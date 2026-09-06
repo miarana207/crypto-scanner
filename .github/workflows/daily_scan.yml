@@ -5,7 +5,7 @@ on:
     # 07:00 UTC = 09:00 heure de Paris (été) / 08:00 (hiver)
     # Ajuste l'heure selon ton fuseau et tes horaires de trading.
     # Format cron: minute heure jour mois jour-semaine (1-5 = lundi-vendredi)
-    - cron: "0 7 * * 1-5"
+    - cron: "0 * * * *"
   workflow_dispatch: {}  # permet aussi de le lancer manuellement depuis l'onglet Actions
 
 jobs:
