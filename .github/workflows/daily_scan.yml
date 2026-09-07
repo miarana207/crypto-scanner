@@ -35,4 +35,4 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: |
           cd app
-          python run_and_notify.py --symbols BTCUSDT ETHUSDT SOLUSDT BNBUSDT XRPUSDT ADAUSDT DOGEUSDT AVAXUSDT LINKUSDT DOTUSDT --interval 5m --threshold 60
+          python run_and_notify.py --threshold 60
