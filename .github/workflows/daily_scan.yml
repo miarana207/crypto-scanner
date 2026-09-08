@@ -33,6 +33,7 @@ jobs:
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          BINANCE_DATA_URL: https://api.binance.us
         run: |
           cd app
           python run_and_notify.py --threshold 60
