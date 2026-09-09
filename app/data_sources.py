@@ -1,84 +1,52 @@
 """
-Sources de données OHLCV par classe d'actifs.
+Sources de données OHLCV V4.
 
-- klines_binance (dans backtest.py) :
-  crypto, API publique Binance
+- Binance       : crypto
+- Twelve Data   : forex + actions + certaines matières premières
+- Yahoo Finance : indices + fallback + certaines matières premières
 
-- klines_yahoo :
-  fallback actions/indices/matières premières
-
-- klines_twelvedata :
-  actions/forex/matières premières,
-  API officielle Twelve Data
-
-- klines_finnhub_forex :
-  conservée pour compatibilité,
-  mais le Forex gratuit est routé via Twelve Data.
-
-Corrections :
-- Twelve Data forcé en UTC.
-- Absence de volume gérée avec volume = 0.
+Twelve Data :
+- timeout renforcé
+- retries
+- backoff progressif
+- gestion propre des réponses d'erreur
 """
 
 import os
 import time
+
 import requests
 import pandas as pd
+
+
+# ============================================================
+# CONFIGURATION YAHOO
+# ============================================================
+
+_YF_CONFIG = {
+    "1m":  ("1m", "7d"),
+    "5m":  ("5m", "60d"),
+    "15m": ("15m", "60d"),
+    "30m": ("30m", "60d"),
+    "1h":  ("60m", "730d"),
+    "1d":  ("1d", "10y"),
+}
 
 
 # ============================================================
 # YAHOO FINANCE
 # ============================================================
 
-_YF_CONFIG = {
-
-    "1m": (
-        "1m",
-        "7d"
-    ),
-
-    "5m": (
-        "5m",
-        "60d"
-    ),
-
-    "15m": (
-        "15m",
-        "60d"
-    ),
-
-    "30m": (
-        "30m",
-        "60d"
-    ),
-
-    "1h": (
-        "60m",
-        "730d"
-    ),
-
-    "1d": (
-        "1d",
-        "10y"
-    ),
-}
-
-
 def klines_yahoo(
     symbol,
     interval="15m",
     limit=500,
-    **kwargs
+    **kwargs,
 ):
 
-    yf_interval, yf_range = (
-        _YF_CONFIG.get(
-            interval,
-            (
-                "15m",
-                "60d"
-            )
-        )
+    yf_interval, yf_range = _YF_CONFIG.get(
+        interval,
+        ("15m", "60d"),
     )
 
     url = (
@@ -88,20 +56,20 @@ def klines_yahoo(
 
     params = {
         "range": yf_range,
-        "interval": yf_interval
+        "interval": yf_interval,
     }
 
     headers = {
         "User-Agent":
-        "Mozilla/5.0 "
-        "(compatible; scanner-perso/1.0)"
+            "Mozilla/5.0 "
+            "(compatible; scanner-v4/1.0)"
     }
 
     r = requests.get(
         url,
         params=params,
         headers=headers,
-        timeout=15
+        timeout=30,
     )
 
     r.raise_for_status()
@@ -123,8 +91,8 @@ def klines_yahoo(
         )
 
         raise ValueError(
-            f"Yahoo Finance n'a rien "
-            f"renvoyé pour {symbol}: {err}"
+            f"Yahoo Finance n'a rien renvoyé "
+            f"pour {symbol}: {err}"
         )
 
     result = result_list[0]
@@ -137,37 +105,30 @@ def klines_yahoo(
 
         raise ValueError(
             f"Aucune bougie disponible "
-            f"pour {symbol} sur cette période"
+            f"pour {symbol}"
         )
 
     quote = (
-        result["indicators"]["quote"][0]
+        result
+        ["indicators"]
+        ["quote"][0]
     )
 
-    df = pd.DataFrame({
+    df = pd.DataFrame(
+        {
+            "open_time": pd.to_datetime(
+                timestamps,
+                unit="s",
+                utc=True,
+            ),
 
-        "open_time":
-        pd.to_datetime(
-            timestamps,
-            unit="s",
-            utc=True
-        ),
-
-        "open":
-        quote["open"],
-
-        "high":
-        quote["high"],
-
-        "low":
-        quote["low"],
-
-        "close":
-        quote["close"],
-
-        "volume":
-        quote["volume"],
-    })
+            "open": quote["open"],
+            "high": quote["high"],
+            "low": quote["low"],
+            "close": quote["close"],
+            "volume": quote["volume"],
+        }
+    )
 
     df = (
         df
@@ -187,7 +148,6 @@ def klines_yahoo(
 # ============================================================
 
 _TD_INTERVAL_MAP = {
-
     "1m": "1min",
     "5m": "5min",
     "15m": "15min",
@@ -201,7 +161,7 @@ def klines_twelvedata(
     symbol,
     interval="15m",
     limit=500,
-    **kwargs
+    **kwargs,
 ):
 
     api_key = os.environ.get(
@@ -215,11 +175,9 @@ def klines_twelvedata(
             "(variable d'environnement)"
         )
 
-    td_interval = (
-        _TD_INTERVAL_MAP.get(
-            interval,
-            "15min"
-        )
+    td_interval = _TD_INTERVAL_MAP.get(
+        interval,
+        "15min",
     )
 
     url = (
@@ -227,120 +185,183 @@ def klines_twelvedata(
         "time_series"
     )
 
-    params = {
-
-        "symbol": symbol,
-
-        "interval": td_interval,
-
-        "outputsize": min(
-            limit,
-            5000
-        ),
-
-        "apikey": api_key,
-
-        "timezone": "UTC",
-    }
-
-    r = requests.get(
-        url,
-        params=params,
-        timeout=15
-    )
-
-    r.raise_for_status()
-
-    data = r.json()
-
-    if data.get("status") == "error":
-
-        raise ValueError(
-            f"Twelve Data erreur pour "
-            f"{symbol}: "
-            f"{data.get('message')}"
-        )
-
-    values = data.get(
-        "values"
-    )
-
-    if not values:
-
-        raise ValueError(
-            f"Twelve Data n'a renvoyé "
-            f"aucune donnée pour {symbol}"
-        )
-
-    df = pd.DataFrame(
-        values
-    )
-
-    df["open_time"] = (
-        pd.to_datetime(
-            df["datetime"],
-            utc=True
-        )
-    )
-
-    for col in [
-        "open",
-        "high",
-        "low",
-        "close"
-    ]:
-
-        df[col] = (
-            df[col]
-            .astype(float)
-        )
-
     # --------------------------------------------------------
-    # VOLUME
+    # Limite pratique
     # --------------------------------------------------------
 
-    if "volume" in df.columns:
-
-        df["volume"] = (
-            df["volume"]
-            .astype(float)
-        )
-
-    else:
-
-        # Certains actifs Twelve Data,
-        # notamment Forex/spot commodities,
-        # n'ont pas de volume exploitable.
-        df["volume"] = 0.0
-
-    # --------------------------------------------------------
-    # ORDRE CHRONOLOGIQUE
-    # --------------------------------------------------------
-
-    df = (
-        df
-        .sort_values(
-            "open_time"
-        )
-        .reset_index(
-            drop=True
-        )
+    outputsize = min(
+        int(limit),
+        5000,
     )
 
-    return (
-        df[
-            [
-                "open_time",
+    # --------------------------------------------------------
+    # Retry
+    # --------------------------------------------------------
+
+    max_attempts = 3
+
+    timeout = 30
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        max_attempts + 1,
+    ):
+
+        params = {
+            "symbol": symbol,
+            "interval": td_interval,
+            "outputsize": outputsize,
+            "apikey": api_key,
+            "timezone": "UTC",
+        }
+
+        try:
+
+            r = requests.get(
+                url,
+                params=params,
+                timeout=timeout,
+            )
+
+            r.raise_for_status()
+
+            data = r.json()
+
+            # ------------------------------------------------
+            # Erreur API
+            # ------------------------------------------------
+
+            if data.get("status") == "error":
+
+                message = data.get(
+                    "message",
+                    "erreur inconnue",
+                )
+
+                raise ValueError(
+                    f"Twelve Data erreur "
+                    f"pour {symbol}: {message}"
+                )
+
+            values = data.get(
+                "values"
+            )
+
+            if not values:
+
+                raise ValueError(
+                    f"Twelve Data n'a renvoyé "
+                    f"aucune donnée pour {symbol}"
+                )
+
+            # ------------------------------------------------
+            # Conversion
+            # ------------------------------------------------
+
+            df = pd.DataFrame(values)
+
+            df["open_time"] = (
+                pd.to_datetime(
+                    df["datetime"],
+                    utc=True,
+                )
+            )
+
+            for col in [
                 "open",
                 "high",
                 "low",
                 "close",
-                "volume"
-            ]
-        ]
-        .tail(limit)
-        .reset_index(drop=True)
-    )
+            ]:
+
+                df[col] = df[col].astype(
+                    float
+                )
+
+            # ------------------------------------------------
+            # Volume
+            # ------------------------------------------------
+
+            if "volume" in df.columns:
+
+                df["volume"] = (
+                    pd.to_numeric(
+                        df["volume"],
+                        errors="coerce",
+                    )
+                    .fillna(0.0)
+                    .astype(float)
+                )
+
+            else:
+
+                # Forex / spot commodities
+                # peuvent ne pas avoir de volume.
+                df["volume"] = 0.0
+
+            # ------------------------------------------------
+            # Nettoyage
+            # ------------------------------------------------
+
+            df = (
+                df
+                .sort_values(
+                    "open_time"
+                )
+                .reset_index(
+                    drop=True
+                )
+            )
+
+            return (
+                df[
+                    [
+                        "open_time",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                    ]
+                ]
+                .tail(limit)
+                .reset_index(drop=True)
+            )
+
+        except Exception as e:
+
+            last_error = e
+
+            if attempt < max_attempts:
+
+                wait = 2 ** attempt
+
+                print(
+                    f"[Twelve Data] "
+                    f"{symbol}: tentative "
+                    f"{attempt}/{max_attempts} "
+                    f"échouée : {e}"
+                )
+
+                print(
+                    f"[Twelve Data] "
+                    f"Nouvelle tentative dans "
+                    f"{wait}s..."
+                )
+
+                time.sleep(wait)
+
+            else:
+
+                print(
+                    f"[Twelve Data] "
+                    f"{symbol}: échec après "
+                    f"{max_attempts} tentatives."
+                )
+
+    raise last_error
 
 
 # ============================================================
@@ -348,36 +369,12 @@ def klines_twelvedata(
 # ============================================================
 
 _FH_RESOLUTION_MAP = {
-
-    "1m": (
-        "1",
-        1
-    ),
-
-    "5m": (
-        "5",
-        5
-    ),
-
-    "15m": (
-        "15",
-        15
-    ),
-
-    "30m": (
-        "30",
-        30
-    ),
-
-    "1h": (
-        "60",
-        60
-    ),
-
-    "1d": (
-        "D",
-        1440
-    ),
+    "1m":  ("1", 1),
+    "5m":  ("5", 5),
+    "15m": ("15", 15),
+    "30m": ("30", 30),
+    "1h":  ("60", 60),
+    "1d":  ("D", 1440),
 }
 
 
@@ -385,7 +382,7 @@ def klines_finnhub_forex(
     symbol,
     interval="15m",
     limit=500,
-    **kwargs
+    **kwargs,
 ):
 
     api_key = os.environ.get(
@@ -402,10 +399,7 @@ def klines_finnhub_forex(
     resolution, minutes_per_bar = (
         _FH_RESOLUTION_MAP.get(
             interval,
-            (
-                "15",
-                15
-            )
+            ("15", 15),
         )
     )
 
@@ -414,38 +408,30 @@ def klines_finnhub_forex(
     )
 
     span_seconds = (
-        minutes_per_bar *
-        60 *
-        (limit + 20)
+        minutes_per_bar
+        * 60
+        * (limit + 20)
     )
 
-    start = (
-        now -
-        span_seconds
-    )
+    start = now - span_seconds
 
     url = (
-        "https://finnhub.io/"
-        "api/v1/forex/candle"
+        "https://finnhub.io/api/v1/"
+        "forex/candle"
     )
 
     params = {
-
         "symbol": symbol,
-
         "resolution": resolution,
-
         "from": start,
-
         "to": now,
-
-        "token": api_key
+        "token": api_key,
     }
 
     r = requests.get(
         url,
         params=params,
-        timeout=15
+        timeout=30,
     )
 
     r.raise_for_status()
@@ -460,30 +446,20 @@ def klines_finnhub_forex(
             f"(statut: {data.get('s')})"
         )
 
-    df = pd.DataFrame({
-
-        "open_time":
-        pd.to_datetime(
-            data["t"],
-            unit="s",
-            utc=True
-        ),
-
-        "open":
-        data["o"],
-
-        "high":
-        data["h"],
-
-        "low":
-        data["l"],
-
-        "close":
-        data["c"],
-
-        "volume":
-        data["v"],
-    })
+    df = pd.DataFrame(
+        {
+            "open_time": pd.to_datetime(
+                data["t"],
+                unit="s",
+                utc=True,
+            ),
+            "open": data["o"],
+            "high": data["h"],
+            "low": data["l"],
+            "close": data["c"],
+            "volume": data["v"],
+        }
+    )
 
     return (
         df
