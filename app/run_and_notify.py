@@ -166,45 +166,117 @@ def freshness_summary(all_results, now=None):
         )
     return lines
 
-
 def format_message(all_results, stock_provider, top=5, threshold=60, now=None):
     now = now or datetime.now(timezone.utc)
     ts = now.strftime("%Y-%m-%d %H:%M UTC")
+
     lines = [
         f"📊 Scan multi-actifs — {ts} (seuil {threshold:.0f})",
-        f"Source Actions/Matières premières ce run : {stock_provider} | Indices : yahoo (fixe, indices non couverts par le plan gratuit Twelve Data)",
+        f"Source Actions/Matières premières ce run : {stock_provider} | "
+        f"Indices : yahoo (fixe, indices non couverts par le plan gratuit Twelve Data)",
         "",
     ]
+
     any_signal = False
 
+    # ---------------------------------------------------------
+    # 1. Signaux au-dessus du seuil
+    # ---------------------------------------------------------
     for name, df in all_results.items():
         if df.empty:
             continue
+
         signals = df[df["direction"].isin(["LONG", "SHORT"])]
+
         if signals.empty:
             continue
+
         any_signal = True
         lines.append(f"--- {name} ---")
+
         for _, row in signals.head(top).iterrows():
             best = max(row["score_long"], row["score_short"])
             icon = "🟢" if row["direction"] == "LONG" else "🔴"
-            relvol_display = "n/d" if pd.isna(row["relvol"]) else row["relvol"]
-            lines.append(
-                f"{icon} {row['symbol']}: {row['direction']} (score {best:.0f}) | "
-                f"close={row['close']} | RSI={row['rsi']} | relvol={relvol_display}"
+
+            relvol_display = (
+                "n/d" if pd.isna(row["relvol"]) else row["relvol"]
             )
+
+            lines.append(
+                f"{icon} {row['symbol']}: {row['direction']} "
+                f"(score {best:.0f}) | "
+                f"close={row['close']} | "
+                f"RSI={row['rsi']} | "
+                f"relvol={relvol_display}"
+            )
+
         lines.append("")
 
+    # ---------------------------------------------------------
+    # 2. Aucun signal : afficher les meilleurs scores
+    #    avec le détail des composantes
+    # ---------------------------------------------------------
     if not any_signal:
-        lines.append("Aucun signal au-dessus du seuil sur aucune catégorie.")
+        lines.append(
+            "Aucun signal au-dessus du seuil sur aucune catégorie."
+        )
+        lines.append("")
+        lines.append("--- Meilleurs scores sous le seuil ---")
 
+        for name, df in all_results.items():
+            if df.empty:
+                continue
+
+            diagnostic = df.copy()
+
+            diagnostic["best_score"] = diagnostic[
+                ["score_long", "score_short"]
+            ].max(axis=1)
+
+            diagnostic["best_direction"] = diagnostic.apply(
+                lambda row: (
+                    "LONG"
+                    if row["score_long"] >= row["score_short"]
+                    else "SHORT"
+                ),
+                axis=1,
+            )
+
+            diagnostic = diagnostic.sort_values(
+                "best_score",
+                ascending=False,
+            ).head(top)
+
+            lines.append(name)
+
+            for _, row in diagnostic.iterrows():
+                relvol_display = (
+                    "n/d" if pd.isna(row["relvol"]) else row["relvol"]
+                )
+
+                lines.append(
+                    f"  {row['symbol']}: {row['best_score']:.0f} "
+                    f"({row['best_direction']}) | "
+                    f"tendance={row['trend_pts']:+.0f} | "
+                    f"EMA={row['ema_pts']:+.0f} | "
+                    f"RSI={row['rsi_pts']:+.0f} | "
+                    f"volume={row['volume_pts']:+.0f} | "
+                    f"breakout={row['breakout_pts']:+.0f} | "
+                    f"relvol={relvol_display}"
+                )
+
+            lines.append("")
+
+    # ---------------------------------------------------------
+    # 3. Fraîcheur des données
+    # ---------------------------------------------------------
     fresh_lines = freshness_summary(all_results, now)
+
     if fresh_lines:
         lines.append("--- Fraîcheur des données ---")
         lines.extend(fresh_lines)
 
     return "\n".join(lines)
-
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
