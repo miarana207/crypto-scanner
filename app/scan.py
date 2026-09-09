@@ -1,5 +1,5 @@
 """
-Scanner multi-actifs — V1.2
+Scanner multi-actifs — V1.3
 
 Score maximal : 100 points.
 
@@ -14,13 +14,22 @@ Statut :
 - SIGNAL FORT : score >= seuil + breakout + volume
 - ATTENTE     : score >= seuil mais trigger incomplet
 - "-"         : score sous le seuil
+
+Breakout renforcé :
+- LONG  : clôture > précédent plus haut de 0,10 %
+- SHORT : clôture < précédent plus bas de 0,10 %
 """
 
 import argparse
 import time
 import pandas as pd
 
-from backtest import klines, indicators, score
+from backtest import (
+    klines,
+    indicators,
+    score,
+    BREAKOUT_BUFFER
+)
 
 
 def scan(
@@ -34,6 +43,7 @@ def scan(
 
     rows=[]
 
+
     for sym in symbols:
 
         try:
@@ -44,7 +54,9 @@ def scan(
                 limit=limit
             )
 
+
             d=indicators(df)
+
 
             d["prev_high"]=(
                 d.high
@@ -53,6 +65,7 @@ def scan(
                 .shift(1)
             )
 
+
             d["prev_low"]=(
                 d.low
                 .rolling(20)
@@ -60,7 +73,9 @@ def scan(
                 .shift(1)
             )
 
+
             last=d.iloc[-1]
+
 
             required=[
                 "ema20",
@@ -69,6 +84,7 @@ def scan(
                 "prev_high",
                 "prev_low"
             ]
+
 
             if any(
                 pd.isna(last[c])
@@ -82,34 +98,70 @@ def scan(
 
                 continue
 
+
             L,S,details=score(
                 last,
                 return_details=True
             )
 
+
+            # -------------------------------------------------------------
+            # DIRECTION
+            # -------------------------------------------------------------
+
             if L>=threshold and L>S:
+
                 direction="LONG"
 
             elif S>=threshold and S>L:
+
                 direction="SHORT"
 
             else:
-                direction="-"
+
+                # Pour le classement de surveillance, on conserve
+                # la meilleure direction même si le seuil n'est pas atteint.
+                if L>S:
+                    direction="LONG"
+                elif S>L:
+                    direction="SHORT"
+                else:
+                    direction="-"
 
 
-            # -------------------------------------------------
+            # -------------------------------------------------------------
             # TRIGGER
-            # -------------------------------------------------
+            # -------------------------------------------------------------
 
             if direction=="LONG":
 
-                breakout_ok=details["breakout"]==20
-                volume_ok=details["volume"]==15
+                breakout_ok=(
+                    float(last.close)
+                    >
+                    float(last.prev_high)
+                    *
+                    (1+BREAKOUT_BUFFER)
+                )
+
+                volume_ok=(
+                    details["volume"]==15
+                )
+
 
             elif direction=="SHORT":
 
-                breakout_ok=details["breakout"]==-20
-                volume_ok=details["volume"]==-15
+                breakout_ok=(
+                    float(last.close)
+                    <
+                    float(last.prev_low)
+                    *
+                    (1-BREAKOUT_BUFFER)
+                )
+
+                volume_ok=(
+                    details["volume"]==-15
+                )
+
 
             else:
 
@@ -117,7 +169,20 @@ def scan(
                 volume_ok=False
 
 
-            if direction in ["LONG","SHORT"]:
+            # -------------------------------------------------------------
+            # STATUT
+            # -------------------------------------------------------------
+
+            best_score=max(
+                L,
+                S
+            )
+
+
+            if (
+                best_score>=threshold
+                and direction in ["LONG","SHORT"]
+            ):
 
                 if breakout_ok and volume_ok:
 
@@ -126,6 +191,7 @@ def scan(
                 else:
 
                     status="ATTENTE"
+
 
             else:
 
@@ -155,12 +221,17 @@ def scan(
                 ),
 
                 "relvol":(
-                    round(float(last.relvol),2)
+                    round(
+                        float(last.relvol),
+                        2
+                    )
                     if not pd.isna(last.relvol)
                     else float("nan")
                 ),
 
-                "trend1h":int(last.trend1h),
+                "trend1h":int(
+                    last.trend1h
+                ),
 
                 "trend_pts":details["trend"],
 
@@ -173,6 +244,7 @@ def scan(
                 "breakout_pts":details["breakout"],
 
                 "last_candle":last.open_time,
+
             })
 
 
@@ -182,18 +254,25 @@ def scan(
                 f"Erreur sur {sym}: {e}"
             )
 
+
         time.sleep(pause)
 
 
     if not rows:
+
         return pd.DataFrame()
 
 
     out=pd.DataFrame(rows)
 
+
     out["max_score"]=out[
-        ["score_long","score_short"]
+        [
+            "score_long",
+            "score_short"
+        ]
     ].max(axis=1)
+
 
     out=(
         out
@@ -201,15 +280,21 @@ def scan(
             "max_score",
             ascending=False
         )
-        .drop(columns="max_score")
+        .drop(
+            columns="max_score"
+        )
     )
 
-    return out.reset_index(drop=True)
+
+    return out.reset_index(
+        drop=True
+    )
 
 
 if __name__=="__main__":
 
     ap=argparse.ArgumentParser()
+
 
     ap.add_argument(
         "--symbols",
@@ -228,16 +313,19 @@ if __name__=="__main__":
         ]
     )
 
+
     ap.add_argument(
         "--interval",
         default="5m"
     )
+
 
     ap.add_argument(
         "--limit",
         type=int,
         default=1000
     )
+
 
     ap.add_argument(
         "--threshold",
@@ -249,18 +337,22 @@ if __name__=="__main__":
         )
     )
 
+
     ap.add_argument(
         "--top",
         type=int,
         default=10
     )
 
+
     args=ap.parse_args()
+
 
     print(
         f"Scan de {len(args.symbols)} actifs "
         f"en {args.interval}...\n"
     )
+
 
     results=scan(
         args.symbols,
@@ -268,6 +360,7 @@ if __name__=="__main__":
         limit=args.limit,
         threshold=args.threshold
     )
+
 
     if results.empty:
 
@@ -277,18 +370,23 @@ if __name__=="__main__":
             "sur tous les actifs)."
         )
 
+
     else:
 
         print(
             results
             .head(args.top)
-            .to_string(index=False)
+            .to_string(
+                index=False
+            )
         )
+
 
         results.to_csv(
             "scan_results.csv",
             index=False
         )
+
 
         print(
             f"\n{len(results)} actifs analysés — "
