@@ -1,14 +1,15 @@
 """
-Lance le scan multi-actifs et envoie les résultats sur Slack + Email.
+Scanner multi-actifs V4.
 
-V4 :
+Règles :
 
 Score maximum = 100
-- Tendance 1H : 25
-- EMA          : 20
-- RSI          : 15
-- Volume       : 15
-- Breakout     : 25
+
+    Tendance 1H : 25
+    EMA          : 20
+    RSI          : 15
+    Volume       : 15
+    Breakout     : 25
 
 SIGNAL FORT :
     score >= seuil
@@ -16,7 +17,8 @@ SIGNAL FORT :
     + VOLUME
 
 ATTENTE :
-    score >= seuil mais trigger incomplet
+    score >= seuil
+    mais trigger incomplet
 
 SOUS SEUIL :
     score < seuil
@@ -31,7 +33,7 @@ Sources :
     Actions      = Twelve Data 03:00-19:00 UTC,
                    Yahoo sinon
     Indices      = Yahoo
-    Commodities  = Twelve Data/Yahoo selon configuration
+    Commodities  = Twelve Data/Yahoo
 """
 
 import argparse
@@ -83,6 +85,7 @@ PAUSE_BY_PROVIDER = {
 def twelvedata_window_active(
     now=None
 ):
+
     now = (
         now
         or datetime.now(
@@ -93,6 +96,42 @@ def twelvedata_window_active(
     return (
         3 <= now.hour < 19
     )
+
+
+# ======================================================================
+# RESOLUTION DES SYMBOLES
+# ======================================================================
+
+def resolve_symbols(
+    entries,
+    key
+):
+
+    result = []
+
+    for entry in entries:
+
+        if isinstance(
+            entry,
+            dict
+        ):
+
+            value = entry.get(
+                key
+            )
+
+            if value:
+                result.append(
+                    value
+                )
+
+        else:
+
+            result.append(
+                entry
+            )
+
+    return result
 
 
 # ======================================================================
@@ -112,15 +151,13 @@ def build_categories(
     stock_provider = (
         "twelvedata"
         if use_twelvedata
-        else
-        "yahoo"
+        else "yahoo"
     )
 
     stock_fetcher = (
         klines_twelvedata
         if use_twelvedata
-        else
-        klines_yahoo
+        else klines_yahoo
     )
 
     stock_pause = (
@@ -128,36 +165,6 @@ def build_categories(
             stock_provider
         ]
     )
-
-    def resolve_symbols(
-        entries,
-        key
-    ):
-        result = []
-
-        for entry in entries:
-
-            if isinstance(
-                entry,
-                dict
-            ):
-                value = entry.get(
-                    key
-                )
-
-                if value:
-                    result.append(
-                        value
-                    )
-
-            else:
-                # Compatibilité si assets.py
-                # contient directement des strings.
-                result.append(
-                    entry
-                )
-
-        return result
 
     categories = {
 
@@ -171,8 +178,10 @@ def build_categories(
                     CRYPTO,
                     "binance"
                 ),
-                "fetcher": klines_binance,
-                "interval": "5m",
+                "fetcher":
+                    klines_binance,
+                "interval":
+                    "5m",
                 "pause":
                     PAUSE_BY_PROVIDER[
                         "binance"
@@ -192,7 +201,8 @@ def build_categories(
                 ),
                 "fetcher":
                     klines_twelvedata,
-                "interval": "15m",
+                "interval":
+                    "15m",
                 "pause":
                     PAUSE_BY_PROVIDER[
                         "twelvedata"
@@ -212,7 +222,8 @@ def build_categories(
                 ),
                 "fetcher":
                     stock_fetcher,
-                "interval": "15m",
+                "interval":
+                    "15m",
                 "pause":
                     stock_pause,
             }
@@ -230,7 +241,8 @@ def build_categories(
                 ),
                 "fetcher":
                     klines_yahoo,
-                "interval": "15m",
+                "interval":
+                    "15m",
                 "pause":
                     PAUSE_BY_PROVIDER[
                         "yahoo"
@@ -243,7 +255,6 @@ def build_categories(
         # ==============================================================
 
         "🛢️ Matières premières": [
-
             {
                 "symbols": resolve_symbols(
                     COMMODITIES,
@@ -251,11 +262,11 @@ def build_categories(
                 ),
                 "fetcher":
                     stock_fetcher,
-                "interval": "15m",
+                "interval":
+                    "15m",
                 "pause":
                     stock_pause,
             },
-
             {
                 "symbols": resolve_symbols(
                     COMMODITIES_YAHOO_ONLY,
@@ -263,7 +274,8 @@ def build_categories(
                 ),
                 "fetcher":
                     klines_yahoo,
-                "interval": "15m",
+                "interval":
+                    "15m",
                 "pause":
                     PAUSE_BY_PROVIDER[
                         "yahoo"
@@ -279,14 +291,18 @@ def build_categories(
 
 
 # ======================================================================
-# SCAN COMPLET
+# SCAN GLOBAL
 # ======================================================================
 
 def scan_all(
     threshold=75,
     limit=1000,
-    now=None
+    top=5
 ):
+
+    now = datetime.now(
+        timezone.utc
+    )
 
     categories, stock_provider = (
         build_categories(
@@ -294,15 +310,17 @@ def scan_all(
         )
     )
 
-    results = {}
+    all_results = {}
 
-    for name, groups in categories.items():
+    for name, groups in (
+        categories.items()
+    ):
 
-        dfs = []
+        frames = []
 
-        for cfg in groups:
+        for group in groups:
 
-            symbols = cfg[
+            symbols = group[
                 "symbols"
             ]
 
@@ -310,35 +328,38 @@ def scan_all(
                 continue
 
             print(
-                f"--- {name} "
-                f"({cfg['fetcher'].__name__}, "
-                f"pause={cfg['pause']}s) ---"
+                f"\n{name} — "
+                f"{len(symbols)} actifs"
             )
 
             df = scan(
-                symbols,
-                fetcher=cfg[
+                symbols=symbols,
+                fetcher=group[
                     "fetcher"
                 ],
-                interval=cfg[
+                interval=group[
                     "interval"
                 ],
                 limit=limit,
                 threshold=threshold,
-                pause=cfg[
+                pause=group[
                     "pause"
                 ],
             )
 
-            if not df.empty:
-                dfs.append(
+            if (
+                df is not None
+                and not df.empty
+            ):
+
+                frames.append(
                     df
                 )
 
-        if dfs:
+        if frames:
 
             merged = pd.concat(
-                dfs,
+                frames,
                 ignore_index=True
             )
 
@@ -353,22 +374,24 @@ def scan_all(
                 )
             )
 
-            results[name] = merged
+            all_results[
+                name
+            ] = merged
 
         else:
 
-            results[name] = (
-                pd.DataFrame()
-            )
+            all_results[
+                name
+            ] = pd.DataFrame()
 
     return (
-        results,
+        all_results,
         stock_provider
     )
 
 
 # ======================================================================
-# SIGNALS
+# SIGNAL FORT
 # ======================================================================
 
 def has_signal(
@@ -379,14 +402,13 @@ def has_signal(
 
         if (
             not df.empty
-            and
-            "status" in df.columns
-            and
-            (
+            and "status" in df.columns
+            and (
                 df["status"]
                 == "SIGNAL FORT"
             ).any()
         ):
+
             return True
 
     return False
@@ -396,85 +418,27 @@ def count_signals(
     all_results
 ):
 
-    count = 0
+    total = 0
 
     for df in all_results.values():
 
         if (
             not df.empty
-            and
-            "status" in df.columns
+            and "status" in df.columns
         ):
 
-            count += int(
+            total += int(
                 (
                     df["status"]
                     == "SIGNAL FORT"
                 ).sum()
             )
 
-    return count
+    return total
 
 
 # ======================================================================
-# CONDITIONS MANQUANTES
-# ======================================================================
-
-def missing_conditions(
-    row,
-    threshold=75
-):
-
-    best_score = max(
-        row["score_long"],
-        row["score_short"]
-    )
-
-    direction = row[
-        "direction"
-    ]
-
-    missing = []
-
-    if best_score < threshold:
-        missing.append(
-            f"SCORE < {threshold:.0f}"
-        )
-
-    breakout_ok = bool(
-        row.get(
-            "breakout_ok",
-            False
-        )
-    )
-
-    volume_ok = bool(
-        row.get(
-            "volume_ok",
-            False
-        )
-    )
-
-    if not breakout_ok:
-        missing.append(
-            "BREAKOUT"
-        )
-
-    if not volume_ok:
-        missing.append(
-            "VOLUME"
-        )
-
-    if not missing:
-        return "aucune"
-
-    return " + ".join(
-        missing
-    )
-
-
-# ======================================================================
-# FORMAT RELVOL
+# FORMATAGE
 # ======================================================================
 
 def relvol_text(
@@ -487,22 +451,73 @@ def relvol_text(
     return f"{float(value):.2f}"
 
 
-# ======================================================================
-# BLOC SCORE
-# ======================================================================
+def missing_conditions(
+    row,
+    threshold=75
+):
+
+    missing = []
+
+    best_score = max(
+        float(
+            row["score_long"]
+        ),
+        float(
+            row["score_short"]
+        )
+    )
+
+    if best_score < threshold:
+
+        missing.append(
+            f"SCORE < {threshold:.0f}"
+        )
+
+    if not bool(
+        row.get(
+            "breakout_ok",
+            False
+        )
+    ):
+
+        missing.append(
+            "BREAKOUT"
+        )
+
+    if not bool(
+        row.get(
+            "volume_ok",
+            False
+        )
+    ):
+
+        missing.append(
+            "VOLUME"
+        )
+
+    if not missing:
+        return "aucune"
+
+    return " + ".join(
+        missing
+    )
+
 
 def format_score_block(
     row
 ):
 
+    score_value = float(
+        row["best_score"]
+    )
+
     direction = row[
         "direction"
     ]
 
-    best = max(
-        row["score_long"],
-        row["score_short"]
-    )
+    status = row[
+        "status"
+    ]
 
     relvol = relvol_text(
         row.get(
@@ -521,175 +536,19 @@ def format_score_block(
     else:
         rsi_text = f"{float(rsi):.1f}"
 
-    trend_text = (
-        f"{row['trend_pts']:+.0f}/25"
-    )
-
-    ema_text = (
-        f"{row['ema_pts']:+.0f}/20"
-    )
-
-    rsi_pts_text = (
-        f"{row['rsi_pts']:+.0f}/15"
-    )
-
-    volume_text = (
-        f"{row['volume_pts']:+.0f}/15"
-    )
-
-    breakout_text = (
-        f"{row['breakout_pts']:+.0f}/25"
-    )
-
-    lines = [
-
-        f"{row['symbol']} "
-        f"{direction} — "
-        f"SCORE {best:.0f}/100",
-
-        "",
-
-        f"Tendance 1H       {trend_text}",
-
-        f"EMA               {ema_text}",
-
-        f"RSI               {rsi_pts_text} "
-        f"(RSI {rsi_text})",
-
-        f"Volume            {volume_text} "
-        f"(RelVol {relvol})",
-
-        f"Breakout          {breakout_text}",
-
-        "------------------------",
-
-        f"TOTAL              {best:.0f}/100",
-    ]
-
-    if row["status"] == "SIGNAL FORT":
-
-        lines.extend(
-            [
-                "",
-                "🔥 TRIGGER : BREAKOUT + VOLUME",
-                "➡️ SIGNAL FORT",
-                "🔥 PRISE DE POSITION IMMÉDIATE",
-            ]
-        )
-
-    elif row["status"] == "ATTENTE":
-
-        missing = missing_conditions(
-            row
-        )
-
-        lines.extend(
-            [
-                "",
-                "⏳ TRIGGER INCOMPLET",
-                f"➡️ ATTENTE — manque : {missing}",
-            ]
-        )
-
-    else:
-
-        missing = missing_conditions(
-            row
-        )
-
-        lines.extend(
-            [
-                "",
-                f"🟡 SOUS SEUIL — manque : {missing}",
-            ]
-        )
-
-    return "\n".join(
-        lines
-    )
-
-
-# ======================================================================
-# MESSAGE SLACK
-# ======================================================================
-
-def format_signal_message(
-    all_results,
-    stock_provider,
-    threshold=75,
-    now=None
-):
-
-    now = (
-        now
-        or datetime.now(
-            timezone.utc
-        )
-    )
-
-    ts = now.strftime(
-        "%Y-%m-%d %H:%M UTC"
-    )
-
-    lines = [
-
-        "🔥 SIGNALS FORTS",
-
-        f"{ts}",
-
-        f"Seuil : "
-        f"{threshold:.0f}/100",
-
-        "Conditions : "
-        "SCORE ≥ seuil + BREAKOUT + VOLUME",
-
-        f"Source Actions/Matières : "
-        f"{stock_provider}",
-
-        "Indices : yahoo",
-
-        "",
-    ]
-
-    total = 0
-
-    for name, df in all_results.items():
-
-        if df.empty:
-            continue
-
-        strong = df[
-            df["status"]
-            == "SIGNAL FORT"
-        ]
-
-        if strong.empty:
-            continue
-
-        lines.append(
-            f"--- {name} ---"
-        )
-
-        lines.append("")
-
-        for _, row in strong.iterrows():
-
-            total += 1
-
-            lines.append(
-                format_score_block(
-                    row
-                )
-            )
-
-            lines.append("")
-
-    lines.append(
-        f"Total SIGNAL FORT : {total}"
-    )
-
-    return "\n".join(
-        lines
+    return (
+        f"{row['symbol']} | "
+        f"{score_value:.0f}/100 "
+        f"{direction} | "
+        f"{status}\n"
+        f"   "
+        f"T:{row['trend_pts']:.0f} "
+        f"E:{row['ema_pts']:.0f} "
+        f"R:{row['rsi_pts']:.0f} "
+        f"V:{row['volume_pts']:.0f} "
+        f"B:{row['breakout_pts']:.0f} "
+        f"| RSI:{rsi_text} "
+        f"| RelVol:{relvol}"
     )
 
 
@@ -709,9 +568,13 @@ def freshness_summary(
         )
     )
 
-    lines = []
+    lines = [
+        "🕐 FRAÎCHEUR DES DONNÉES"
+    ]
 
-    for name, df in all_results.items():
+    for name, df in (
+        all_results.items()
+    ):
 
         if (
             df.empty
@@ -719,6 +582,7 @@ def freshness_summary(
             "last_candle"
             not in df.columns
         ):
+
             continue
 
         most_recent = pd.to_datetime(
@@ -730,6 +594,7 @@ def freshness_summary(
         if pd.isna(
             most_recent
         ):
+
             continue
 
         age_min = (
@@ -740,7 +605,7 @@ def freshness_summary(
         if age_min > 90:
 
             flag = (
-                " ⚠️ possible donnée figée"
+                " ⚠️ donnée potentiellement figée"
             )
 
         else:
@@ -748,24 +613,25 @@ def freshness_summary(
             flag = ""
 
         lines.append(
-            f"{name}: dernière bougie "
-            f"{most_recent.strftime('%Y-%m-%d %H:%M UTC')} "
-            f"(il y a {age_min:.0f} min)"
-            f"{flag}"
+            f"{name}: "
+            f"{most_recent.strftime('%H:%M')} UTC "
+            f"({age_min:.0f} min){flag}"
         )
 
-    return lines
+    return "\n".join(
+        lines
+    )
 
 
 # ======================================================================
-# RAPPORT EMAIL
+# MESSAGE PRINCIPAL
 # ======================================================================
 
-def format_email_message(
+def format_full_message(
     all_results,
     stock_provider,
-    top=5,
     threshold=75,
+    top=5,
     now=None
 ):
 
@@ -780,24 +646,28 @@ def format_email_message(
         "%Y-%m-%d %H:%M UTC"
     )
 
-    total_signals = count_signals(
+    strong_count = count_signals(
         all_results
     )
 
     lines = [
 
-        "📊 SCAN MULTI-ACTIFS",
+        "📊 SCAN MULTI-ACTIFS V4",
 
         f"{ts}",
 
-        "",
-
-        f"Seuil stratégique : "
+        f"Seuil : "
         f"{threshold:.0f}/100",
 
-        "Score : "
-        "Trend 25 + EMA 20 + RSI 15 "
-        "+ Volume 15 + Breakout 25",
+        "",
+
+        "🔥 SIGNAL FORT",
+
+        "Conditions : "
+        "SCORE ≥ seuil + BREAKOUT + VOLUME",
+
+        f"Total SIGNAL FORT : "
+        f"{strong_count}",
 
         f"Source Actions/Matières : "
         f"{stock_provider}",
@@ -805,45 +675,27 @@ def format_email_message(
         "Indices : yahoo",
 
         "",
-
     ]
 
-    # ==================================================================
-    # 1. SIGNAL FORT
-    # ==================================================================
+    # ==============================================================
+    # SIGNALS FORTS
+    # ==============================================================
 
-    lines.extend(
-        [
-            "🔥 PRISE DE POSITION IMMÉDIATE",
-
-            "Conditions : "
-            "score ≥ seuil + breakout + volume",
-
-            "",
-        ]
-    )
-
-    if total_signals == 0:
+    if strong_count == 0:
 
         lines.extend(
             [
-                "Aucun actif ne remplit "
-                "actuellement toutes les conditions.",
+                "Aucun signal fort "
+                "sur ce scan.",
                 "",
             ]
         )
 
     else:
 
-        lines.extend(
-            [
-                f"{total_signals} actif(s) "
-                "remplissent les conditions :",
-                "",
-            ]
-        )
-
-        for name, df in all_results.items():
+        for name, df in (
+            all_results.items()
+        ):
 
             if df.empty:
                 continue
@@ -860,10 +712,9 @@ def format_email_message(
                 f"--- {name} ---"
             )
 
-            lines.append("")
-
-            # Tous les SIGNAL FORT
-            for _, row in strong.iterrows():
+            for _, row in (
+                strong.iterrows()
+            ):
 
                 lines.append(
                     format_score_block(
@@ -871,27 +722,25 @@ def format_email_message(
                     )
                 )
 
-                lines.append("")
+            lines.append("")
 
-    # ==================================================================
-    # 2. À SURVEILLER
-    # ==================================================================
+    # ==============================================================
+    # À SURVEILLER
+    # ==============================================================
 
     lines.extend(
         [
             "👀 À SURVEILLER",
-
-            f"Top {top} par catégorie "
-            "hors SIGNAL FORT.",
-
-            "Le classement inclut "
-            "les actifs sous le seuil.",
-
+            f"Top {top} par catégorie.",
+            "Les actifs sous le seuil "
+            "restent affichés.",
             "",
         ]
     )
 
-    for name, df in all_results.items():
+    for name, df in (
+        all_results.items()
+    ):
 
         lines.append(
             f"--- {name} ---"
@@ -908,32 +757,7 @@ def format_email_message(
 
             continue
 
-        watch = df[
-            df["status"]
-            != "SIGNAL FORT"
-        ].copy()
-
-        if watch.empty:
-
-            lines.extend(
-                [
-                    "Tous les actifs disponibles "
-                    "sont actuellement en SIGNAL FORT.",
-                    "",
-                ]
-            )
-
-            continue
-
-        watch["best_score"] = (
-            watch[
-                [
-                    "score_long",
-                    "score_short",
-                ]
-            ]
-            .max(axis=1)
-        )
+        watch = df.copy()
 
         watch = (
             watch
@@ -949,21 +773,11 @@ def format_email_message(
             start=1
         ):
 
-            score_value = row[
-                "best_score"
-            ]
-
-            direction = row[
-                "direction"
-            ]
-
-            status = row[
-                "status"
-            ]
-
-            missing = missing_conditions(
-                row,
-                threshold
+            missing = (
+                missing_conditions(
+                    row,
+                    threshold
+                )
             )
 
             relvol = relvol_text(
@@ -973,91 +787,41 @@ def format_email_message(
                 )
             )
 
-            if status == "ATTENTE":
-
-                status_text = (
-                    "⏳ ATTENTE"
-                )
-
-            else:
-
-                status_text = (
-                    "🟡 SOUS SEUIL"
-                )
-
-            lines.extend(
-                [
-                    f"{rank}. "
-                    f"{row['symbol']} — "
-                    f"{direction} — "
-                    f"{score_value:.0f}/100",
-
-                    f"   {status_text}",
-
-                    f"   Manque : "
-                    f"{missing}",
-
-                    f"   Tendance {row['trend_pts']:+.0f} | "
-                    f"EMA {row['ema_pts']:+.0f} | "
-                    f"RSI {row['rsi_pts']:+.0f} | "
-                    f"Volume {row['volume_pts']:+.0f} | "
-                    f"Breakout {row['breakout_pts']:+.0f}",
-
-                    f"   RelVol : {relvol}",
-
-                    "",
-                ]
+            lines.append(
+                f"{rank}. "
+                f"{row['symbol']} | "
+                f"{row['best_score']:.0f}/100 "
+                f"{row['direction']} | "
+                f"{row['status']}"
             )
 
-    # ==================================================================
-    # 3. FRAÎCHEUR
-    # ==================================================================
+            lines.append(
+                f"   "
+                f"T:{row['trend_pts']:.0f} "
+                f"E:{row['ema_pts']:.0f} "
+                f"R:{row['rsi_pts']:.0f} "
+                f"V:{row['volume_pts']:.0f} "
+                f"B:{row['breakout_pts']:.0f}"
+                f" | RelVol:{relvol}"
+            )
 
-    fresh_lines = freshness_summary(
-        all_results,
-        now
-    )
-
-    if fresh_lines:
-
-        lines.extend(
-            [
-                "--- Fraîcheur des données ---",
-            ]
-        )
-
-        lines.extend(
-            fresh_lines
-        )
+            lines.append(
+                f"   Manque : {missing}"
+            )
 
         lines.append("")
 
-    # ==================================================================
-    # 4. RÉSUMÉ
-    # ==================================================================
+    # ==============================================================
+    # FRAÎCHEUR
+    # ==============================================================
 
     lines.extend(
         [
-            "--- Résumé ---",
-
-            f"🔥 Entrées immédiates : "
-            f"{total_signals}",
-
-            f"👀 Catégories surveillées : "
-            f"{len(all_results)}",
-
             "",
-
-            "RelVol = volume de la dernière "
-            "bougie clôturée / moyenne des "
-            "20 bougies clôturées précédentes.",
-
-            "Seuil volume : RelVol ≥ 1,50.",
-
-            "Breakout renforcé : "
-            "+0,10 % au-dessus du précédent "
-            "plus haut / "
-            "-0,10 % sous le précédent plus bas.",
+            freshness_summary(
+                all_results,
+                now
+            ),
         ]
     )
 
@@ -1070,9 +834,12 @@ def format_email_message(
 # MAIN
 # ======================================================================
 
-if __name__ == "__main__":
+def main():
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=
+        "Scanner multi-actifs V4"
+    )
 
     parser.add_argument(
         "--threshold",
@@ -1083,11 +850,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--limit",
         type=int,
-        default=1000,
-        help=(
-            "Nombre de bougies récupérées "
-            "par appel."
-        )
+        default=1000
     )
 
     parser.add_argument(
@@ -1102,120 +865,117 @@ if __name__ == "__main__":
         timezone.utc
     )
 
-    # ==============================================================
-    # SCAN
-    # ==============================================================
-
-    results, stock_provider = scan_all(
-        threshold=args.threshold,
-        limit=args.limit,
-        now=now
-    )
-
-    now_for_notifications = (
-        datetime.now(
-            timezone.utc
-        )
-    )
-
-    # ==============================================================
-    # RAPPORT EMAIL
-    # ==============================================================
-
-    email_message = format_email_message(
-        results,
-        stock_provider,
-        top=args.top,
-        threshold=args.threshold,
-        now=now_for_notifications
+    print(
+        f"\nScan multi-actifs — "
+        f"{now.strftime('%Y-%m-%d %H:%M')} UTC "
+        f"(seuil {args.threshold:.0f}/100)"
     )
 
     print(
-        "\n"
-        + email_message
+        f"Limite données : "
+        f"{args.limit}"
     )
 
-    # ==============================================================
-    # SLACK — UNIQUEMENT SIGNAL FORT
-    # ==============================================================
+    # ----------------------------------------------------------
+    # SCAN
+    # ----------------------------------------------------------
 
-    if has_signal(results):
+    all_results, stock_provider = (
+        scan_all(
+            threshold=args.threshold,
+            limit=args.limit,
+            top=args.top
+        )
+    )
 
-        slack_message = (
-            format_signal_message(
-                results,
-                stock_provider,
-                threshold=args.threshold,
-                now=now_for_notifications
+    # ----------------------------------------------------------
+    # MESSAGE
+    # ----------------------------------------------------------
+
+    message = format_full_message(
+        all_results,
+        stock_provider,
+        threshold=args.threshold,
+        top=args.top,
+        now=now
+    )
+
+    print(
+        "\n" + message
+    )
+
+    # ----------------------------------------------------------
+    # SIGNAL FORT ?
+    # ----------------------------------------------------------
+
+    signal_exists = has_signal(
+        all_results
+    )
+
+    # ----------------------------------------------------------
+    # EMAIL : TOUJOURS
+    # ----------------------------------------------------------
+
+    email_subject = (
+        f"Scan V4 — "
+        f"{count_signals(all_results)} "
+        f"signal(s) fort(s) — "
+        f"{now.strftime('%Y-%m-%d %H:%M')} UTC"
+    )
+
+    send_email(
+        os.getenv(
+            "SMTP_HOST",
+            "smtp.gmail.com"
+        ),
+        os.getenv(
+            "SMTP_PORT",
+            "465"
+        ),
+        os.getenv(
+            "EMAIL_SENDER"
+        ),
+        os.getenv(
+            "EMAIL_PASSWORD"
+        ),
+        os.getenv(
+            "EMAIL_RECIPIENT"
+        ),
+        email_subject,
+        message
+    )
+
+    # ----------------------------------------------------------
+    # SLACK : UNIQUEMENT SIGNAL FORT
+    # ----------------------------------------------------------
+
+    if signal_exists:
+
+        slack_url = os.getenv(
+            "SLACK_WEBHOOK_URL"
+        )
+
+        if slack_url:
+
+            send_slack(
+                slack_url,
+                message
             )
-        )
 
-        send_slack(
-            os.getenv(
-                "SLACK_WEBHOOK_URL"
-            ),
-            slack_message
-        )
+        else:
+
+            print(
+                "[Slack] "
+                "SLACK_WEBHOOK_URL absent."
+            )
 
     else:
 
         print(
-            "\nAucun SIGNAL FORT "
-            "— notification Slack non envoyée."
+            "[Slack] Aucun SIGNAL FORT "
+            "— Slack non envoyé."
         )
 
-    # ==============================================================
-    # EMAIL — TOUJOURS ENVOYÉ
-    # ==============================================================
 
-    signal_count = count_signals(
-        results
-    )
-
-    if signal_count:
-
-        subject = (
-            f"🔥 {signal_count} SIGNAL FORT"
-            f"{'S' if signal_count > 1 else ''} "
-            f"| 👀 À surveiller — "
-            f"{now.strftime('%Y-%m-%d %H:%M')}"
-        )
-
-    else:
-
-        subject = (
-            f"👀 Aucun SIGNAL FORT "
-            f"| À surveiller — "
-            f"{now.strftime('%Y-%m-%d %H:%M')}"
-        )
-
-    send_email(
-        smtp_host=os.getenv(
-            "SMTP_HOST",
-            "smtp.gmail.com"
-        ),
-
-        smtp_port=int(
-            os.getenv(
-                "SMTP_PORT"
-            )
-            or
-            "465"
-        ),
-
-        sender=os.getenv(
-            "EMAIL_SENDER"
-        ),
-
-        password=os.getenv(
-            "EMAIL_PASSWORD"
-        ),
-
-        recipient=os.getenv(
-            "EMAIL_RECIPIENT"
-        ),
-
-        subject=subject,
-
-        body=email_message
-    )
+if __name__ == "__main__":
+    main()
