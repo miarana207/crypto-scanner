@@ -33,4 +33,4 @@ jobs:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
         run: |
-          python run_and_notify.py --threshold 75 --limit 150 --top 5
+          python app/run_and_notify.py --threshold 75 --limit 150 --top 5
