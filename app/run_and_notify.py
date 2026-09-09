@@ -195,8 +195,38 @@ def format_message(all_results, stock_provider, top=5, threshold=60, now=None):
             )
         lines.append("")
 
-    if not any_signal:
+        if not any_signal:
         lines.append("Aucun signal au-dessus du seuil sur aucune catégorie.")
+        lines.append("")
+        lines.append("--- Meilleurs scores sous le seuil ---")
+
+        for name, df in all_results.items():
+            if df.empty:
+                continue
+
+            # Score maximal entre LONG et SHORT pour chaque actif
+            diagnostic = df.copy()
+            diagnostic["best_score"] = diagnostic[["score_long", "score_short"]].max(axis=1)
+
+            # Direction correspondant au meilleur score
+            diagnostic["best_direction"] = diagnostic.apply(
+                lambda row: "LONG" if row["score_long"] >= row["score_short"] else "SHORT",
+                axis=1
+            )
+
+            diagnostic = diagnostic.sort_values(
+                "best_score", ascending=False
+            ).head(top)
+
+            lines.append(name)
+
+            for _, row in diagnostic.iterrows():
+                lines.append(
+                    f"  {row['symbol']}: {row['best_score']:.0f} "
+                    f"({row['best_direction']})"
+                )
+
+            lines.append("")
 
     fresh_lines = freshness_summary(all_results, now)
     if fresh_lines:
