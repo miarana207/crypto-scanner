@@ -1,52 +1,109 @@
 """
-Lance le scan multi-actifs et envoie les résultats sur Slack + Email —
-uniquement si au moins un signal dépasse le seuil.
+Lance le scan multi-actifs V4 et envoie les résultats
+sur Slack + Email.
 
-Répartition des sources de données :
-- Crypto            : Binance, toujours (24/7, gratuit, sans clé)
-- Forex             : Finnhub, toujours (API officielle gratuite)
-- Actions/Indices/
-  Matières premières : Twelve Data de 3h à 19h UTC (6h-22h heure de
-                        Madagascar), Yahoo Finance le reste du temps
+ARCHITECTURE V4
+---------------
 
-v1.1 — fix : pause spécifique par fournisseur (Twelve Data = 8 req/min sur
-le plan gratuit, donc il faut au moins ~7.5s entre deux appels — l'ancienne
-pause de 0.3s partagée par tous les fournisseurs faisait dépasser ce quota
-en quelques secondes sur une liste de ~16 actifs, ce qui pouvait faire
-retomber les appels suivants sur des données dégradées/non rafraîchies).
-Ajout aussi d'un horodatage de fraîcheur (dernière bougie utilisée) dans
-le message, pour repérer immédiatement si une source sert des données
-figées.
+Score maximum : 100
 
-v1.2 — Forex basculé de Finnhub vers Twelve Data (le plan gratuit Finnhub
-ne donne plus accès à /forex/candle, 403 systématique). Le Forex tourne
-maintenant en continu (comme la Crypto), toujours via Twelve Data, avec
-la même pause de 9s que les autres catégories Twelve Data.
+    Trend    = 25
+    EMA      = 20
+    RSI      = 15
+    Volume   = 15
+    Breakout = 25
 
-v1.3 — deux fix suite aux premiers tests réels :
-- outputsize réduit de 500 à 150 par défaut (largement suffisant pour les
-  indicateurs, et consomme moins de crédits API Twelve Data — un
-  outputsize élevé semble coûter plusieurs crédits par appel, ce qui
-  déclenchait des 429 malgré la pause entre appels) ; pause portée à 9s
-  par marge de sécurité supplémentaire.
-- affichage "n/d" au lieu de "nan" pour le relvol des instruments sans
-  vraie donnée de volume (forex, or) dans le message envoyé.
+Seuil par défaut : 75/100
+
+STATUTS
+-------
+
+SIGNAL FORT
+    score >= seuil
+    + breakout confirmé
+    + volume confirmé
+
+ATTENTE
+    score >= seuil
+    mais breakout et/ou volume manquant
+
+SOUS SEUIL
+    score < seuil
+
+NOTIFICATIONS
+-------------
+
+Email :
+    envoyé à chaque scan.
+
+Slack :
+    envoyé uniquement lorsqu'au moins un
+    SIGNAL FORT est détecté.
+
+SOURCES
+-------
+
+Crypto :
+    Binance
+
+Forex :
+    Twelve Data
+
+Actions :
+    Twelve Data de 03h à 19h UTC
+    Yahoo Finance hors fenêtre
+
+Indices :
+    Yahoo Finance
+
+Matières premières :
+    Twelve Data de 03h à 19h UTC
+    Yahoo Finance hors fenêtre
+
+Argent :
+    Yahoo Finance
 """
+
 import argparse
 import os
 from datetime import datetime, timezone
 
 import pandas as pd
 
-from backtest import klines as klines_binance
-from data_sources import klines_yahoo, klines_twelvedata
-from scan import scan
-from notify import send_slack, send_email
-from assets import CRYPTO, ACTIONS, FOREX, INDICES, COMMODITIES, COMMODITIES_YAHOO_ONLY
+from backtest import (
+    klines as klines_binance,
+)
 
-# Pause (en secondes) entre deux appels API, par fournisseur.
-# Twelve Data (plan gratuit) : 8 requêtes/minute max -> il faut au moins
-# 60/8 = 7.5s entre deux appels. On prend une marge de sécurité à 8s.
+from data_sources import (
+    klines_yahoo,
+    klines_twelvedata,
+)
+
+from scan import scan
+
+from notify import (
+    send_slack,
+    send_email,
+)
+
+from assets import (
+    CRYPTO,
+    ACTIONS,
+    FOREX,
+    INDICES,
+    COMMODITIES,
+    COMMODITIES_YAHOO_ONLY,
+)
+
+
+# ============================================================
+# PARAMÈTRES V4
+# ============================================================
+
+DEFAULT_THRESHOLD = 75
+DEFAULT_LIMIT = 150
+DEFAULT_TOP = 5
+
 PAUSE_BY_PROVIDER = {
     "binance": 0.3,
     "twelvedata": 9.0,
@@ -54,265 +111,846 @@ PAUSE_BY_PROVIDER = {
 }
 
 
+# ============================================================
+# FENÊTRE TWELVE DATA
+# ============================================================
+
 def twelvedata_window_active(now=None):
-    """True si on est entre 3h et 19h UTC (6h-22h heure de Madagascar, UTC+3)."""
-    now = now or datetime.now(timezone.utc)
+    """
+    Twelve Data actif de 03h00 à 19h00 UTC.
+    Soit 06h00 à 22h00 à Madagascar (UTC+3).
+    """
+
+    now = (
+        now
+        or datetime.now(timezone.utc)
+    )
+
     return 3 <= now.hour < 19
 
 
+# ============================================================
+# CATÉGORIES
+# ============================================================
+
 def build_categories(now=None):
-    """Construit la config des catégories, avec la source active pour
-    Actions/Matières premières selon l'heure actuelle.
 
-    Chaque catégorie est une LISTE de groupes (symbols/fetcher/pause/
-    interval), pour permettre de mélanger deux sources différentes dans
-    une même catégorie affichée (ex: Or/WTI/Brent en bascule Twelve
-    Data/Yahoo, mais Argent toujours en Yahoo faute d'équivalent USD chez
-    Twelve Data)."""
-    use_twelvedata = twelvedata_window_active(now)
-    stock_provider = "twelvedata" if use_twelvedata else "yahoo"
-    stock_fetcher = klines_twelvedata if use_twelvedata else klines_yahoo
-    stock_pause = PAUSE_BY_PROVIDER[stock_provider]
+    use_twelvedata = (
+        twelvedata_window_active(now)
+    )
 
-    def resolve_symbols(entries, key):
-        return [e[key] for e in entries]
+    stock_provider = (
+        "twelvedata"
+        if use_twelvedata
+        else "yahoo"
+    )
+
+    stock_fetcher = (
+        klines_twelvedata
+        if use_twelvedata
+        else klines_yahoo
+    )
+
+    stock_pause = PAUSE_BY_PROVIDER[
+        stock_provider
+    ]
+
+    def resolve_symbols(
+        entries,
+        key,
+    ):
+        return [
+            e[key]
+            for e in entries
+        ]
 
     categories = {
-        "🪙 Crypto": [{
-            "symbols": CRYPTO, "fetcher": klines_binance, "interval": "5m",
-            "pause": PAUSE_BY_PROVIDER["binance"],
-        }],
-        "💵 Forex": [{
-            "symbols": resolve_symbols(FOREX, "twelvedata"),
-            "fetcher": klines_twelvedata, "interval": "15m",
-            "pause": PAUSE_BY_PROVIDER["twelvedata"],
-        }],
-        "📈 Actions": [{
-            "symbols": resolve_symbols(ACTIONS, stock_provider),
-            "fetcher": stock_fetcher, "interval": "15m",
-            "pause": stock_pause,
-        }],
-        "📊 Indices": [{
-            # Les indices ne sont pas disponibles sur le plan gratuit Twelve
-            # Data (réservé aux plans payants à partir de 29$/mois) — on
-            # utilise donc toujours Yahoo pour cette catégorie, quelle que
-            # soit la fenêtre horaire.
-            "symbols": resolve_symbols(INDICES, "yahoo"),
-            "fetcher": klines_yahoo, "interval": "15m",
-            "pause": PAUSE_BY_PROVIDER["yahoo"],
-        }],
-        "🛢️ Matières premières": [
+
+        # ====================================================
+        # CRYPTO
+        # ====================================================
+
+        "🪙 Crypto": [
             {
-                # Or, WTI, Brent : bascule Twelve Data / Yahoo comme les actions.
-                "symbols": resolve_symbols(COMMODITIES, stock_provider),
-                "fetcher": stock_fetcher, "interval": "15m",
+                "symbols": CRYPTO,
+                "fetcher": klines_binance,
+                "interval": "5m",
+                "pause": PAUSE_BY_PROVIDER[
+                    "binance"
+                ],
+                "provider": "binance",
+            }
+        ],
+
+        # ====================================================
+        # FOREX
+        # ====================================================
+
+        "💵 Forex": [
+            {
+                "symbols": resolve_symbols(
+                    FOREX,
+                    "twelvedata",
+                ),
+                "fetcher": klines_twelvedata,
+                "interval": "15m",
+                "pause": PAUSE_BY_PROVIDER[
+                    "twelvedata"
+                ],
+                "provider": "twelvedata",
+            }
+        ],
+
+        # ====================================================
+        # ACTIONS
+        # ====================================================
+
+        "📈 Actions": [
+            {
+                "symbols": resolve_symbols(
+                    ACTIONS,
+                    stock_provider,
+                ),
+                "fetcher": stock_fetcher,
+                "interval": "15m",
                 "pause": stock_pause,
-            },
+                "provider": stock_provider,
+            }
+        ],
+
+        # ====================================================
+        # INDICES
+        # ====================================================
+
+        "📊 Indices": [
             {
-                # Argent : pas de version USD chez Twelve Data -> Yahoo toujours.
-                "symbols": resolve_symbols(COMMODITIES_YAHOO_ONLY, "yahoo"),
-                "fetcher": klines_yahoo, "interval": "15m",
-                "pause": PAUSE_BY_PROVIDER["yahoo"],
+                "symbols": resolve_symbols(
+                    INDICES,
+                    "yahoo",
+                ),
+                "fetcher": klines_yahoo,
+                "interval": "15m",
+                "pause": PAUSE_BY_PROVIDER[
+                    "yahoo"
+                ],
+                "provider": "yahoo",
+            }
+        ],
+
+        # ====================================================
+        # MATIÈRES PREMIÈRES
+        # ====================================================
+
+        "🛢️ Matières premières": [
+
+            {
+                "symbols": resolve_symbols(
+                    COMMODITIES,
+                    stock_provider,
+                ),
+                "fetcher": stock_fetcher,
+                "interval": "15m",
+                "pause": stock_pause,
+                "provider": stock_provider,
+            },
+
+            {
+                "symbols": resolve_symbols(
+                    COMMODITIES_YAHOO_ONLY,
+                    "yahoo",
+                ),
+                "fetcher": klines_yahoo,
+                "interval": "15m",
+                "pause": PAUSE_BY_PROVIDER[
+                    "yahoo"
+                ],
+                "provider": "yahoo",
             },
         ],
     }
-    return categories, stock_provider
+
+    return (
+        categories,
+        stock_provider,
+    )
 
 
-def scan_all(threshold=60, limit=500, now=None):
-    categories, stock_provider = build_categories(now)
+# ============================================================
+# SCAN COMPLET
+# ============================================================
+
+def scan_all(
+    threshold=DEFAULT_THRESHOLD,
+    limit=DEFAULT_LIMIT,
+    now=None,
+):
+
+    categories, stock_provider = (
+        build_categories(now)
+    )
+
     results = {}
-    for name, groups in categories.items():
-        dfs = []
-        for cfg in groups:
-            print(f"--- {name} ({cfg['fetcher'].__name__}, pause={cfg['pause']}s) ---")
-            df = scan(
-                cfg["symbols"], fetcher=cfg["fetcher"], interval=cfg["interval"],
-                limit=limit, threshold=threshold, pause=cfg["pause"],
-            )
-            if not df.empty:
-                dfs.append(df)
-        if dfs:
-            merged = pd.concat(dfs, ignore_index=True)
-            merged["max_score"] = merged[["score_long", "score_short"]].max(axis=1)
-            merged = merged.sort_values("max_score", ascending=False).drop(columns="max_score").reset_index(drop=True)
-            results[name] = merged
-        else:
-            results[name] = pd.DataFrame()
-    return results, stock_provider
 
+    for name, groups in categories.items():
+
+        dfs = []
+
+        for cfg in groups:
+
+            print(
+                f"--- {name} "
+                f"({cfg['fetcher'].__name__}, "
+                f"source={cfg['provider']}, "
+                f"pause={cfg['pause']}s) ---"
+            )
+
+            df = scan(
+                cfg["symbols"],
+                fetcher=cfg["fetcher"],
+                interval=cfg["interval"],
+                limit=limit,
+                threshold=threshold,
+                pause=cfg["pause"],
+            )
+
+            if not df.empty:
+
+                # Source de chaque ligne
+                df = df.copy()
+                df["provider"] = (
+                    cfg["provider"]
+                )
+
+                dfs.append(df)
+
+        if dfs:
+
+            merged = pd.concat(
+                dfs,
+                ignore_index=True,
+            )
+
+            merged = merged.sort_values(
+                "best_score",
+                ascending=False,
+            ).reset_index(
+                drop=True
+            )
+
+            results[name] = merged
+
+        else:
+
+            results[name] = (
+                pd.DataFrame()
+            )
+
+    return (
+        results,
+        stock_provider,
+    )
+
+
+# ============================================================
+# SIGNAL FORT
+# ============================================================
 
 def has_signal(all_results):
+
     for df in all_results.values():
-        if not df.empty and df["direction"].isin(["LONG", "SHORT"]).any():
-            return True
-    return False
 
-
-def freshness_summary(all_results, now=None):
-    """Pour chaque catégorie non vide, l'horodatage de la bougie la plus
-    récente utilisée dans le scan — permet de repérer une source figée."""
-    now = now or datetime.now(timezone.utc)
-    lines = []
-    for name, df in all_results.items():
-        if df.empty or "last_candle" not in df.columns:
-            continue
-        most_recent = df["last_candle"].max()
-        age_min = (now - most_recent).total_seconds() / 60
-        flag = " ⚠️ possible donnée figée" if age_min > 90 else ""
-        lines.append(
-            f"{name}: dernière bougie {most_recent.strftime('%Y-%m-%d %H:%M UTC')} "
-            f"(il y a {age_min:.0f} min){flag}"
-        )
-    return lines
-
-def format_message(all_results, stock_provider, top=5, threshold=60, now=None):
-    now = now or datetime.now(timezone.utc)
-    ts = now.strftime("%Y-%m-%d %H:%M UTC")
-
-    lines = [
-        f"📊 Scan multi-actifs — {ts} (seuil {threshold:.0f})",
-        f"Source Actions/Matières premières ce run : {stock_provider} | "
-        f"Indices : yahoo (fixe, indices non couverts par le plan gratuit Twelve Data)",
-        "",
-    ]
-
-    any_signal = False
-
-    # ---------------------------------------------------------
-    # 1. Signaux au-dessus du seuil
-    # ---------------------------------------------------------
-    for name, df in all_results.items():
         if df.empty:
             continue
 
-        signals = df[df["direction"].isin(["LONG", "SHORT"])]
-
-        if signals.empty:
+        if "status" not in df.columns:
             continue
 
-        any_signal = True
-        lines.append(f"--- {name} ---")
+        if (
+            df["status"]
+            .eq("SIGNAL FORT")
+            .any()
+        ):
+            return True
 
-        for _, row in signals.head(top).iterrows():
-            best = max(row["score_long"], row["score_short"])
-            icon = "🟢" if row["direction"] == "LONG" else "🔴"
+    return False
 
-            relvol_display = (
-                "n/d" if pd.isna(row["relvol"]) else row["relvol"]
-            )
 
-            lines.append(
-                f"{icon} {row['symbol']}: {row['direction']} "
-                f"(score {best:.0f}) | "
-                f"close={row['close']} | "
-                f"RSI={row['rsi']} | "
-                f"relvol={relvol_display}"
-            )
+# ============================================================
+# NOMBRE DE SIGNAUX FORTS
+# ============================================================
 
-        lines.append("")
+def count_strong_signals(
+    all_results,
+):
 
-    # ---------------------------------------------------------
-    # 2. Aucun signal : afficher les meilleurs scores
-    #    avec le détail des composantes
-    # ---------------------------------------------------------
-    if not any_signal:
-        lines.append(
-            "Aucun signal au-dessus du seuil sur aucune catégorie."
+    total = 0
+
+    for df in all_results.values():
+
+        if df.empty:
+            continue
+
+        if "status" not in df.columns:
+            continue
+
+        total += int(
+            df["status"]
+            .eq("SIGNAL FORT")
+            .sum()
         )
-        lines.append("")
-        lines.append("--- Meilleurs scores sous le seuil ---")
 
-        for name, df in all_results.items():
-            if df.empty:
-                continue
+    return total
 
-            diagnostic = df.copy()
 
-            diagnostic["best_score"] = diagnostic[
-                ["score_long", "score_short"]
-            ].max(axis=1)
+# ============================================================
+# FRAÎCHEUR
+# ============================================================
 
-            diagnostic["best_direction"] = diagnostic.apply(
-                lambda row: (
-                    "LONG"
-                    if row["score_long"] >= row["score_short"]
-                    else "SHORT"
-                ),
-                axis=1,
+def freshness_summary(
+    all_results,
+    now=None,
+):
+
+    now = (
+        now
+        or datetime.now(timezone.utc)
+    )
+
+    lines = []
+
+    for name, df in all_results.items():
+
+        if (
+            df.empty
+            or "last_candle"
+            not in df.columns
+        ):
+            continue
+
+        valid_times = (
+            pd.to_datetime(
+                df["last_candle"],
+                utc=True,
+                errors="coerce",
+            )
+            .dropna()
+        )
+
+        if valid_times.empty:
+            continue
+
+        most_recent = (
+            valid_times.max()
+        )
+
+        age_min = (
+            now - most_recent
+        ).total_seconds() / 60
+
+        if age_min > 90:
+            flag = (
+                " ⚠️ possible donnée figée"
             )
 
-            diagnostic = diagnostic.sort_values(
+        elif age_min > 30:
+            flag = (
+                " ⚠️ donnée ancienne"
+            )
+
+        else:
+            flag = ""
+
+        lines.append(
+            f"{name}: dernière bougie "
+            f"{most_recent.strftime('%Y-%m-%d %H:%M UTC')} "
+            f"(il y a {age_min:.0f} min)"
+            f"{flag}"
+        )
+
+    return lines
+
+
+# ============================================================
+# FORMATAGE D'UNE LIGNE
+# ============================================================
+
+def format_row(
+    row,
+    threshold,
+):
+
+    status = row.get(
+        "status",
+        "SOUS SEUIL",
+    )
+
+    direction = row.get(
+        "direction",
+        "-",
+    )
+
+    best_score = float(
+        row.get(
+            "best_score",
+            max(
+                row.get(
+                    "score_long",
+                    0,
+                ),
+                row.get(
+                    "score_short",
+                    0,
+                ),
+            ),
+        )
+    )
+
+    if status == "SIGNAL FORT":
+
+        icon = "🔥"
+
+    elif status == "ATTENTE":
+
+        icon = "🟡"
+
+    elif direction == "LONG":
+
+        icon = "🟢"
+
+    elif direction == "SHORT":
+
+        icon = "🔴"
+
+    else:
+
+        icon = "⚪"
+
+    relvol = row.get(
+        "relvol",
+        float("nan"),
+    )
+
+    if pd.isna(relvol):
+        relvol_display = "n/d"
+    else:
+        relvol_display = (
+            f"{float(relvol):.2f}"
+        )
+
+    trend_pts = float(
+        row.get("trend_pts", 0)
+    )
+
+    ema_pts = float(
+        row.get("ema_pts", 0)
+    )
+
+    rsi_pts = float(
+        row.get("rsi_pts", 0)
+    )
+
+    volume_pts = float(
+        row.get("volume_pts", 0)
+    )
+
+    breakout_pts = float(
+        row.get("breakout_pts", 0)
+    )
+
+    missing = row.get(
+        "missing",
+        "",
+    )
+
+    if status == "SIGNAL FORT":
+
+        diagnostic = (
+            "🔥 PRISE DE POSITION IMMÉDIATE"
+        )
+
+    elif status == "ATTENTE":
+
+        diagnostic = (
+            f"manque : {missing}"
+        )
+
+    else:
+
+        diagnostic = (
+            "manque : SCORE"
+        )
+
+    return (
+        f"{icon} {row['symbol']}: "
+        f"{direction} | "
+        f"score {best_score:.0f}/100 | "
+        f"{status} | "
+        f"{diagnostic} | "
+        f"Trend={trend_pts:+.0f} "
+        f"EMA={ema_pts:+.0f} "
+        f"RSI={rsi_pts:+.0f} "
+        f"Volume={volume_pts:+.0f} "
+        f"Breakout={breakout_pts:+.0f} | "
+        f"RSI={float(row['rsi']):.1f} | "
+        f"relvol={relvol_display}"
+    )
+
+
+# ============================================================
+# MESSAGE PRINCIPAL
+# ============================================================
+
+def format_message(
+    all_results,
+    stock_provider,
+    top=DEFAULT_TOP,
+    threshold=DEFAULT_THRESHOLD,
+    now=None,
+):
+
+    now = (
+        now
+        or datetime.now(timezone.utc)
+    )
+
+    ts = now.strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+
+    strong_count = (
+        count_strong_signals(
+            all_results
+        )
+    )
+
+    if strong_count:
+
+        signal_header = (
+            f"🔥 {strong_count} SIGNAL(S) FORT(S) DÉTECTÉ(S)"
+        )
+
+    else:
+
+        signal_header = (
+            "ℹ️ Aucun SIGNAL FORT détecté"
+        )
+
+    lines = [
+
+        f"📊 Scan multi-actifs V4 — {ts}",
+
+        (
+            f"Seuil : {threshold:.0f}/100 | "
+            "Score maximum : 100"
+        ),
+
+        (
+            "Pondération : "
+            "Trend 25 | EMA 20 | RSI 15 | "
+            "Volume 15 | Breakout 25"
+        ),
+
+        (
+            "Breakout : ±0,10 % | "
+            "Volume : relvol ≥ 1,50"
+        ),
+
+        signal_header,
+
+        (
+            "Source Actions/Matières premières "
+            f"ce run : {stock_provider}"
+        ),
+
+        (
+            "Indices : yahoo "
+            "(fixe, indices non couverts "
+            "par le plan gratuit Twelve Data)"
+        ),
+
+        "",
+    ]
+
+    # ========================================================
+    # TOP 5 DE CHAQUE CATÉGORIE
+    # ========================================================
+
+    for name, df in all_results.items():
+
+        if df.empty:
+            continue
+
+        lines.append(
+            f"--- {name} | TOP {top} ---"
+        )
+
+        diagnostic = (
+            df.sort_values(
                 "best_score",
                 ascending=False,
-            ).head(top)
+            )
+            .head(top)
+        )
 
-            lines.append(name)
+        for _, row in diagnostic.iterrows():
 
-            for _, row in diagnostic.iterrows():
-                relvol_display = (
-                    "n/d" if pd.isna(row["relvol"]) else row["relvol"]
+            lines.append(
+                format_row(
+                    row,
+                    threshold,
                 )
+            )
 
-                lines.append(
-                    f"  {row['symbol']}: {row['best_score']:.0f} "
-                    f"({row['best_direction']}) | "
-                    f"tendance={row['trend_pts']:+.0f} | "
-                    f"EMA={row['ema_pts']:+.0f} | "
-                    f"RSI={row['rsi_pts']:+.0f} | "
-                    f"volume={row['volume_pts']:+.0f} | "
-                    f"breakout={row['breakout_pts']:+.0f} | "
-                    f"relvol={relvol_display}"
-                )
+        lines.append("")
 
-            lines.append("")
+    # ========================================================
+    # FRAÎCHEUR
+    # ========================================================
 
-    # ---------------------------------------------------------
-    # 3. Fraîcheur des données
-    # ---------------------------------------------------------
-    fresh_lines = freshness_summary(all_results, now)
+    fresh_lines = (
+        freshness_summary(
+            all_results,
+            now,
+        )
+    )
 
     if fresh_lines:
-        lines.append("--- Fraîcheur des données ---")
-        lines.extend(fresh_lines)
+
+        lines.append(
+            "--- Fraîcheur des données ---"
+        )
+
+        lines.extend(
+            fresh_lines
+        )
+
+        lines.append("")
+
+    # ========================================================
+    # LÉGENDE
+    # ========================================================
+
+    lines.extend(
+        [
+            "--- Légende ---",
+            (
+                "🔥 SIGNAL FORT = score ≥ seuil "
+                "+ BREAKOUT + VOLUME"
+            ),
+            (
+                "🟡 ATTENTE = score ≥ seuil "
+                "mais trigger incomplet"
+            ),
+            (
+                "SOUS SEUIL = score < seuil"
+            ),
+        ]
+    )
 
     return "\n".join(lines)
 
+
+# ============================================================
+# EXECUTION
+# ============================================================
+
 if __name__ == "__main__":
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--threshold", type=float, default=60)
-    ap.add_argument("--limit", type=int, default=150,
-                     help="Nombre de bougies récupérées par appel (150 suffit largement "
-                          "pour EMA50/RSI14/relvol20 ; une valeur plus haute comme 500 "
-                          "consomme inutilement plus de crédits API Twelve Data et peut "
-                          "déclencher un 429 malgré la pause entre appels).")
-    ap.add_argument("--top", type=int, default=5)
+
+    ap.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+    )
+
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help=(
+            "Nombre de bougies récupérées "
+            "par appel. 150 suffit pour "
+            "EMA50/RSI14/relvol20."
+        ),
+    )
+
+    ap.add_argument(
+        "--top",
+        type=int,
+        default=DEFAULT_TOP,
+    )
+
     args = ap.parse_args()
 
-    now = datetime.now(timezone.utc)
-    results, stock_provider = scan_all(threshold=args.threshold, limit=args.limit, now=now)
-    # FIX: on recalcule "now" ici, après la récupération de toutes les
-    # données (le run entier peut prendre plusieurs minutes à cause des
-    # pauses entre appels Twelve Data). Le réutiliser tel quel pour la
-    # fraîcheur ferait paraître les dernières catégories traitées comme
-    # "plus fraîches que le présent" (âge négatif) si une nouvelle bougie
-    # s'est formée pendant le run. Le "now" de début de run reste utilisé
-    # pour l'horodatage affiché en en-tête du message et pour la fenêtre
-    # horaire Twelve Data/Yahoo, ce qui reste correct.
-    now_for_freshness = datetime.now(timezone.utc)
-    message = format_message(results, stock_provider, top=args.top, threshold=args.threshold, now=now_for_freshness)
-    print("\n" + message)
+    # ========================================================
+    # HEURE DE DÉBUT
+    # ========================================================
 
-    if not has_signal(results):
-        print("\nAucun signal détecté sur aucune catégorie — notifications non envoyées.")
-    else:
-        send_slack(os.getenv("SLACK_WEBHOOK_URL"), message)
+    run_start = datetime.now(
+        timezone.utc
+    )
+
+    print(
+        "=================================================="
+    )
+
+    print(
+        "SCAN MULTI-ACTIFS V4"
+    )
+
+    print(
+        "=================================================="
+    )
+
+    print(
+        f"Début : "
+        f"{run_start.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+
+    print(
+        f"Seuil : {args.threshold:.0f}/100"
+    )
+
+    print(
+        f"Limit : {args.limit}"
+    )
+
+    print(
+        f"Top : {args.top}"
+    )
+
+    print()
+
+    # ========================================================
+    # SCAN
+    # ========================================================
+
+    results, stock_provider = scan_all(
+        threshold=args.threshold,
+        limit=args.limit,
+        now=run_start,
+    )
+
+    # ========================================================
+    # HEURE APRÈS SCAN
+    # ========================================================
+
+    now_after_scan = datetime.now(
+        timezone.utc
+    )
+
+    # ========================================================
+    # MESSAGE
+    # ========================================================
+
+    message = format_message(
+        results,
+        stock_provider,
+        top=args.top,
+        threshold=args.threshold,
+        now=now_after_scan,
+    )
+
+    print(
+        "\n" + message
+    )
+
+    # ========================================================
+    # NOTIFICATIONS
+    # ========================================================
+
+    strong_signal = has_signal(
+        results
+    )
+
+    # --------------------------------------------------------
+    # EMAIL : TOUJOURS
+    # --------------------------------------------------------
+
+    email_subject_prefix = (
+        "🔥 SIGNAL FORT"
+        if strong_signal
+        else "📊 Scan"
+    )
+
+    email_subject = (
+        f"{email_subject_prefix} "
+        f"multi-actifs — "
+        f"{run_start.strftime('%Y-%m-%d %H:%M')}"
+    )
+
+    try:
+
         send_email(
-            smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com"),
-            smtp_port=int(os.getenv("SMTP_PORT", "465")),
-            sender=os.getenv("EMAIL_SENDER"),
-            password=os.getenv("EMAIL_PASSWORD"),
-            recipient=os.getenv("EMAIL_RECIPIENT"),
-            subject=f"Scan multi-actifs — {now.strftime('%Y-%m-%d %H:%M')}",
+            smtp_host=os.getenv(
+                "SMTP_HOST",
+                "smtp.gmail.com",
+            ),
+
+            smtp_port=int(
+                os.getenv(
+                    "SMTP_PORT",
+                    "465",
+                )
+            ),
+
+            sender=os.getenv(
+                "EMAIL_SENDER"
+            ),
+
+            password=os.getenv(
+                "EMAIL_PASSWORD"
+            ),
+
+            recipient=os.getenv(
+                "EMAIL_RECIPIENT"
+            ),
+
+            subject=email_subject,
+
             body=message,
+        )
+
+        print(
+            "\n✅ Email envoyé."
+        )
+
+    except Exception as e:
+
+        print(
+            f"\n❌ Erreur envoi email : {e}"
+        )
+
+    # --------------------------------------------------------
+    # SLACK : UNIQUEMENT SIGNAL FORT
+    # --------------------------------------------------------
+
+    if strong_signal:
+
+        try:
+
+            send_slack(
+                os.getenv(
+                    "SLACK_WEBHOOK_URL"
+                ),
+                message,
+            )
+
+            print(
+                "✅ Slack envoyé "
+                "(SIGNAL FORT détecté)."
+            )
+
+        except Exception as e:
+
+            print(
+                f"❌ Erreur envoi Slack : {e}"
+            )
+
+    else:
+
+        print(
+            "\nℹ️ Aucun SIGNAL FORT : "
+            "Slack non envoyé."
         )
