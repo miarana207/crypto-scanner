@@ -1,5 +1,5 @@
 """
-Scanner multi-actifs — V1.3
+Scanner multi-actifs — V4
 
 Score maximal : 100 points.
 
@@ -15,20 +15,20 @@ Statut :
 - ATTENTE     : score >= seuil mais trigger incomplet
 - "-"         : score sous le seuil
 
-Breakout renforcé :
-- LONG  : clôture > précédent plus haut de 0,10 %
-- SHORT : clôture < précédent plus bas de 0,10 %
+Breakout :
+- LONG  : clôture > ancien plus haut de 20 bougies + 0,10 %
+- SHORT : clôture < ancien plus bas de 20 bougies - 0,10 %
 """
 
 import argparse
 import time
+
 import pandas as pd
 
 from backtest import (
     klines,
     indicators,
-    score,
-    BREAKOUT_BUFFER
+    score
 )
 
 
@@ -41,50 +41,71 @@ def scan(
     pause=0.3
 ):
 
-    rows=[]
-
+    rows = []
 
     for sym in symbols:
 
         try:
 
-            df=fetcher(
+            # ------------------------------------------------
+            # DONNÉES
+            # ------------------------------------------------
+
+            df = fetcher(
                 sym,
                 interval=interval,
                 limit=limit
             )
 
+            if df is None or df.empty:
 
-            d=indicators(df)
+                print(
+                    f"{sym}: aucune donnée reçue."
+                )
 
+                continue
 
-            d["prev_high"]=(
+            # ------------------------------------------------
+            # INDICATEURS
+            # ------------------------------------------------
+
+            d = indicators(df)
+
+            # ------------------------------------------------
+            # ANCIEN PLUS HAUT / BAS
+            # ------------------------------------------------
+
+            d["prev_high"] = (
                 d.high
                 .rolling(20)
                 .max()
                 .shift(1)
             )
 
-
-            d["prev_low"]=(
+            d["prev_low"] = (
                 d.low
                 .rolling(20)
                 .min()
                 .shift(1)
             )
 
+            if d.empty:
 
-            last=d.iloc[-1]
+                continue
 
+            last = d.iloc[-1]
 
-            required=[
+            # ------------------------------------------------
+            # DONNÉES MINIMALES NÉCESSAIRES
+            # ------------------------------------------------
+
+            required = [
                 "ema20",
                 "ema50",
                 "rsi",
                 "prev_high",
                 "prev_low"
             ]
-
 
             if any(
                 pd.isna(last[c])
@@ -98,155 +119,187 @@ def scan(
 
                 continue
 
+            # ------------------------------------------------
+            # SCORE
+            # ------------------------------------------------
 
-            L,S,details=score(
+            L, S, details = score(
                 last,
                 return_details=True
             )
 
-
-            # -------------------------------------------------------------
+            # ------------------------------------------------
             # DIRECTION
-            # -------------------------------------------------------------
+            # ------------------------------------------------
 
-            if L>=threshold and L>S:
+            if L >= threshold and L > S:
 
-                direction="LONG"
+                direction = "LONG"
 
-            elif S>=threshold and S>L:
+            elif S >= threshold and S > L:
 
-                direction="SHORT"
-
-            else:
-
-                # Pour le classement de surveillance, on conserve
-                # la meilleure direction même si le seuil n'est pas atteint.
-                if L>S:
-                    direction="LONG"
-                elif S>L:
-                    direction="SHORT"
-                else:
-                    direction="-"
-
-
-            # -------------------------------------------------------------
-            # TRIGGER
-            # -------------------------------------------------------------
-
-            if direction=="LONG":
-
-                breakout_ok=(
-                    float(last.close)
-                    >
-                    float(last.prev_high)
-                    *
-                    (1+BREAKOUT_BUFFER)
-                )
-
-                volume_ok=(
-                    details["volume"]==15
-                )
-
-
-            elif direction=="SHORT":
-
-                breakout_ok=(
-                    float(last.close)
-                    <
-                    float(last.prev_low)
-                    *
-                    (1-BREAKOUT_BUFFER)
-                )
-
-                volume_ok=(
-                    details["volume"]==-15
-                )
-
+                direction = "SHORT"
 
             else:
 
-                breakout_ok=False
-                volume_ok=False
+                direction = "-"
 
+            # ------------------------------------------------
+            # TRIGGER BREAKOUT + VOLUME
+            # ------------------------------------------------
 
-            # -------------------------------------------------------------
+            if direction == "LONG":
+
+                breakout_ok = (
+                    details["breakout"] == 20
+                )
+
+                volume_ok = (
+                    details["volume"] == 15
+                )
+
+            elif direction == "SHORT":
+
+                breakout_ok = (
+                    details["breakout"] == -20
+                )
+
+                volume_ok = (
+                    details["volume"] == -15
+                )
+
+            else:
+
+                breakout_ok = False
+                volume_ok = False
+
+            # ------------------------------------------------
             # STATUT
-            # -------------------------------------------------------------
+            # ------------------------------------------------
 
-            best_score=max(
-                L,
-                S
-            )
+            if direction in [
+                "LONG",
+                "SHORT"
+            ]:
 
+                if (
+                    breakout_ok
+                    and
+                    volume_ok
+                ):
 
-            if (
-                best_score>=threshold
-                and direction in ["LONG","SHORT"]
-            ):
-
-                if breakout_ok and volume_ok:
-
-                    status="SIGNAL FORT"
+                    status = "SIGNAL FORT"
 
                 else:
 
-                    status="ATTENTE"
-
+                    status = "ATTENTE"
 
             else:
 
-                status="-"
+                status = "-"
 
+            # ------------------------------------------------
+            # RAISONS DU TRIGGER
+            # ------------------------------------------------
+
+            if direction == "LONG":
+
+                if not breakout_ok and not volume_ok:
+
+                    trigger_missing = (
+                        "BREAKOUT + VOLUME"
+                    )
+
+                elif not breakout_ok:
+
+                    trigger_missing = "BREAKOUT"
+
+                elif not volume_ok:
+
+                    trigger_missing = "VOLUME"
+
+                else:
+
+                    trigger_missing = ""
+
+            elif direction == "SHORT":
+
+                if not breakout_ok and not volume_ok:
+
+                    trigger_missing = (
+                        "BREAKOUT + VOLUME"
+                    )
+
+                elif not breakout_ok:
+
+                    trigger_missing = "BREAKOUT"
+
+                elif not volume_ok:
+
+                    trigger_missing = "VOLUME"
+
+                else:
+
+                    trigger_missing = ""
+
+            else:
+
+                trigger_missing = "SEUIL"
+
+            # ------------------------------------------------
+            # RESULTAT
+            # ------------------------------------------------
 
             rows.append({
 
-                "symbol":sym,
+                "symbol": sym,
 
-                "close":round(
+                "close": round(
                     float(last.close),
                     4
                 ),
 
-                "score_long":L,
+                "score_long": L,
 
-                "score_short":S,
+                "score_short": S,
 
-                "direction":direction,
+                "direction": direction,
 
-                "status":status,
+                "status": status,
 
-                "rsi":round(
+                "trigger_missing": trigger_missing,
+
+                "rsi": round(
                     float(last.rsi),
                     1
                 ),
 
-                "relvol":(
+                "relvol": (
                     round(
                         float(last.relvol),
                         2
                     )
                     if not pd.isna(last.relvol)
-                    else float("nan")
+                    else
+                    float("nan")
                 ),
 
-                "trend1h":int(
+                "trend1h": int(
                     last.trend1h
                 ),
 
-                "trend_pts":details["trend"],
+                "trend_pts": details["trend"],
 
-                "ema_pts":details["ema"],
+                "ema_pts": details["ema"],
 
-                "rsi_pts":details["rsi"],
+                "rsi_pts": details["rsi"],
 
-                "volume_pts":details["volume"],
+                "volume_pts": details["volume"],
 
-                "breakout_pts":details["breakout"],
+                "breakout_pts": details["breakout"],
 
-                "last_candle":last.open_time,
-
+                "last_candle": last.open_time,
             })
-
 
         except Exception as e:
 
@@ -254,27 +307,30 @@ def scan(
                 f"Erreur sur {sym}: {e}"
             )
 
-
         time.sleep(pause)
 
+    # ========================================================
+    # AUCUN RÉSULTAT
+    # ========================================================
 
     if not rows:
 
         return pd.DataFrame()
 
+    # ========================================================
+    # DATAFRAME FINAL
+    # ========================================================
 
-    out=pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
 
-
-    out["max_score"]=out[
+    out["max_score"] = out[
         [
             "score_long",
             "score_short"
         ]
     ].max(axis=1)
 
-
-    out=(
+    out = (
         out
         .sort_values(
             "max_score",
@@ -285,16 +341,18 @@ def scan(
         )
     )
 
-
     return out.reset_index(
         drop=True
     )
 
 
-if __name__=="__main__":
+# ============================================================
+# EXÉCUTION DIRECTE
+# ============================================================
 
-    ap=argparse.ArgumentParser()
+if __name__ == "__main__":
 
+    ap = argparse.ArgumentParser()
 
     ap.add_argument(
         "--symbols",
@@ -313,12 +371,10 @@ if __name__=="__main__":
         ]
     )
 
-
     ap.add_argument(
         "--interval",
         default="5m"
     )
-
 
     ap.add_argument(
         "--limit",
@@ -326,17 +382,15 @@ if __name__=="__main__":
         default=1000
     )
 
-
     ap.add_argument(
         "--threshold",
         type=float,
         default=75,
         help=(
-            "Score minimum sur 100 pour "
-            "considérer un signal"
+            "Score minimum sur 100 "
+            "pour considérer un signal"
         )
     )
-
 
     ap.add_argument(
         "--top",
@@ -344,23 +398,19 @@ if __name__=="__main__":
         default=10
     )
 
-
-    args=ap.parse_args()
-
+    args = ap.parse_args()
 
     print(
         f"Scan de {len(args.symbols)} actifs "
         f"en {args.interval}...\n"
     )
 
-
-    results=scan(
+    results = scan(
         args.symbols,
         interval=args.interval,
         limit=args.limit,
         threshold=args.threshold
     )
-
 
     if results.empty:
 
@@ -369,7 +419,6 @@ if __name__=="__main__":
             "(données insuffisantes "
             "sur tous les actifs)."
         )
-
 
     else:
 
@@ -381,12 +430,10 @@ if __name__=="__main__":
             )
         )
 
-
         results.to_csv(
             "scan_results.csv",
             index=False
         )
-
 
         print(
             f"\n{len(results)} actifs analysés — "
