@@ -33,7 +33,7 @@ def scan(symbols, fetcher=klines, interval="5m", limit=1000, threshold=60, pause
                 print(f"{sym}: pas assez de données pour un score fiable, ignoré.")
                 continue
 
-            L, S = score(last)
+            L, S, details = score(last, return_details=True)
             if L >= threshold and L > S:
                 direction = "LONG"
             elif S >= threshold and S > L:
