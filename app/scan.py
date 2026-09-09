@@ -1,249 +1,440 @@
-"""
-Scanner multi-actifs V4.
-
-Logique :
-
-1. Score qualité /100
-2. Seuil stratégique = 75
-3. Breakout = déclencheur
-4. Volume = confirmation
-5. SIGNAL FORT uniquement si :
-       score >= 75
-       + breakout
-       + volume
-
-Statuts :
-
-- SIGNAL FORT
-- ATTENTE
-- SOUS SEUIL
-"""
-
-import argparse
 import time
+import math
 
 import pandas as pd
 
 from backtest import (
-    klines,
     indicators,
     score,
+    BREAKOUT_BUFFER,
 )
 
 
-# ============================================================
-# PARAMÈTRES
-# ============================================================
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
 
 DEFAULT_THRESHOLD = 75
+VOLUME_THRESHOLD = 1.5
+BREAKOUT_LOOKBACK = 20
 
 
-# ============================================================
-# SCAN
-# ============================================================
+# ======================================================================
+# OUTILS
+# ======================================================================
+
+def safe_float(
+    value,
+    default=float("nan")
+):
+    try:
+        value = float(value)
+
+        if math.isnan(value):
+            return default
+
+        return value
+
+    except Exception:
+        return default
+
+
+def best_direction(
+    score_long,
+    score_short
+):
+    if score_long > score_short:
+        return "LONG"
+
+    if score_short > score_long:
+        return "SHORT"
+
+    return "-"
+
+
+def format_relvol(
+    value
+):
+    if pd.isna(value):
+        return "n/d"
+
+    return f"{float(value):.2f}"
+
+
+# ======================================================================
+# SCAN D'UN ENSEMBLE D'ACTIFS
+# ======================================================================
 
 def scan(
     symbols,
-    fetcher=klines,
-    interval="5m",
+    fetcher,
+    interval="15m",
     limit=1000,
-    threshold=DEFAULT_THRESHOLD,
-    pause=0.3,
+    threshold=75,
+    pause=0.0,
 ):
-    rows = []
+    """
+    Scan V4.
 
-    for sym in symbols:
+    Pour chaque actif :
+
+    1. récupération des données
+    2. suppression de la bougie en formation
+    3. indicateurs
+    4. précédent plus haut / plus bas
+    5. score LONG / SHORT
+    6. validation breakout + volume
+    7. statut final
+    """
+
+    results = []
+
+    for symbol in symbols:
 
         try:
 
+            # ----------------------------------------------------------
+            # Récupération
+            # ----------------------------------------------------------
+
             df = fetcher(
-                sym,
+                symbol,
                 interval=interval,
-                limit=limit,
+                limit=limit
             )
 
             if df is None or df.empty:
                 print(
-                    f"{sym}: aucune donnée."
+                    f"{symbol}: aucune donnée"
                 )
+
+                if pause:
+                    time.sleep(pause)
+
                 continue
+
+            # ----------------------------------------------------------
+            # Nettoyage
+            # ----------------------------------------------------------
+
+            df = df.copy()
+
+            required = [
+                "open_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]
+
+            missing_columns = [
+                c
+                for c in required
+                if c not in df.columns
+            ]
+
+            if missing_columns:
+                print(
+                    f"{symbol}: colonnes absentes "
+                    f"{missing_columns}"
+                )
+
+                if pause:
+                    time.sleep(pause)
+
+                continue
+
+            df["open_time"] = pd.to_datetime(
+                df["open_time"],
+                utc=True,
+                errors="coerce"
+            )
+
+            for col in [
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]:
+                df[col] = pd.to_numeric(
+                    df[col],
+                    errors="coerce"
+                )
+
+            df = df.dropna(
+                subset=[
+                    "open_time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                ]
+            )
+
+            df = df.sort_values(
+                "open_time"
+            ).reset_index(
+                drop=True
+            )
+
+            if len(df) < 60:
+                print(
+                    f"{symbol}: données insuffisantes "
+                    f"({len(df)} bougies)"
+                )
+
+                if pause:
+                    time.sleep(pause)
+
+                continue
+
+            # ----------------------------------------------------------
+            # INDICATEURS
+            # ----------------------------------------------------------
 
             d = indicators(df)
 
-            # ------------------------------------------------
-            # Niveaux de breakout
-            # ------------------------------------------------
+            if d.empty:
+                continue
+
+            # ----------------------------------------------------------
+            # BREAKOUT
+            #
+            # IMPORTANT :
+            # shift(1) signifie que la bougie actuelle est comparée
+            # au plus haut / plus bas des 20 bougies précédentes.
+            # ----------------------------------------------------------
 
             d["prev_high"] = (
                 d["high"]
-                .rolling(20)
+                .rolling(
+                    BREAKOUT_LOOKBACK
+                )
                 .max()
                 .shift(1)
             )
 
             d["prev_low"] = (
                 d["low"]
-                .rolling(20)
+                .rolling(
+                    BREAKOUT_LOOKBACK
+                )
                 .min()
                 .shift(1)
             )
 
+            # ----------------------------------------------------------
+            # Dernière bougie CLÔTURÉE
+            # ----------------------------------------------------------
+
             last = d.iloc[-1]
 
-            required = [
-                "ema20",
-                "ema50",
-                "rsi",
-                "prev_high",
-                "prev_low",
-            ]
-
-            if any(
-                pd.isna(last[c])
-                for c in required
-            ):
-                print(
-                    f"{sym}: pas assez de données "
-                    f"pour un score fiable, ignoré."
-                )
-                continue
-
-            # ------------------------------------------------
-            # Score
-            # ------------------------------------------------
-
-            L, S, details = score(
+            (
+                score_long,
+                score_short,
+                details
+            ) = score(
                 last,
-                return_details=True,
+                return_details=True
             )
 
-            # ------------------------------------------------
-            # Direction
-            # ------------------------------------------------
+            # ----------------------------------------------------------
+            # DIRECTION
+            # ----------------------------------------------------------
 
-            if L > S:
+            direction = best_direction(
+                score_long,
+                score_short
+            )
 
-                direction = "LONG"
+            best_score = max(
+                score_long,
+                score_short
+            )
 
-                best_score = L
+            # ----------------------------------------------------------
+            # BREAKOUT DU CÔTÉ RETENU
+            # ----------------------------------------------------------
 
-                trend_pts = details["long_trend"]
-                ema_pts = details["long_ema"]
-                rsi_pts = details["long_rsi"]
-                volume_pts = details["long_volume"]
-                breakout_pts = details["long_breakout"]
+            if direction == "LONG":
 
-            elif S > L:
+                breakout_ok = bool(
+                    details["breakout_long"]
+                )
 
-                direction = "SHORT"
+            elif direction == "SHORT":
 
-                best_score = S
-
-                trend_pts = details["short_trend"]
-                ema_pts = details["short_ema"]
-                rsi_pts = details["short_rsi"]
-                volume_pts = details["short_volume"]
-                breakout_pts = details["short_breakout"]
+                breakout_ok = bool(
+                    details["breakout_short"]
+                )
 
             else:
 
-                direction = "LONG"
-                best_score = L
+                breakout_ok = False
 
-                trend_pts = details["long_trend"]
-                ema_pts = details["long_ema"]
-                rsi_pts = details["long_rsi"]
-                volume_pts = details["long_volume"]
-                breakout_pts = details["long_breakout"]
+            # ----------------------------------------------------------
+            # VOLUME DU CÔTÉ RETENU
+            # ----------------------------------------------------------
 
-            # ------------------------------------------------
-            # Conditions du déclencheur
-            # ------------------------------------------------
-
-            breakout_ok = (
-                breakout_pts > 0
+            volume_ok = bool(
+                details["volume_ok"]
             )
 
-            volume_ok = (
-                volume_pts > 0
-            )
+            # ----------------------------------------------------------
+            # STATUT
+            # ----------------------------------------------------------
 
-            score_ok = (
+            if (
                 best_score >= threshold
-            )
-
-            # ------------------------------------------------
-            # Statut
-            # ------------------------------------------------
-
-            if score_ok and breakout_ok and volume_ok:
+                and breakout_ok
+                and volume_ok
+            ):
 
                 status = "SIGNAL FORT"
 
-                missing = ""
-
-            elif not score_ok:
-
-                status = "SOUS SEUIL"
-
-                missing = "SCORE"
-
-            else:
+            elif best_score >= threshold:
 
                 status = "ATTENTE"
 
-                missing_parts = []
-
-                if not breakout_ok:
-                    missing_parts.append(
-                        "BREAKOUT"
-                    )
-
-                if not volume_ok:
-                    missing_parts.append(
-                        "VOLUME"
-                    )
-
-                missing = " + ".join(
-                    missing_parts
-                )
-
-            # ------------------------------------------------
-            # Relvol
-            # ------------------------------------------------
-
-            relvol = last.relvol
-
-            if pd.isna(relvol):
-                relvol_value = float("nan")
             else:
-                relvol_value = float(
-                    relvol
+
+                status = "SOUS SEUIL"
+
+            # ----------------------------------------------------------
+            # CONDITIONS MANQUANTES
+            # ----------------------------------------------------------
+
+            missing = []
+
+            if best_score < threshold:
+                missing.append(
+                    f"SCORE < {threshold:.0f}"
                 )
 
-            # ------------------------------------------------
-            # Résultat
-            # ------------------------------------------------
+            if not breakout_ok:
+                missing.append(
+                    "BREAKOUT"
+                )
 
-            rows.append(
+            if not volume_ok:
+                missing.append(
+                    "VOLUME"
+                )
+
+            if missing:
+                missing_text = (
+                    " + ".join(missing)
+                )
+            else:
+                missing_text = "aucune"
+
+            # ----------------------------------------------------------
+            # POINTS DU CÔTÉ RETENU
+            # ----------------------------------------------------------
+
+            if direction == "LONG":
+
+                trend_pts = details[
+                    "long"
+                ]["trend"]
+
+                ema_pts = details[
+                    "long"
+                ]["ema"]
+
+                rsi_pts = details[
+                    "long"
+                ]["rsi"]
+
+                volume_pts = details[
+                    "long"
+                ]["volume"]
+
+                breakout_pts = details[
+                    "long"
+                ]["breakout"]
+
+            elif direction == "SHORT":
+
+                trend_pts = details[
+                    "short"
+                ]["trend"]
+
+                ema_pts = details[
+                    "short"
+                ]["ema"]
+
+                rsi_pts = details[
+                    "short"
+                ]["rsi"]
+
+                volume_pts = details[
+                    "short"
+                ]["volume"]
+
+                breakout_pts = details[
+                    "short"
+                ]["breakout"]
+
+            else:
+
+                trend_pts = 0
+                ema_pts = 0
+                rsi_pts = 0
+                volume_pts = 0
+                breakout_pts = 0
+
+            # ----------------------------------------------------------
+            # FRAÎCHEUR
+            # ----------------------------------------------------------
+
+            last_candle = last[
+                "open_time"
+            ]
+
+            # ----------------------------------------------------------
+            # RELVOL
+            # ----------------------------------------------------------
+
+            relvol = safe_float(
+                last.get(
+                    "relvol",
+                    float("nan")
+                )
+            )
+
+            # ----------------------------------------------------------
+            # RESULTAT
+            # ----------------------------------------------------------
+
+            results.append(
                 {
-                    "symbol": sym,
+                    "symbol": symbol,
 
-                    "close": round(
-                        float(last.close),
-                        4,
+                    "close": safe_float(
+                        last["close"]
                     ),
 
-                    "score_long": float(L),
-                    "score_short": float(S),
+                    "score_long": float(
+                        score_long
+                    ),
 
-                    "score": float(
-                        best_score
+                    "score_short": float(
+                        score_short
                     ),
 
                     "direction": direction,
 
-                    # Composantes
+                    "best_score": float(
+                        best_score
+                    ),
+
+                    "status": status,
+
+                    "missing": missing_text,
+
                     "trend_pts": float(
                         trend_pts
                     ),
@@ -264,155 +455,56 @@ def scan(
                         breakout_pts
                     ),
 
-                    # Conditions
-                    "score_ok": bool(
-                        score_ok
+                    "breakout_ok": breakout_ok,
+
+                    "volume_ok": volume_ok,
+
+                    "rsi": safe_float(
+                        last.get(
+                            "rsi",
+                            float("nan")
+                        )
                     ),
 
-                    "breakout_ok": bool(
-                        breakout_ok
+                    "relvol": relvol,
+
+                    "trend1h": safe_float(
+                        last.get(
+                            "trend1h",
+                            0
+                        ),
+                        0
                     ),
 
-                    "volume_ok": bool(
-                        volume_ok
-                    ),
-
-                    "status": status,
-
-                    "missing": missing,
-
-                    # Indicateurs
-                    "rsi": round(
-                        float(last.rsi),
-                        1,
-                    ),
-
-                    "relvol": relvol_value,
-
-                    "trend1h": int(
-                        last.trend1h
-                    ),
-
-                    # Horodatage
-                    "last_candle": last.open_time,
+                    "last_candle": last_candle,
                 }
             )
 
-        except Exception as e:
+        except Exception as exc:
 
             print(
-                f"Erreur sur {sym}: {e}"
+                f"{symbol}: ERREUR — {exc}"
             )
 
-        time.sleep(pause)
+        finally:
 
-    # ========================================================
-    # DATAFRAME FINAL
-    # ========================================================
+            if pause:
+                time.sleep(
+                    pause
+                )
 
-    if not rows:
+    if not results:
         return pd.DataFrame()
 
-    out = pd.DataFrame(rows)
-
-    out = out.sort_values(
-        "score",
-        ascending=False,
+    result = pd.DataFrame(
+        results
     )
 
-    return out.reset_index(
+    result = result.sort_values(
+        "best_score",
+        ascending=False
+    ).reset_index(
         drop=True
     )
 
-
-# ============================================================
-# EXÉCUTION DIRECTE
-# ============================================================
-
-if __name__ == "__main__":
-
-    ap = argparse.ArgumentParser()
-
-    ap.add_argument(
-        "--symbols",
-        nargs="+",
-        default=[
-            "BTCUSDT",
-            "ETHUSDT",
-            "SOLUSDT",
-            "BNBUSDT",
-            "XRPUSDT",
-            "ADAUSDT",
-            "DOGEUSDT",
-            "AVAXUSDT",
-            "LINKUSDT",
-            "DOTUSDT",
-        ],
-    )
-
-    ap.add_argument(
-        "--interval",
-        default="5m",
-    )
-
-    ap.add_argument(
-        "--limit",
-        type=int,
-        default=1000,
-    )
-
-    ap.add_argument(
-        "--threshold",
-        type=float,
-        default=75,
-    )
-
-    ap.add_argument(
-        "--top",
-        type=int,
-        default=10,
-    )
-
-    args = ap.parse_args()
-
-    print(
-        f"Scan de {len(args.symbols)} actifs "
-        f"en {args.interval}..."
-    )
-
-    results = scan(
-        args.symbols,
-        interval=args.interval,
-        limit=args.limit,
-        threshold=args.threshold,
-    )
-
-    if results.empty:
-
-        print(
-            "Aucun résultat exploitable."
-        )
-
-    else:
-
-        print(
-            results.head(
-                args.top
-            ).to_string(
-                index=False
-            )
-        )
-
-        results.to_csv(
-            "scan_results.csv",
-            index=False,
-        )
-
-        print(
-            f"\n{len(results)} actifs analysés."
-        )
-
-        print(
-            "Résultats complets : "
-            "scan_results.csv"
-        )
+    return result
