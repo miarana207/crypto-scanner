@@ -211,7 +211,7 @@ def format_message(all_results, stock_provider, top=5, threshold=60, now=None):
                 axis=1
             )
 
-                                    diagnostic = diagnostic.sort_values(
+              diagnostic = diagnostic.sort_values(
                 "best_score", ascending=False
             ).head(top)
 
@@ -229,8 +229,9 @@ def format_message(all_results, stock_provider, top=5, threshold=60, now=None):
                 )
 
             lines.append("")
-        
+
     fresh_lines = freshness_summary(all_results, now)
+                                    
     if fresh_lines:
         lines.append("--- Fraîcheur des données ---")
         lines.extend(fresh_lines)
