@@ -211,7 +211,7 @@ def format_message(all_results, stock_provider, top=5, threshold=60, now=None):
                 axis=1
             )
 
-                        diagnostic = diagnostic.sort_values(
+                                    diagnostic = diagnostic.sort_values(
                 "best_score", ascending=False
             ).head(top)
 
