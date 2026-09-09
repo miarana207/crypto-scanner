@@ -264,7 +264,7 @@ if __name__ == "__main__":
         send_slack(os.getenv("SLACK_WEBHOOK_URL"), message)
         send_email(
             smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com"),
-            smtp_port=int(os.getenv("SMTP_PORT", "465")),
+            smtp_port=int(os.getenv("SMTP_PORT") or "465"),
             sender=os.getenv("EMAIL_SENDER"),
             password=os.getenv("EMAIL_PASSWORD"),
             recipient=os.getenv("EMAIL_RECIPIENT"),
