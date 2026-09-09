@@ -11,11 +11,13 @@ from backtest import (
 
 
 # ======================================================================
-# CONFIGURATION
+# CONFIGURATION V4
 # ======================================================================
 
 DEFAULT_THRESHOLD = 75
+
 VOLUME_THRESHOLD = 1.5
+
 BREAKOUT_LOOKBACK = 20
 
 
@@ -28,6 +30,7 @@ def safe_float(
     default=float("nan")
 ):
     try:
+
         value = float(value)
 
         if math.isnan(value):
@@ -43,6 +46,7 @@ def best_direction(
     score_long,
     score_short
 ):
+
     if score_long > score_short:
         return "LONG"
 
@@ -55,6 +59,7 @@ def best_direction(
 def format_relvol(
     value
 ):
+
     if pd.isna(value):
         return "n/d"
 
@@ -62,7 +67,7 @@ def format_relvol(
 
 
 # ======================================================================
-# SCAN D'UN ENSEMBLE D'ACTIFS
+# SCAN
 # ======================================================================
 
 def scan(
@@ -71,21 +76,8 @@ def scan(
     interval="15m",
     limit=1000,
     threshold=75,
-    pause=0.0,
+    pause=0.0
 ):
-    """
-    Scan V4.
-
-    Pour chaque actif :
-
-    1. récupération des données
-    2. suppression de la bougie en formation
-    3. indicateurs
-    4. précédent plus haut / plus bas
-    5. score LONG / SHORT
-    6. validation breakout + volume
-    7. statut final
-    """
 
     results = []
 
@@ -94,7 +86,7 @@ def scan(
         try:
 
             # ----------------------------------------------------------
-            # Récupération
+            # DONNÉES
             # ----------------------------------------------------------
 
             df = fetcher(
@@ -104,6 +96,7 @@ def scan(
             )
 
             if df is None or df.empty:
+
                 print(
                     f"{symbol}: aucune donnée"
                 )
@@ -112,10 +105,6 @@ def scan(
                     time.sleep(pause)
 
                 continue
-
-            # ----------------------------------------------------------
-            # Nettoyage
-            # ----------------------------------------------------------
 
             df = df.copy()
 
@@ -129,21 +118,23 @@ def scan(
             ]
 
             missing_columns = [
-                c
-                for c in required
-                if c not in df.columns
+                col
+                for col in required
+                if col not in df.columns
             ]
 
             if missing_columns:
+
                 print(
                     f"{symbol}: colonnes absentes "
                     f"{missing_columns}"
                 )
 
-                if pause:
-                    time.sleep(pause)
-
                 continue
+
+            # ----------------------------------------------------------
+            # TYPES
+            # ----------------------------------------------------------
 
             df["open_time"] = pd.to_datetime(
                 df["open_time"],
@@ -158,6 +149,7 @@ def scan(
                 "close",
                 "volume",
             ]:
+
                 df[col] = pd.to_numeric(
                     df[col],
                     errors="coerce"
@@ -173,20 +165,21 @@ def scan(
                 ]
             )
 
-            df = df.sort_values(
-                "open_time"
-            ).reset_index(
-                drop=True
+            df = (
+                df.sort_values(
+                    "open_time"
+                )
+                .reset_index(
+                    drop=True
+                )
             )
 
             if len(df) < 60:
+
                 print(
                     f"{symbol}: données insuffisantes "
                     f"({len(df)} bougies)"
                 )
-
-                if pause:
-                    time.sleep(pause)
 
                 continue
 
@@ -194,17 +187,15 @@ def scan(
             # INDICATEURS
             # ----------------------------------------------------------
 
-            d = indicators(df)
-
-            if d.empty:
-                continue
+            d = indicators(
+                df
+            )
 
             # ----------------------------------------------------------
             # BREAKOUT
             #
-            # IMPORTANT :
-            # shift(1) signifie que la bougie actuelle est comparée
-            # au plus haut / plus bas des 20 bougies précédentes.
+            # Le niveau de référence est constitué des
+            # 20 bougies précédentes.
             # ----------------------------------------------------------
 
             d["prev_high"] = (
@@ -225,8 +216,26 @@ def scan(
                 .shift(1)
             )
 
+            d["breakout_long"] = (
+                d["close"]
+                >
+                d["prev_high"]
+                * (
+                    1 + BREAKOUT_BUFFER
+                )
+            )
+
+            d["breakout_short"] = (
+                d["close"]
+                <
+                d["prev_low"]
+                * (
+                    1 - BREAKOUT_BUFFER
+                )
+            )
+
             # ----------------------------------------------------------
-            # Dernière bougie CLÔTURÉE
+            # DERNIÈRE BOUGIE CLÔTURÉE
             # ----------------------------------------------------------
 
             last = d.iloc[-1]
@@ -261,13 +270,17 @@ def scan(
             if direction == "LONG":
 
                 breakout_ok = bool(
-                    details["breakout_long"]
+                    details[
+                        "breakout_long"
+                    ]
                 )
 
             elif direction == "SHORT":
 
                 breakout_ok = bool(
-                    details["breakout_short"]
+                    details[
+                        "breakout_short"
+                    ]
                 )
 
             else:
@@ -275,11 +288,13 @@ def scan(
                 breakout_ok = False
 
             # ----------------------------------------------------------
-            # VOLUME DU CÔTÉ RETENU
+            # VOLUME
             # ----------------------------------------------------------
 
             volume_ok = bool(
-                details["volume_ok"]
+                details[
+                    "volume_ok"
+                ]
             )
 
             # ----------------------------------------------------------
@@ -309,6 +324,7 @@ def scan(
             missing = []
 
             if best_score < threshold:
+
                 missing.append(
                     f"SCORE < {threshold:.0f}"
                 )
@@ -324,10 +340,15 @@ def scan(
                 )
 
             if missing:
+
                 missing_text = (
-                    " + ".join(missing)
+                    " + ".join(
+                        missing
+                    )
                 )
+
             else:
+
                 missing_text = "aucune"
 
             # ----------------------------------------------------------
@@ -387,25 +408,6 @@ def scan(
                 breakout_pts = 0
 
             # ----------------------------------------------------------
-            # FRAÎCHEUR
-            # ----------------------------------------------------------
-
-            last_candle = last[
-                "open_time"
-            ]
-
-            # ----------------------------------------------------------
-            # RELVOL
-            # ----------------------------------------------------------
-
-            relvol = safe_float(
-                last.get(
-                    "relvol",
-                    float("nan")
-                )
-            )
-
-            # ----------------------------------------------------------
             # RESULTAT
             # ----------------------------------------------------------
 
@@ -455,9 +457,13 @@ def scan(
                         breakout_pts
                     ),
 
-                    "breakout_ok": breakout_ok,
+                    "breakout_ok": bool(
+                        breakout_ok
+                    ),
 
-                    "volume_ok": volume_ok,
+                    "volume_ok": bool(
+                        volume_ok
+                    ),
 
                     "rsi": safe_float(
                         last.get(
@@ -466,45 +472,70 @@ def scan(
                         )
                     ),
 
-                    "relvol": relvol,
+                    "relvol": safe_float(
+                        last.get(
+                            "relvol",
+                            float("nan")
+                        )
+                    ),
 
-                    "trend1h": safe_float(
+                    "trend1h": int(
                         last.get(
                             "trend1h",
                             0
-                        ),
-                        0
+                        )
                     ),
 
-                    "last_candle": last_candle,
+                    "last_candle": last[
+                        "open_time"
+                    ],
                 }
             )
 
         except Exception as exc:
 
             print(
-                f"{symbol}: ERREUR — {exc}"
+                f"{symbol}: ERREUR : {exc}"
             )
 
-        finally:
-
-            if pause:
-                time.sleep(
-                    pause
-                )
+        if pause:
+            time.sleep(
+                pause
+            )
 
     if not results:
-        return pd.DataFrame()
 
-    result = pd.DataFrame(
-        results
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "close",
+                "score_long",
+                "score_short",
+                "direction",
+                "best_score",
+                "status",
+                "missing",
+                "trend_pts",
+                "ema_pts",
+                "rsi_pts",
+                "volume_pts",
+                "breakout_pts",
+                "breakout_ok",
+                "volume_ok",
+                "rsi",
+                "relvol",
+                "trend1h",
+                "last_candle",
+            ]
+        )
+
+    return (
+        pd.DataFrame(results)
+        .sort_values(
+            "best_score",
+            ascending=False
+        )
+        .reset_index(
+            drop=True
+        )
     )
-
-    result = result.sort_values(
-        "best_score",
-        ascending=False
-    ).reset_index(
-        drop=True
-    )
-
-    return result
