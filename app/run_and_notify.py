@@ -218,10 +218,15 @@ def format_message(all_results, stock_provider, top=5, threshold=60, now=None):
             lines.append(name)
 
             for _, row in diagnostic.iterrows():
-                lines.append(
-                    f"  {row['symbol']}: {row['best_score']:.0f} "
-                    f"({row['best_direction']})"
-                )
+    lines.append(
+        f"  {row['symbol']}: {row['best_score']:.0f} "
+        f"({row['best_direction']}) | "
+        f"Tendance={row['trend_pts']:+.0f} | "
+        f"EMA={row['ema_pts']:+.0f} | "
+        f"RSI={row['rsi_pts']:+.0f} | "
+        f"Volume={row['volume_pts']:+.0f} | "
+        f"Breakout={row['breakout_pts']:+.0f}"
+    )
 
             lines.append("")
         
