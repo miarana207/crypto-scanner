@@ -1,164 +1,752 @@
-"""
-Sources de données OHLCV par classe d'actifs.
-
-- klines_binance (dans backtest.py)  : crypto, API publique Binance
-- klines_yahoo (ici)                 : fallback actions/indices/matières
-  premières, endpoint non-officiel Yahoo Finance
-- klines_twelvedata (ici)            : actions/indices/matières premières,
-  API officielle gratuite (nécessite TWELVEDATA_API_KEY)
-- klines_finnhub_forex (ici)         : forex, API officielle gratuite
-  (nécessite FINNHUB_API_KEY)
-
-⚠️ v1.1 — fix : les paires spot (or, argent, pétrole, forex) renvoyées par
-Twelve Data n'incluent pas de colonne "volume" dans leur réponse. L'ancien
-code plantait avec une KeyError 'volume' sur ces symboles. On la remplace
-maintenant par 0.0 quand elle est absente (le relvol ne sera de toute
-façon pas interprétable sans volume réel pour ces actifs).
-"""
 import os
-import time
+import argparse
 import requests
+import math
+
+from datetime import datetime, timezone
+
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-# ---------------------------------------------------------------------------
-# Yahoo Finance (non-officiel) — fallback pour actions/indices/matières 1ères
-# ---------------------------------------------------------------------------
-_YF_CONFIG = {
-    "1m":  ("1m", "7d"),
-    "5m":  ("5m", "60d"),
-    "15m": ("15m", "60d"),
-    "30m": ("30m", "60d"),
-    "1h":  ("60m", "730d"),
-    "1d":  ("1d", "10y"),
-}
+# ============================================================
+# CONFIGURATION BINANCE
+# ============================================================
+
+BASE = os.getenv(
+    "BINANCE_DATA_URL",
+    "https://api.binance.com"
+)
 
 
-def klines_yahoo(symbol, interval="15m", limit=500, **kwargs):
-    yf_interval, yf_range = _YF_CONFIG.get(interval, ("15m", "60d"))
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": yf_range, "interval": yf_interval}
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; scanner-perso/1.0)"}
+# ============================================================
+# PARAMÈTRE BREAKOUT
+# ============================================================
 
-    r = requests.get(url, params=params, headers=headers, timeout=15)
-    r.raise_for_status()
-    payload = r.json()
-
-    result_list = payload.get("chart", {}).get("result")
-    if not result_list:
-        err = payload.get("chart", {}).get("error")
-        raise ValueError(f"Yahoo Finance n'a rien renvoyé pour {symbol}: {err}")
-    result = result_list[0]
-
-    timestamps = result.get("timestamp")
-    if not timestamps:
-        raise ValueError(f"Aucune bougie disponible pour {symbol} sur cette période")
-
-    quote = result["indicators"]["quote"][0]
-    df = pd.DataFrame({
-        "open_time": pd.to_datetime(timestamps, unit="s", utc=True),
-        "open": quote["open"], "high": quote["high"], "low": quote["low"],
-        "close": quote["close"], "volume": quote["volume"],
-    }).dropna().reset_index(drop=True)
-
-    return df.tail(limit).reset_index(drop=True)
+# Le prix doit dépasser l'ancien plus haut / plus bas
+# d'au moins 0,10 % pour être considéré comme un breakout.
+BREAKOUT_BUFFER = 0.001
 
 
-# ---------------------------------------------------------------------------
-# Twelve Data — actions/indices/matières premières (API officielle, clé requise)
-# ---------------------------------------------------------------------------
-_TD_INTERVAL_MAP = {
-    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
-    "1h": "1h", "1d": "1day",
-}
+# ============================================================
+# DONNÉES BINANCE
+# ============================================================
 
+def klines(
+    symbol,
+    interval="5m",
+    limit=1000,
+    start=None,
+    end=None
+):
 
-def klines_twelvedata(symbol, interval="15m", limit=500, **kwargs):
-    api_key = os.environ.get("TWELVE_DATA_API_KEY")
-    if not api_key:
-        raise RuntimeError("TWELVE_DATA_API_KEY manquant (variable d'environnement)")
-
-    td_interval = _TD_INTERVAL_MAP.get(interval, "15min")
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol, "interval": td_interval,
-        "outputsize": min(limit, 5000), "apikey": api_key,
-        # FIX: sans ce paramètre, Twelve Data renvoie les horodatages dans
-        # le fuseau horaire par défaut de l'instrument ("Exchange"), qui
-        # n'est PAS l'UTC. Notre code parse pourtant la réponse avec
-        # utc=True (voir plus bas), ce qui décalait artificiellement les
-        # heures affichées — au point de faire apparaître des bougies
-        # "dans le futur" pour le forex/les matières premières, actifs
-        # dont l'écart de fuseau est le plus visible.
-        "timezone": "UTC",
+    p = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": limit
     }
-    r = requests.get(url, params=params, timeout=15)
+
+    if start:
+        p["startTime"] = int(
+            start.timestamp() * 1000
+        )
+
+    if end:
+        p["endTime"] = int(
+            end.timestamp() * 1000
+        )
+
+    r = requests.get(
+        BASE + "/api/v3/klines",
+        params=p,
+        timeout=30
+    )
+
     r.raise_for_status()
-    data = r.json()
 
-    if data.get("status") == "error":
-        raise ValueError(f"Twelve Data erreur pour {symbol}: {data.get('message')}")
-    values = data.get("values")
-    if not values:
-        raise ValueError(f"Twelve Data n'a renvoyé aucune donnée pour {symbol}")
+    x = r.json()
 
-    df = pd.DataFrame(values)
-    df["open_time"] = pd.to_datetime(df["datetime"], utc=True)
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-    # FIX: les paires spot (or, argent, pétrole, forex) chez Twelve Data ne
-    # renvoient pas de colonne "volume" — on la crée à 0 plutôt que de
-    # planter, puisque relvol ne sera de toute façon pas interprétable
-    # pour ces actifs sans volume réel.
-    if "volume" in df.columns:
-        df["volume"] = df["volume"].astype(float)
-    else:
-        df["volume"] = 0.0
-    # Twelve Data renvoie généralement du plus récent au plus ancien -> on remet dans l'ordre chronologique
-    df = df.sort_values("open_time").reset_index(drop=True)
+    cols = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "qav",
+        "trades",
+        "tbv",
+        "tqv",
+        "ignore"
+    ]
 
-    return df[["open_time", "open", "high", "low", "close", "volume"]].tail(limit).reset_index(drop=True)
+    df = pd.DataFrame(
+        x,
+        columns=cols
+    )
+
+    for c in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+    ]:
+
+        df[c] = df[c].astype(float)
+
+    df["open_time"] = pd.to_datetime(
+        df["open_time"],
+        unit="ms",
+        utc=True
+    )
+
+    return df
 
 
-# ---------------------------------------------------------------------------
-# Finnhub — forex (API officielle, clé requise)
-# ---------------------------------------------------------------------------
-_FH_RESOLUTION_MAP = {
-    "1m": ("1", 1), "5m": ("5", 5), "15m": ("15", 15), "30m": ("30", 30),
-    "1h": ("60", 60), "1d": ("D", 1440),
-}
+# ============================================================
+# INDICATEURS
+# ============================================================
+
+def indicators(df):
+
+    d = df.copy()
+
+    # --------------------------------------------------------
+    # EMA 20
+    # --------------------------------------------------------
+
+    d["ema20"] = d.close.ewm(
+        span=20,
+        adjust=False
+    ).mean()
+
+    # --------------------------------------------------------
+    # EMA 50
+    # --------------------------------------------------------
+
+    d["ema50"] = d.close.ewm(
+        span=50,
+        adjust=False
+    ).mean()
+
+    # --------------------------------------------------------
+    # RSI 14
+    # --------------------------------------------------------
+
+    delta = d.close.diff()
+
+    gain = (
+        delta
+        .clip(lower=0)
+        .rolling(14)
+        .mean()
+    )
+
+    loss = (
+        -delta
+        .clip(upper=0)
+        .rolling(14)
+        .mean()
+    )
+
+    rs = gain / loss.replace(
+        0,
+        float("nan")
+    )
+
+    d["rsi"] = 100 - (
+        100 / (1 + rs)
+    )
+
+    # --------------------------------------------------------
+    # VOLUME RELATIF
+    # --------------------------------------------------------
+
+    d["relvol"] = (
+        d.volume /
+        d.volume.rolling(20).mean()
+    )
+
+    # --------------------------------------------------------
+    # TENDANCE 1H
+    # --------------------------------------------------------
+
+    d["trend1h"] = 0
+
+    h = (
+        d
+        .set_index("open_time")
+        .close
+        .resample("1h")
+        .last()
+        .dropna()
+    )
+
+    he20 = h.ewm(
+        span=20,
+        adjust=False
+    ).mean()
+
+    he50 = h.ewm(
+        span=50,
+        adjust=False
+    ).mean()
+
+    ht = pd.Series(
+        0,
+        index=h.index
+    )
+
+    ht[
+        (h > he20) &
+        (he20 > he50)
+    ] = 1
+
+    ht[
+        (h < he20) &
+        (he20 < he50)
+    ] = -1
+
+    d["trend1h"] = (
+        ht
+        .reindex(
+            d.open_time,
+            method="ffill"
+        )
+        .values
+    )
+
+    return d
 
 
-def klines_finnhub_forex(symbol, interval="15m", limit=500, **kwargs):
-    """symbol au format Finnhub, ex: "OANDA:EUR_USD"
+# ============================================================
+# SCORE V4
+# ============================================================
 
-    ⚠️ Le plan gratuit Finnhub ne donne plus accès à /forex/candle (403
-    "You don't have access to this resource"). Cette fonction est
-    conservée pour un compte payant, mais n'est plus utilisable en
-    l'état sur le plan gratuit — voir data_sources README pour
-    l'alternative recommandée (router le Forex via Twelve Data).
+def score(
+    row,
+    return_details=False
+):
+
     """
-    api_key = os.environ.get("FINNHUB_API_KEY")
-    if not api_key:
-        raise RuntimeError("FINNHUB_API_KEY manquant (variable d'environnement)")
+    Score V4 normalisé sur 100.
 
-    resolution, minutes_per_bar = _FH_RESOLUTION_MAP.get(interval, ("15", 15))
-    now = int(time.time())
-    span_seconds = minutes_per_bar * 60 * (limit + 20)  # marge de sécurité
-    start = now - span_seconds
+    Pondération :
 
-    url = "https://finnhub.io/api/v1/forex/candle"
-    params = {"symbol": symbol, "resolution": resolution, "from": start, "to": now, "token": api_key}
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
+        Tendance 1H : 30 points
+        EMA          : 20 points
+        RSI          : 15 points
+        Volume       : 15 points
+        Breakout     : 20 points
 
-    if data.get("s") != "ok":
-        raise ValueError(f"Finnhub n'a pas de données pour {symbol} (statut: {data.get('s')})")
+    Maximum absolu : 100 points.
 
-    df = pd.DataFrame({
-        "open_time": pd.to_datetime(data["t"], unit="s", utc=True),
-        "open": data["o"], "high": data["h"], "low": data["l"],
-        "close": data["c"], "volume": data["v"],
-    })
-    return df.tail(limit).reset_index(drop=True)
+    Breakout :
+        LONG  = clôture > ancien plus haut x 1,001
+        SHORT = clôture < ancien plus bas  x 0,999
+    """
+
+    L = 0
+    S = 0
+
+    details = {
+        "trend": 0,
+        "ema": 0,
+        "rsi": 0,
+        "volume": 0,
+        "breakout": 0,
+    }
+
+    # ========================================================
+    # 1. TENDANCE 1H — 30 POINTS
+    # ========================================================
+
+    if row.trend1h == 1:
+
+        L += 30
+        details["trend"] = 30
+
+    elif row.trend1h == -1:
+
+        S += 30
+        details["trend"] = -30
+
+
+    # ========================================================
+    # 2. EMA — 20 POINTS
+    # ========================================================
+
+    if row.close > row.ema20 > row.ema50:
+
+        L += 20
+        details["ema"] = 20
+
+    elif row.close < row.ema20 < row.ema50:
+
+        S += 20
+        details["ema"] = -20
+
+
+    # ========================================================
+    # 3. RSI — 15 POINTS
+    # ========================================================
+
+    if 50 <= row.rsi <= 70:
+
+        L += 15
+        details["rsi"] = 15
+
+    elif 30 <= row.rsi < 50:
+
+        S += 15
+        details["rsi"] = -15
+
+
+    # ========================================================
+    # 4. VOLUME — 15 POINTS
+    # ========================================================
+
+    if row.relvol >= 1.5:
+
+        if row.trend1h == 1:
+
+            L += 15
+            details["volume"] = 15
+
+        elif row.trend1h == -1:
+
+            S += 15
+            details["volume"] = -15
+
+
+    # ========================================================
+    # 5. BREAKOUT — 20 POINTS
+    # ========================================================
+
+    prev_high = row.prev_high
+    prev_low = row.prev_low
+
+    # LONG :
+    # clôture au moins 0,10 % au-dessus
+    # de l'ancien plus haut
+
+    if row.close > (
+        prev_high * (1 + BREAKOUT_BUFFER)
+    ):
+
+        L += 20
+        details["breakout"] = 20
+
+    # SHORT :
+    # clôture au moins 0,10 % sous
+    # l'ancien plus bas
+
+    elif row.close < (
+        prev_low * (1 - BREAKOUT_BUFFER)
+    ):
+
+        S += 20
+        details["breakout"] = -20
+
+
+    if return_details:
+
+        return L, S, details
+
+    return L, S
+
+
+# ============================================================
+# BACKTEST
+# ============================================================
+
+def run(
+    df,
+    fee=0.001,
+    slippage=0.0002,
+    stop_pct=0.01,
+    target_pct=0.02,
+    threshold=75
+):
+
+    d = indicators(df)
+
+    d["prev_high"] = (
+        d.high
+        .rolling(20)
+        .max()
+        .shift(1)
+    )
+
+    d["prev_low"] = (
+        d.low
+        .rolling(20)
+        .min()
+        .shift(1)
+    )
+
+    position = None
+
+    entry = 0
+    stop = 0
+    target = 0
+
+    trades = []
+
+    equity = 1.0
+    peak = 1.0
+
+    for i, row in d.iterrows():
+
+        if any(
+            pd.isna(row[x])
+            for x in [
+                "ema20",
+                "ema50",
+                "rsi",
+                "relvol",
+                "prev_high",
+                "prev_low"
+            ]
+        ):
+
+            continue
+
+        L, S = score(row)
+
+        # ----------------------------------------------------
+        # SIGNAL BACKTEST
+        # ----------------------------------------------------
+
+        action = (
+            "LONG"
+            if L >= threshold and L > S
+            else
+            "SHORT"
+            if S >= threshold and S > L
+            else
+            None
+        )
+
+        # ----------------------------------------------------
+        # GESTION POSITION
+        # ----------------------------------------------------
+
+        if position:
+
+            if position == "LONG":
+
+                hit_stop = row.low <= stop
+                hit_target = row.high >= target
+
+                if hit_stop or hit_target:
+
+                    exitp = (
+                        stop
+                        if hit_stop
+                        else
+                        target
+                    )
+
+                    ret = (
+                        (exitp / entry - 1)
+                        - 2 * fee
+                        - slippage
+                    )
+
+                    equity *= 1 + ret
+
+                    trades.append(
+                        (
+                            row.open_time,
+                            position,
+                            entry,
+                            exitp,
+                            ret
+                        )
+                    )
+
+                    position = None
+
+            else:
+
+                hit_stop = row.high >= stop
+                hit_target = row.low <= target
+
+                if hit_stop or hit_target:
+
+                    exitp = (
+                        stop
+                        if hit_stop
+                        else
+                        target
+                    )
+
+                    ret = (
+                        (entry / exitp - 1)
+                        - 2 * fee
+                        - slippage
+                    )
+
+                    equity *= 1 + ret
+
+                    trades.append(
+                        (
+                            row.open_time,
+                            position,
+                            entry,
+                            exitp,
+                            ret
+                        )
+                    )
+
+                    position = None
+
+
+        # ----------------------------------------------------
+        # NOUVELLE ENTRÉE
+        # ----------------------------------------------------
+
+        if not position and action:
+
+            entry = (
+                row.close * (1 + slippage)
+                if action == "LONG"
+                else
+                row.close * (1 - slippage)
+            )
+
+            if action == "LONG":
+
+                stop = (
+                    entry *
+                    (1 - stop_pct)
+                )
+
+                target = (
+                    entry *
+                    (1 + target_pct)
+                )
+
+            else:
+
+                stop = (
+                    entry *
+                    (1 + stop_pct)
+                )
+
+                target = (
+                    entry *
+                    (1 - target_pct)
+                )
+
+            position = action
+
+        peak = max(
+            peak,
+            equity
+        )
+
+
+    # ========================================================
+    # FERMETURE POSITION FINALE
+    # ========================================================
+
+    if position:
+
+        row = d.iloc[-1]
+
+        exitp = row.close
+
+        ret = (
+            (exitp / entry - 1) - 2 * fee
+            if position == "LONG"
+            else
+            (entry / exitp - 1) - 2 * fee
+        )
+
+        equity *= 1 + ret
+
+        trades.append(
+            (
+                row.open_time,
+                position,
+                entry,
+                exitp,
+                ret
+            )
+        )
+
+
+    # ========================================================
+    # STATISTIQUES
+    # ========================================================
+
+    t = pd.DataFrame(
+        trades,
+        columns=[
+            "time",
+            "side",
+            "entry",
+            "exit",
+            "return"
+        ]
+    )
+
+    wins = (
+        (t["return"] > 0).sum()
+        if len(t)
+        else
+        0
+    )
+
+    losses = (
+        (t["return"] <= 0).sum()
+        if len(t)
+        else
+        0
+    )
+
+    grosswin = (
+        t.loc[
+            t["return"] > 0,
+            "return"
+        ].sum()
+        if len(t)
+        else
+        0
+    )
+
+    grossloss = (
+        abs(
+            t.loc[
+                t["return"] <= 0,
+                "return"
+            ].sum()
+        )
+        if len(t)
+        else
+        0
+    )
+
+    pf = (
+        grosswin / grossloss
+        if grossloss
+        else
+        float("inf")
+        if grosswin
+        else
+        0
+    )
+
+    return {
+        "trades": len(t),
+        "wins": int(wins),
+        "losses": int(losses),
+        "win_rate": (
+            wins / len(t) * 100
+            if len(t)
+            else
+            0
+        ),
+        "profit_factor": pf,
+        "return_pct": (
+            equity - 1
+        ) * 100,
+        "final_equity": equity
+    }, t
+
+
+# ============================================================
+# EXÉCUTION DIRECTE
+# ============================================================
+
+if __name__ == "__main__":
+
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument(
+        "--symbol",
+        default="BTCUSDT"
+    )
+
+    ap.add_argument(
+        "--interval",
+        default="5m"
+    )
+
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=1000
+    )
+
+    ap.add_argument(
+        "--fee",
+        type=float,
+        default=0.001
+    )
+
+    ap.add_argument(
+        "--slippage",
+        type=float,
+        default=0.0002
+    )
+
+    ap.add_argument(
+        "--stop",
+        type=float,
+        default=0.01
+    )
+
+    ap.add_argument(
+        "--target",
+        type=float,
+        default=0.02
+    )
+
+    ap.add_argument(
+        "--threshold",
+        type=float,
+        default=75
+    )
+
+    args = ap.parse_args()
+
+    df = klines(
+        args.symbol,
+        args.interval,
+        args.limit
+    )
+
+    stats, trades = run(
+        df,
+        args.fee,
+        args.slippage,
+        args.stop,
+        args.target,
+        args.threshold
+    )
+
+    print(
+        "\nBACKTEST",
+        args.symbol,
+        args.interval
+    )
+
+    for k, v in stats.items():
+
+        print(
+            f"{k}: {v}"
+        )
+
+    if len(trades):
+
+        trades.to_csv(
+            f"trades_{args.symbol}_{args.interval}.csv",
+            index=False
+        )
