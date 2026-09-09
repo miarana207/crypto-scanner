@@ -40,24 +40,65 @@ def indicators(df):
     d["trend1h"]=ht.reindex(d.open_time,method="ffill").values
     return d
 
-def score(row):
+def score(row, return_details=False):
     L=S=0
-    if row.trend1h==1:L+=25
-    if row.trend1h==-1:S+=25
-    if row.close>row.ema20>row.ema50:L+=15
-    if row.close<row.ema20<row.ema50:S+=15
-    if 50<=row.rsi<=70:L+=10
-    if 30<=row.rsi<=50:S+=10
-    # FIX: le volume relatif confirme la direction déjà suggérée par la
-    # tendance (trend1h), au lieu de gonfler artificiellement les deux
-    # scores à la fois dès qu'il y a du volume.
+
+    details = {
+        "trend": 0,
+        "ema": 0,
+        "rsi": 0,
+        "volume": 0,
+        "breakout": 0,
+    }
+
+    # Tendance 1H
+    if row.trend1h==1:
+        L+=25
+        details["trend"]=25
+    elif row.trend1h==-1:
+        S+=25
+        details["trend"]=-25
+
+    # Alignement EMA
+    if row.close>row.ema20>row.ema50:
+        L+=15
+        details["ema"]=15
+    elif row.close<row.ema20<row.ema50:
+        S+=15
+        details["ema"]=-15
+
+    # RSI
+    if 50<=row.rsi<=70:
+        L+=10
+        details["rsi"]=10
+    elif 30<=row.rsi<=50:
+        S+=10
+        details["rsi"]=-10
+
+    # Volume relatif
+    # Le volume confirme uniquement la direction de la tendance.
     if row.relvol>=1.5:
-        if row.trend1h==1:L+=15
-        elif row.trend1h==-1:S+=15
+        if row.trend1h==1:
+            L+=15
+            details["volume"]=15
+        elif row.trend1h==-1:
+            S+=15
+            details["volume"]=-15
+
+    # Breakout
     prev_high=row.prev_high
     prev_low=row.prev_low
-    if row.close>prev_high:L+=15
-    if row.close<prev_low:S+=15
+
+    if row.close>prev_high:
+        L+=15
+        details["breakout"]=15
+    elif row.close<prev_low:
+        S+=15
+        details["breakout"]=-15
+
+    if return_details:
+        return L,S,details
+
     return L,S
 
 def run(df, fee=0.001, slippage=0.0002, stop_pct=0.01, target_pct=0.02, threshold=75):
