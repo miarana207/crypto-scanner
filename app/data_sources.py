@@ -26,7 +26,7 @@ TWELVE_DATA_BASE = (
 
 
 # ======================================================================
-# INTERVALLES
+# UTILITAIRES
 # ======================================================================
 
 def interval_to_seconds(interval):
@@ -57,50 +57,15 @@ def interval_to_seconds(interval):
     return 60
 
 
-def is_completed_candle(
-    open_time,
-    interval
-):
-    """
-    Vérifie qu'une bougie est totalement clôturée.
-    """
-
-    if pd.isna(open_time):
-        return False
-
-    ts = pd.Timestamp(
-        open_time
-    )
-
-    if ts.tzinfo is None:
-        ts = ts.tz_localize(
-            "UTC"
-        )
-    else:
-        ts = ts.tz_convert(
-            "UTC"
-        )
-
-    now = pd.Timestamp.now(
-        tz="UTC"
-    )
-
-    age = (
-        now - ts
-    ).total_seconds()
-
-    return (
-        age >= interval_to_seconds(
-            interval
-        )
-    )
-
-
 def keep_completed_candles(
     df,
     interval
 ):
-    if df.empty:
+    """
+    Supprime toute bougie qui n'est pas encore complètement clôturée.
+    """
+
+    if df is None or df.empty:
         return df
 
     d = df.copy()
@@ -133,13 +98,15 @@ def keep_completed_candles(
         >= interval_seconds
     )
 
-    return d.loc[
-        completed
-    ].copy()
+    return (
+        d.loc[completed]
+        .copy()
+        .reset_index(drop=True)
+    )
 
 
 # ======================================================================
-# YAHOO FINANCE
+# YAHOO
 # ======================================================================
 
 _YF_CONFIG = {
@@ -175,13 +142,6 @@ def klines_yahoo(
     interval="15m",
     limit=1000
 ):
-    """
-    Yahoo Finance.
-
-    Volume absent/invalide = NaN.
-    Jamais 0 artificiellement.
-    """
-
     config = _YF_CONFIG.get(
         interval,
         {
@@ -211,7 +171,8 @@ def klines_yahoo(
         timeout=30,
         headers={
             "User-Agent":
-                "Mozilla/5.0"
+                "Mozilla/5.0 "
+                "(compatible; scanner-v4/1.0)"
         }
     )
 
@@ -229,7 +190,13 @@ def klines_yahoo(
     )
 
     if not results:
-        return pd.DataFrame()
+        error = chart.get(
+            "error"
+        )
+        raise RuntimeError(
+            f"Yahoo: aucune donnée pour "
+            f"{symbol}: {error}"
+        )
 
     result = results[0]
 
@@ -238,14 +205,10 @@ def klines_yahoo(
         []
     )
 
-    indicators = result.get(
-        "indicators",
-        {}
-    )
-
-    quote_list = indicators.get(
-        "quote",
-        []
+    quote_list = (
+        result
+        .get("indicators", {})
+        .get("quote", [])
     )
 
     if not timestamps or not quote_list:
@@ -294,6 +257,7 @@ def klines_yahoo(
             errors="coerce"
         )
 
+    # Volume absent/invalide = NaN
     df["volume"] = pd.to_numeric(
         df["volume"],
         errors="coerce"
@@ -308,10 +272,9 @@ def klines_yahoo(
         ]
     )
 
-    df = df.sort_values(
-        "open_time"
-    ).reset_index(
-        drop=True
+    df = (
+        df.sort_values("open_time")
+        .reset_index(drop=True)
     )
 
     df = keep_completed_candles(
@@ -358,9 +321,9 @@ def klines_twelvedata(
     """
     Twelve Data.
 
-    Particularité importante :
-    si le fournisseur ne retourne pas de volume,
-    on utilise NaN, pas 0.
+    IMPORTANT :
+    absence de volume = NaN
+    et jamais 0 artificiel.
     """
 
     if not TWELVE_DATA_API_KEY:
@@ -403,14 +366,16 @@ def klines_twelvedata(
 
             payload = response.json()
 
-            if "status" in payload:
-                if payload.get("status") == "error":
-                    raise RuntimeError(
-                        payload.get(
-                            "message",
-                            "Erreur Twelve Data"
-                        )
+            if payload.get(
+                "status"
+            ) == "error":
+
+                raise RuntimeError(
+                    payload.get(
+                        "message",
+                        "Erreur Twelve Data"
                     )
+                )
 
             values = payload.get(
                 "values"
@@ -418,7 +383,8 @@ def klines_twelvedata(
 
             if not values:
                 raise RuntimeError(
-                    "Aucune donnée Twelve Data."
+                    f"Aucune donnée Twelve Data "
+                    f"pour {symbol}"
                 )
 
             df = pd.DataFrame(
@@ -442,6 +408,7 @@ def klines_twelvedata(
                 "low",
                 "close",
             ]:
+
                 if col not in df.columns:
                     raise RuntimeError(
                         f"Colonne {col} absente."
@@ -453,7 +420,7 @@ def klines_twelvedata(
                 )
 
             # ----------------------------------------------------------
-            # Volume
+            # VOLUME
             # ----------------------------------------------------------
 
             if "volume" in df.columns:
@@ -464,9 +431,11 @@ def klines_twelvedata(
                 )
 
             else:
-                # IMPORTANT :
-                # absence de volume = NaN
-                df["volume"] = float("nan")
+
+                # Ne surtout pas mettre 0.
+                df["volume"] = float(
+                    "nan"
+                )
 
             df = df.dropna(
                 subset=[
@@ -478,11 +447,14 @@ def klines_twelvedata(
                 ]
             )
 
-            df = df.sort_values(
-                "open_time"
-            ).reset_index(
-                drop=True
+            df = (
+                df.sort_values("open_time")
+                .reset_index(drop=True)
             )
+
+            # ----------------------------------------------------------
+            # Bougie clôturée uniquement
+            # ----------------------------------------------------------
 
             df = keep_completed_candles(
                 df,
@@ -511,8 +483,26 @@ def klines_twelvedata(
             last_error = exc
 
             if attempt < 2:
+
+                wait = 2 ** (
+                    attempt + 1
+                )
+
+                print(
+                    f"[Twelve Data] "
+                    f"{symbol}: tentative "
+                    f"{attempt + 1}/3 échouée : "
+                    f"{exc}"
+                )
+
+                print(
+                    f"[Twelve Data] "
+                    f"Nouvelle tentative dans "
+                    f"{wait}s..."
+                )
+
                 time.sleep(
-                    2 ** (attempt + 1)
+                    wait
                 )
 
     raise RuntimeError(
@@ -531,10 +521,8 @@ def klines_finnhub(
     limit=1000
 ):
     """
-    Fonction conservée pour compatibilité.
-
-    Le scanner V4 actuel utilise Twelve Data
-    pour le Forex.
+    Fonction conservée uniquement pour compatibilité.
+    V4 utilise Twelve Data pour le Forex.
     """
 
     api_key = os.getenv(
@@ -546,9 +534,6 @@ def klines_finnhub(
             "FINNHUB_API_KEY absente."
         )
 
-    # Finnhub n'est plus la source principale de V4.
-    # On retourne un DataFrame vide plutôt que de produire
-    # des données incompatibles avec le scanner.
     return pd.DataFrame(
         columns=[
             "open_time",
