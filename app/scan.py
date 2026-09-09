@@ -33,7 +33,7 @@ def scan(symbols, fetcher=klines, interval="5m", limit=1000, threshold=60, pause
                 print(f"{sym}: pas assez de données pour un score fiable, ignoré.")
                 continue
 
-            L, S = score(last)
+            L, S, details = score(last, return_details=True)
             if L >= threshold and L > S:
                 direction = "LONG"
             elif S >= threshold and S > L:
@@ -42,21 +42,26 @@ def scan(symbols, fetcher=klines, interval="5m", limit=1000, threshold=60, pause
                 direction = "-"
 
             rows.append({
-                "symbol": sym,
-                "close": round(float(last.close), 4),
-                "score_long": L,
-                "score_short": S,
-                "direction": direction,
-                "rsi": round(float(last.rsi), 1),
-                "relvol": round(float(last.relvol), 2),
-                "trend1h": int(last.trend1h),
-                # Horodatage de la dernière bougie utilisée pour ce score.
-                # Sert à détecter une donnée figée : si ce timestamp ne
-                # bouge pas d'un run à l'autre alors que le marché est
-                # censé être ouvert, la source renvoie des données stale
-                # (souvent un signe de rate-limit atteint côté fournisseur).
-                "last_candle": last.open_time,
-            })
+    "symbol": sym,
+    "close": round(float(last.close), 4),
+    "score_long": L,
+    "score_short": S,
+    "direction": direction,
+
+    # Détail du score
+    "trend_score": details["trend"],
+    "ema_score": details["ema"],
+    "rsi_score": details["rsi"],
+    "volume_score": details["volume"],
+    "breakout_score": details["breakout"],
+
+    "rsi": round(float(last.rsi), 1),
+    "relvol": round(float(last.relvol), 2),
+    "trend1h": int(last.trend1h),
+
+    # Horodatage de la dernière bougie utilisée
+    "last_candle": last.open_time,
+})
         except Exception as e:
             print(f"Erreur sur {sym}: {e}")
         time.sleep(pause)  # évite de saturer l'API du fournisseur
