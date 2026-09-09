@@ -1,19 +1,23 @@
 """
 Sources de données OHLCV par classe d'actifs.
 
-- klines_binance (dans backtest.py)  : crypto, API publique Binance
-- klines_yahoo (ici)                 : fallback actions/indices/matières
-  premières, endpoint non-officiel Yahoo Finance
-- klines_twelvedata (ici)            : actions/indices/matières premières,
-  API officielle gratuite (nécessite TWELVE_DATA_API_KEY)
-- klines_finnhub_forex (ici)         : forex, API officielle gratuite
-  (nécessite FINNHUB_API_KEY)
+- klines_binance (dans backtest.py) :
+  crypto, API publique Binance
 
-v1.1 — fix :
-Les paires spot (or, argent, pétrole, forex) renvoyées par
-Twelve Data n'incluent pas toujours de colonne "volume".
-Lorsque le volume est absent, on le remplace par 0.0.
-Le relvol ne sera alors pas interprétable pour ces actifs.
+- klines_yahoo :
+  fallback actions/indices/matières premières
+
+- klines_twelvedata :
+  actions/forex/matières premières,
+  API officielle Twelve Data
+
+- klines_finnhub_forex :
+  conservée pour compatibilité,
+  mais le Forex gratuit est routé via Twelve Data.
+
+Corrections :
+- Twelve Data forcé en UTC.
+- Absence de volume gérée avec volume = 0.
 """
 
 import os
@@ -22,38 +26,38 @@ import requests
 import pandas as pd
 
 
-# ---------------------------------------------------------------------------
-# Yahoo Finance
-# ---------------------------------------------------------------------------
+# ============================================================
+# YAHOO FINANCE
+# ============================================================
 
 _YF_CONFIG = {
 
-    "1m":(
+    "1m": (
         "1m",
         "7d"
     ),
 
-    "5m":(
+    "5m": (
         "5m",
         "60d"
     ),
 
-    "15m":(
+    "15m": (
         "15m",
         "60d"
     ),
 
-    "30m":(
+    "30m": (
         "30m",
         "60d"
     ),
 
-    "1h":(
+    "1h": (
         "60m",
         "730d"
     ),
 
-    "1d":(
+    "1d": (
         "1d",
         "10y"
     ),
@@ -67,7 +71,7 @@ def klines_yahoo(
     **kwargs
 ):
 
-    yf_interval,yf_range=(
+    yf_interval, yf_range = (
         _YF_CONFIG.get(
             interval,
             (
@@ -77,27 +81,23 @@ def klines_yahoo(
         )
     )
 
-
-    url=(
+    url = (
         "https://query1.finance.yahoo.com/"
         f"v8/finance/chart/{symbol}"
     )
 
-
-    params={
-        "range":yf_range,
-        "interval":yf_interval
+    params = {
+        "range": yf_range,
+        "interval": yf_interval
     }
 
-
-    headers={
+    headers = {
         "User-Agent":
         "Mozilla/5.0 "
         "(compatible; scanner-perso/1.0)"
     }
 
-
-    r=requests.get(
+    r = requests.get(
         url,
         params=params,
         headers=headers,
@@ -106,38 +106,32 @@ def klines_yahoo(
 
     r.raise_for_status()
 
+    payload = r.json()
 
-    payload=r.json()
-
-
-    result_list=(
+    result_list = (
         payload
         .get("chart", {})
         .get("result")
     )
 
-
     if not result_list:
 
-        err=(
+        err = (
             payload
             .get("chart", {})
             .get("error")
         )
 
         raise ValueError(
-            f"Yahoo Finance n'a rien renvoyé "
-            f"pour {symbol}: {err}"
+            f"Yahoo Finance n'a rien "
+            f"renvoyé pour {symbol}: {err}"
         )
 
+    result = result_list[0]
 
-    result=result_list[0]
-
-
-    timestamps=result.get(
+    timestamps = result.get(
         "timestamp"
     )
-
 
     if not timestamps:
 
@@ -146,13 +140,11 @@ def klines_yahoo(
             f"pour {symbol} sur cette période"
         )
 
-
-    quote=(
+    quote = (
         result["indicators"]["quote"][0]
     )
 
-
-    df=pd.DataFrame({
+    df = pd.DataFrame({
 
         "open_time":
         pd.to_datetime(
@@ -175,45 +167,33 @@ def klines_yahoo(
 
         "volume":
         quote["volume"],
-
     })
 
-
-    df=(
+    df = (
         df
         .dropna()
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
-
 
     return (
         df
         .tail(limit)
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
 
 
-# ---------------------------------------------------------------------------
-# Twelve Data
-# ---------------------------------------------------------------------------
+# ============================================================
+# TWELVE DATA
+# ============================================================
 
-_TD_INTERVAL_MAP={
+_TD_INTERVAL_MAP = {
 
-    "1m":"1min",
-
-    "5m":"5min",
-
-    "15m":"15min",
-
-    "30m":"30min",
-
-    "1h":"1h",
-
-    "1d":"1day",
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "1d": "1day",
 }
 
 
@@ -224,10 +204,9 @@ def klines_twelvedata(
     **kwargs
 ):
 
-    api_key=os.environ.get(
+    api_key = os.environ.get(
         "TWELVE_DATA_API_KEY"
     )
-
 
     if not api_key:
 
@@ -236,52 +215,45 @@ def klines_twelvedata(
             "(variable d'environnement)"
         )
 
-
-    td_interval=_TD_INTERVAL_MAP.get(
-        interval,
-        "15min"
+    td_interval = (
+        _TD_INTERVAL_MAP.get(
+            interval,
+            "15min"
+        )
     )
 
-
-    url=(
+    url = (
         "https://api.twelvedata.com/"
         "time_series"
     )
 
+    params = {
 
-    params={
+        "symbol": symbol,
 
-        "symbol":symbol,
+        "interval": td_interval,
 
-        "interval":td_interval,
-
-        "outputsize":min(
+        "outputsize": min(
             limit,
             5000
         ),
 
-        "apikey":api_key,
+        "apikey": api_key,
 
-        # On impose UTC afin d'éviter les
-        # décalages horaires artificiels.
-        "timezone":"UTC",
+        "timezone": "UTC",
     }
 
-
-    r=requests.get(
+    r = requests.get(
         url,
         params=params,
         timeout=15
     )
 
-
     r.raise_for_status()
 
+    data = r.json()
 
-    data=r.json()
-
-
-    if data.get("status")=="error":
+    if data.get("status") == "error":
 
         raise ValueError(
             f"Twelve Data erreur pour "
@@ -289,11 +261,9 @@ def klines_twelvedata(
             f"{data.get('message')}"
         )
 
-
-    values=data.get(
+    values = data.get(
         "values"
     )
-
 
     if not values:
 
@@ -302,17 +272,16 @@ def klines_twelvedata(
             f"aucune donnée pour {symbol}"
         )
 
-
-    df=pd.DataFrame(
+    df = pd.DataFrame(
         values
     )
 
-
-    df["open_time"]=pd.to_datetime(
-        df["datetime"],
-        utc=True
+    df["open_time"] = (
+        pd.to_datetime(
+            df["datetime"],
+            utc=True
+        )
     )
-
 
     for col in [
         "open",
@@ -321,33 +290,42 @@ def klines_twelvedata(
         "close"
     ]:
 
-        df[col]=df[col].astype(
-            float
+        df[col] = (
+            df[col]
+            .astype(float)
         )
 
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
 
-    # Certains instruments Twelve Data
-    # ne fournissent pas de volume.
     if "volume" in df.columns:
 
-        df["volume"]=df[
-            "volume"
-        ].astype(float)
+        df["volume"] = (
+            df["volume"]
+            .astype(float)
+        )
 
     else:
 
-        df["volume"]=0.0
+        # Certains actifs Twelve Data,
+        # notamment Forex/spot commodities,
+        # n'ont pas de volume exploitable.
+        df["volume"] = 0.0
 
+    # --------------------------------------------------------
+    # ORDRE CHRONOLOGIQUE
+    # --------------------------------------------------------
 
-    # Twelve Data renvoie généralement
-    # les bougies de la plus récente
-    # à la plus ancienne.
-    df=df.sort_values(
-        "open_time"
-    ).reset_index(
-        drop=True
+    df = (
+        df
+        .sort_values(
+            "open_time"
+        )
+        .reset_index(
+            drop=True
+        )
     )
-
 
     return (
         df[
@@ -361,44 +339,42 @@ def klines_twelvedata(
             ]
         ]
         .tail(limit)
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
 
 
-# ---------------------------------------------------------------------------
-# Finnhub — Forex
-# ---------------------------------------------------------------------------
+# ============================================================
+# FINNHUB FOREX
+# ============================================================
 
-_FH_RESOLUTION_MAP={
+_FH_RESOLUTION_MAP = {
 
-    "1m":(
+    "1m": (
         "1",
         1
     ),
 
-    "5m":(
+    "5m": (
         "5",
         5
     ),
 
-    "15m":(
+    "15m": (
         "15",
         15
     ),
 
-    "30m":(
+    "30m": (
         "30",
         30
     ),
 
-    "1h":(
+    "1h": (
         "60",
         60
     ),
 
-    "1d":(
+    "1d": (
         "D",
         1440
     ),
@@ -412,19 +388,9 @@ def klines_finnhub_forex(
     **kwargs
 ):
 
-    """
-    symbol au format Finnhub,
-    exemple : OANDA:EUR_USD
-
-    Cette fonction est conservée pour
-    compatibilité avec une éventuelle
-    utilisation future de Finnhub.
-    """
-
-    api_key=os.environ.get(
+    api_key = os.environ.get(
         "FINNHUB_API_KEY"
     )
-
 
     if not api_key:
 
@@ -433,8 +399,7 @@ def klines_finnhub_forex(
             "(variable d'environnement)"
         )
 
-
-    resolution,minutes_per_bar=(
+    resolution, minutes_per_bar = (
         _FH_RESOLUTION_MAP.get(
             interval,
             (
@@ -444,59 +409,50 @@ def klines_finnhub_forex(
         )
     )
 
-
-    now=int(
+    now = int(
         time.time()
     )
 
-
-    span_seconds=(
+    span_seconds = (
         minutes_per_bar *
         60 *
-        (limit+20)
+        (limit + 20)
     )
 
-
-    start=(
-        now-span_seconds
+    start = (
+        now -
+        span_seconds
     )
 
-
-    url=(
-        "https://finnhub.io/api/v1/"
-        "forex/candle"
+    url = (
+        "https://finnhub.io/"
+        "api/v1/forex/candle"
     )
 
+    params = {
 
-    params={
+        "symbol": symbol,
 
-        "symbol":symbol,
+        "resolution": resolution,
 
-        "resolution":resolution,
+        "from": start,
 
-        "from":start,
+        "to": now,
 
-        "to":now,
-
-        "token":api_key,
-
+        "token": api_key
     }
 
-
-    r=requests.get(
+    r = requests.get(
         url,
         params=params,
         timeout=15
     )
 
-
     r.raise_for_status()
 
+    data = r.json()
 
-    data=r.json()
-
-
-    if data.get("s")!="ok":
+    if data.get("s") != "ok":
 
         raise ValueError(
             f"Finnhub n'a pas de données "
@@ -504,8 +460,7 @@ def klines_finnhub_forex(
             f"(statut: {data.get('s')})"
         )
 
-
-    df=pd.DataFrame({
+    df = pd.DataFrame({
 
         "open_time":
         pd.to_datetime(
@@ -528,14 +483,10 @@ def klines_finnhub_forex(
 
         "volume":
         data["v"],
-
     })
-
 
     return (
         df
         .tail(limit)
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
