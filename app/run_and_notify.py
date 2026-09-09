@@ -1,3 +1,4 @@
+```python
 """
 Lance le scan multi-actifs et envoie les résultats
 sur Slack + Email.
@@ -641,25 +642,39 @@ def missing_conditions(
         row["score_short"]
     )
 
-    missing = []
-
     # --------------------------------------------------------
-    # SCORE
+    # 1. SCORE INSUFFISANT
+    # --------------------------------------------------------
+    # Si le score est inférieur au seuil, on considère que
+    # le score est la condition bloquante principale.
+    #
+    # IMPORTANT :
+    # On ne rajoute PAS BREAKOUT et VOLUME ici.
+    # Cela évite un diagnostic trompeur du type :
+    #
+    # "SCORE < 75 + BREAKOUT + VOLUME"
+    #
+    # alors que le véritable état est simplement :
+    #
+    # "SOUS SEUIL — manque : SCORE"
     # --------------------------------------------------------
 
     if best_score < threshold:
 
-        missing.append(
-            f"SCORE < {threshold}"
-        )
+        return "SCORE"
 
     # --------------------------------------------------------
-    # BREAKOUT
+    # 2. SCORE SUFFISANT
+    # --------------------------------------------------------
+    # Le score ayant atteint le seuil, on vérifie maintenant
+    # les deux conditions qui servent de déclencheur :
+    #
+    # BREAKOUT + VOLUME
     # --------------------------------------------------------
 
-    breakout = (
-        row["breakout_pts"]
-    )
+    breakout = row["breakout_pts"]
+
+    volume = row["volume_pts"]
 
     if direction == "LONG":
 
@@ -668,7 +683,7 @@ def missing_conditions(
         )
 
         volume_ok = (
-            row["volume_pts"] == 15
+            volume == 15
         )
 
     else:
@@ -678,8 +693,10 @@ def missing_conditions(
         )
 
         volume_ok = (
-            row["volume_pts"] == -15
+            volume == -15
         )
+
+    missing = []
 
     if not breakout_ok:
 
@@ -692,6 +709,10 @@ def missing_conditions(
         missing.append(
             "VOLUME"
         )
+
+    # --------------------------------------------------------
+    # 3. BREAKOUT + VOLUME OK
+    # --------------------------------------------------------
 
     if not missing:
 
@@ -1086,7 +1107,7 @@ if __name__ == "__main__":
     # EMAIL
     #
     # IMPORTANT :
-    # l'email est maintenant envoyé À CHAQUE SCAN.
+    # l'email est envoyé À CHAQUE SCAN.
     # ========================================================
 
     strong_count = len(
@@ -1147,3 +1168,4 @@ if __name__ == "__main__":
 
         body=message
     )
+```
