@@ -1,158 +1,351 @@
-"""
-Sources de données OHLCV V4.
-
-- Binance       : crypto
-- Twelve Data   : forex + actions + certaines matières premières
-- Yahoo Finance : indices + fallback + certaines matières premières
-
-Twelve Data :
-- timeout renforcé
-- retries
-- backoff progressif
-- gestion propre des réponses d'erreur
-"""
-
 import os
 import time
-
 import requests
+
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-# ============================================================
-# CONFIGURATION YAHOO
-# ============================================================
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
+
+TWELVE_DATA_API_KEY = os.getenv(
+    "TWELVE_DATA_API_KEY"
+)
+
+YAHOO_BASE = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/"
+)
+
+TWELVE_DATA_BASE = (
+    "https://api.twelvedata.com/time_series"
+)
+
+
+# ======================================================================
+# INTERVALLES
+# ======================================================================
+
+def interval_to_seconds(interval):
+    interval = str(
+        interval
+    ).strip().lower()
+
+    if interval.endswith("m"):
+        return int(
+            interval[:-1]
+        ) * 60
+
+    if interval.endswith("h"):
+        return int(
+            interval[:-1]
+        ) * 3600
+
+    if interval.endswith("d"):
+        return int(
+            interval[:-1]
+        ) * 86400
+
+    if interval.endswith("w"):
+        return int(
+            interval[:-1]
+        ) * 604800
+
+    return 60
+
+
+def is_completed_candle(
+    open_time,
+    interval
+):
+    """
+    Vérifie qu'une bougie est totalement clôturée.
+    """
+
+    if pd.isna(open_time):
+        return False
+
+    ts = pd.Timestamp(
+        open_time
+    )
+
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(
+            "UTC"
+        )
+    else:
+        ts = ts.tz_convert(
+            "UTC"
+        )
+
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
+
+    age = (
+        now - ts
+    ).total_seconds()
+
+    return (
+        age >= interval_to_seconds(
+            interval
+        )
+    )
+
+
+def keep_completed_candles(
+    df,
+    interval
+):
+    if df.empty:
+        return df
+
+    d = df.copy()
+
+    d["open_time"] = pd.to_datetime(
+        d["open_time"],
+        utc=True,
+        errors="coerce"
+    )
+
+    d = d.dropna(
+        subset=["open_time"]
+    )
+
+    if d.empty:
+        return d
+
+    interval_seconds = interval_to_seconds(
+        interval
+    )
+
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
+
+    completed = (
+        (
+            now - d["open_time"]
+        ).dt.total_seconds()
+        >= interval_seconds
+    )
+
+    return d.loc[
+        completed
+    ].copy()
+
+
+# ======================================================================
+# YAHOO FINANCE
+# ======================================================================
 
 _YF_CONFIG = {
-    "1m":  ("1m", "7d"),
-    "5m":  ("5m", "60d"),
-    "15m": ("15m", "60d"),
-    "30m": ("30m", "60d"),
-    "1h":  ("60m", "730d"),
-    "1d":  ("1d", "10y"),
+    "1m": {
+        "range": "7d",
+        "interval": "1m",
+    },
+    "5m": {
+        "range": "60d",
+        "interval": "5m",
+    },
+    "15m": {
+        "range": "60d",
+        "interval": "15m",
+    },
+    "30m": {
+        "range": "60d",
+        "interval": "30m",
+    },
+    "1h": {
+        "range": "730d",
+        "interval": "1h",
+    },
+    "1d": {
+        "range": "10y",
+        "interval": "1d",
+    },
 }
 
-
-# ============================================================
-# YAHOO FINANCE
-# ============================================================
 
 def klines_yahoo(
     symbol,
     interval="15m",
-    limit=500,
-    **kwargs,
+    limit=1000
 ):
+    """
+    Yahoo Finance.
 
-    yf_interval, yf_range = _YF_CONFIG.get(
+    Volume absent/invalide = NaN.
+    Jamais 0 artificiellement.
+    """
+
+    config = _YF_CONFIG.get(
         interval,
-        ("15m", "60d"),
+        {
+            "range": "60d",
+            "interval": interval,
+        }
     )
 
     url = (
-        "https://query1.finance.yahoo.com/"
-        f"v8/finance/chart/{symbol}"
+        YAHOO_BASE
+        + requests.utils.quote(
+            str(symbol),
+            safe=""
+        )
     )
 
     params = {
-        "range": yf_range,
-        "interval": yf_interval,
+        "range": config["range"],
+        "interval": config["interval"],
+        "includePrePost": "false",
+        "events": "div,splits",
     }
 
-    headers = {
-        "User-Agent":
-            "Mozilla/5.0 "
-            "(compatible; scanner-v4/1.0)"
-    }
-
-    r = requests.get(
+    response = requests.get(
         url,
         params=params,
-        headers=headers,
         timeout=30,
+        headers={
+            "User-Agent":
+                "Mozilla/5.0"
+        }
     )
 
-    r.raise_for_status()
+    response.raise_for_status()
 
-    payload = r.json()
+    payload = response.json()
 
-    result_list = (
-        payload
-        .get("chart", {})
-        .get("result")
+    chart = payload.get(
+        "chart",
+        {}
     )
 
-    if not result_list:
+    results = chart.get(
+        "result"
+    )
 
-        err = (
-            payload
-            .get("chart", {})
-            .get("error")
-        )
+    if not results:
+        return pd.DataFrame()
 
-        raise ValueError(
-            f"Yahoo Finance n'a rien renvoyé "
-            f"pour {symbol}: {err}"
-        )
-
-    result = result_list[0]
+    result = results[0]
 
     timestamps = result.get(
-        "timestamp"
+        "timestamp",
+        []
     )
 
-    if not timestamps:
-
-        raise ValueError(
-            f"Aucune bougie disponible "
-            f"pour {symbol}"
-        )
-
-    quote = (
-        result
-        ["indicators"]
-        ["quote"][0]
+    indicators = result.get(
+        "indicators",
+        {}
     )
+
+    quote_list = indicators.get(
+        "quote",
+        []
+    )
+
+    if not timestamps or not quote_list:
+        return pd.DataFrame()
+
+    quote = quote_list[0]
 
     df = pd.DataFrame(
         {
             "open_time": pd.to_datetime(
                 timestamps,
                 unit="s",
-                utc=True,
+                utc=True
             ),
-
-            "open": quote["open"],
-            "high": quote["high"],
-            "low": quote["low"],
-            "close": quote["close"],
-            "volume": quote["volume"],
+            "open": quote.get(
+                "open",
+                []
+            ),
+            "high": quote.get(
+                "high",
+                []
+            ),
+            "low": quote.get(
+                "low",
+                []
+            ),
+            "close": quote.get(
+                "close",
+                []
+            ),
+            "volume": quote.get(
+                "volume",
+                []
+            ),
         }
     )
 
-    df = (
-        df
-        .dropna()
-        .reset_index(drop=True)
+    for col in [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]:
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
+
+    df["volume"] = pd.to_numeric(
+        df["volume"],
+        errors="coerce"
     )
 
-    return (
-        df
-        .tail(limit)
-        .reset_index(drop=True)
+    df = df.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+    )
+
+    df = df.sort_values(
+        "open_time"
+    ).reset_index(
+        drop=True
+    )
+
+    df = keep_completed_candles(
+        df,
+        interval
+    )
+
+    return df[
+        [
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+    ].tail(
+        int(limit)
+    ).reset_index(
+        drop=True
     )
 
 
-# ============================================================
+# ======================================================================
 # TWELVE DATA
-# ============================================================
+# ======================================================================
 
-_TD_INTERVAL_MAP = {
+_TD_INTERVALS = {
     "1m": "1min",
     "5m": "5min",
     "15m": "15min",
     "30m": "30min",
     "1h": "1h",
+    "4h": "4h",
     "1d": "1day",
 }
 
@@ -160,113 +353,87 @@ _TD_INTERVAL_MAP = {
 def klines_twelvedata(
     symbol,
     interval="15m",
-    limit=500,
-    **kwargs,
+    limit=1000
 ):
+    """
+    Twelve Data.
 
-    api_key = os.environ.get(
-        "TWELVE_DATA_API_KEY"
-    )
+    Particularité importante :
+    si le fournisseur ne retourne pas de volume,
+    on utilise NaN, pas 0.
+    """
 
-    if not api_key:
-
+    if not TWELVE_DATA_API_KEY:
         raise RuntimeError(
-            "TWELVE_DATA_API_KEY manquant "
-            "(variable d'environnement)"
+            "TWELVE_DATA_API_KEY absente."
         )
 
-    td_interval = _TD_INTERVAL_MAP.get(
+    td_interval = _TD_INTERVALS.get(
         interval,
-        "15min",
+        interval
     )
-
-    url = (
-        "https://api.twelvedata.com/"
-        "time_series"
-    )
-
-    # --------------------------------------------------------
-    # Limite pratique
-    # --------------------------------------------------------
 
     outputsize = min(
         int(limit),
-        5000,
+        5000
     )
 
-    # --------------------------------------------------------
-    # Retry
-    # --------------------------------------------------------
-
-    max_attempts = 3
-
-    timeout = 30
+    params = {
+        "symbol": symbol,
+        "interval": td_interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON",
+        "timezone": "UTC",
+    }
 
     last_error = None
 
-    for attempt in range(
-        1,
-        max_attempts + 1,
-    ):
-
-        params = {
-            "symbol": symbol,
-            "interval": td_interval,
-            "outputsize": outputsize,
-            "apikey": api_key,
-            "timezone": "UTC",
-        }
+    for attempt in range(3):
 
         try:
 
-            r = requests.get(
-                url,
+            response = requests.get(
+                TWELVE_DATA_BASE,
                 params=params,
-                timeout=timeout,
+                timeout=30
             )
 
-            r.raise_for_status()
+            response.raise_for_status()
 
-            data = r.json()
+            payload = response.json()
 
-            # ------------------------------------------------
-            # Erreur API
-            # ------------------------------------------------
+            if "status" in payload:
+                if payload.get("status") == "error":
+                    raise RuntimeError(
+                        payload.get(
+                            "message",
+                            "Erreur Twelve Data"
+                        )
+                    )
 
-            if data.get("status") == "error":
-
-                message = data.get(
-                    "message",
-                    "erreur inconnue",
-                )
-
-                raise ValueError(
-                    f"Twelve Data erreur "
-                    f"pour {symbol}: {message}"
-                )
-
-            values = data.get(
+            values = payload.get(
                 "values"
             )
 
             if not values:
-
-                raise ValueError(
-                    f"Twelve Data n'a renvoyé "
-                    f"aucune donnée pour {symbol}"
+                raise RuntimeError(
+                    "Aucune donnée Twelve Data."
                 )
 
-            # ------------------------------------------------
-            # Conversion
-            # ------------------------------------------------
+            df = pd.DataFrame(
+                values
+            )
 
-            df = pd.DataFrame(values)
-
-            df["open_time"] = (
-                pd.to_datetime(
-                    df["datetime"],
-                    utc=True,
+            if "datetime" not in df.columns:
+                raise RuntimeError(
+                    "Colonne datetime absente."
                 )
+
+            df["open_time"] = pd.to_datetime(
+                df["datetime"],
+                utc=True,
+                errors="coerce"
             )
 
             for col in [
@@ -275,194 +442,120 @@ def klines_twelvedata(
                 "low",
                 "close",
             ]:
+                if col not in df.columns:
+                    raise RuntimeError(
+                        f"Colonne {col} absente."
+                    )
 
-                df[col] = df[col].astype(
-                    float
+                df[col] = pd.to_numeric(
+                    df[col],
+                    errors="coerce"
                 )
 
-            # ------------------------------------------------
+            # ----------------------------------------------------------
             # Volume
-            # ------------------------------------------------
+            # ----------------------------------------------------------
 
             if "volume" in df.columns:
 
-                df["volume"] = (
-                    pd.to_numeric(
-                        df["volume"],
-                        errors="coerce",
-                    )
-                    .fillna(0.0)
-                    .astype(float)
+                df["volume"] = pd.to_numeric(
+                    df["volume"],
+                    errors="coerce"
                 )
 
             else:
+                # IMPORTANT :
+                # absence de volume = NaN
+                df["volume"] = float("nan")
 
-                # Forex / spot commodities
-                # peuvent ne pas avoir de volume.
-                df["volume"] = 0.0
-
-            # ------------------------------------------------
-            # Nettoyage
-            # ------------------------------------------------
-
-            df = (
-                df
-                .sort_values(
-                    "open_time"
-                )
-                .reset_index(
-                    drop=True
-                )
-            )
-
-            return (
-                df[
-                    [
-                        "open_time",
-                        "open",
-                        "high",
-                        "low",
-                        "close",
-                        "volume",
-                    ]
+            df = df.dropna(
+                subset=[
+                    "open_time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
                 ]
-                .tail(limit)
-                .reset_index(drop=True)
             )
 
-        except Exception as e:
+            df = df.sort_values(
+                "open_time"
+            ).reset_index(
+                drop=True
+            )
 
-            last_error = e
+            df = keep_completed_candles(
+                df,
+                interval
+            )
 
-            if attempt < max_attempts:
+            df = df[
+                [
+                    "open_time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                ]
+            ]
 
-                wait = 2 ** attempt
+            return df.tail(
+                int(limit)
+            ).reset_index(
+                drop=True
+            )
 
-                print(
-                    f"[Twelve Data] "
-                    f"{symbol}: tentative "
-                    f"{attempt}/{max_attempts} "
-                    f"échouée : {e}"
+        except Exception as exc:
+
+            last_error = exc
+
+            if attempt < 2:
+                time.sleep(
+                    2 ** (attempt + 1)
                 )
 
-                print(
-                    f"[Twelve Data] "
-                    f"Nouvelle tentative dans "
-                    f"{wait}s..."
-                )
-
-                time.sleep(wait)
-
-            else:
-
-                print(
-                    f"[Twelve Data] "
-                    f"{symbol}: échec après "
-                    f"{max_attempts} tentatives."
-                )
-
-    raise last_error
+    raise RuntimeError(
+        f"Twelve Data échoué pour "
+        f"{symbol}: {last_error}"
+    )
 
 
-# ============================================================
-# FINNHUB FOREX
-# ============================================================
+# ======================================================================
+# FINNHUB — COMPATIBILITÉ
+# ======================================================================
 
-_FH_RESOLUTION_MAP = {
-    "1m":  ("1", 1),
-    "5m":  ("5", 5),
-    "15m": ("15", 15),
-    "30m": ("30", 30),
-    "1h":  ("60", 60),
-    "1d":  ("D", 1440),
-}
-
-
-def klines_finnhub_forex(
+def klines_finnhub(
     symbol,
     interval="15m",
-    limit=500,
-    **kwargs,
+    limit=1000
 ):
+    """
+    Fonction conservée pour compatibilité.
 
-    api_key = os.environ.get(
+    Le scanner V4 actuel utilise Twelve Data
+    pour le Forex.
+    """
+
+    api_key = os.getenv(
         "FINNHUB_API_KEY"
     )
 
     if not api_key:
-
         raise RuntimeError(
-            "FINNHUB_API_KEY manquant "
-            "(variable d'environnement)"
+            "FINNHUB_API_KEY absente."
         )
 
-    resolution, minutes_per_bar = (
-        _FH_RESOLUTION_MAP.get(
-            interval,
-            ("15", 15),
-        )
-    )
-
-    now = int(
-        time.time()
-    )
-
-    span_seconds = (
-        minutes_per_bar
-        * 60
-        * (limit + 20)
-    )
-
-    start = now - span_seconds
-
-    url = (
-        "https://finnhub.io/api/v1/"
-        "forex/candle"
-    )
-
-    params = {
-        "symbol": symbol,
-        "resolution": resolution,
-        "from": start,
-        "to": now,
-        "token": api_key,
-    }
-
-    r = requests.get(
-        url,
-        params=params,
-        timeout=30,
-    )
-
-    r.raise_for_status()
-
-    data = r.json()
-
-    if data.get("s") != "ok":
-
-        raise ValueError(
-            f"Finnhub n'a pas de données "
-            f"pour {symbol} "
-            f"(statut: {data.get('s')})"
-        )
-
-    df = pd.DataFrame(
-        {
-            "open_time": pd.to_datetime(
-                data["t"],
-                unit="s",
-                utc=True,
-            ),
-            "open": data["o"],
-            "high": data["h"],
-            "low": data["l"],
-            "close": data["c"],
-            "volume": data["v"],
-        }
-    )
-
-    return (
-        df
-        .tail(limit)
-        .reset_index(drop=True)
+    # Finnhub n'est plus la source principale de V4.
+    # On retourne un DataFrame vide plutôt que de produire
+    # des données incompatibles avec le scanner.
+    return pd.DataFrame(
+        columns=[
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
     )
