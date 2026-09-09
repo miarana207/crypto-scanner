@@ -74,9 +74,9 @@ _TD_INTERVAL_MAP = {
 
 
 def klines_twelvedata(symbol, interval="15m", limit=500, **kwargs):
-    api_key = os.environ.get("TWELVEDATA_API_KEY")
+    api_key = os.environ.get("TWELVE_DATA_API_KEY")
     if not api_key:
-        raise RuntimeError("TWELVEDATA_API_KEY manquant (variable d'environnement)")
+        raise RuntimeError("TWELVE_DATA_API_KEY manquant (variable d'environnement)")
 
     td_interval = _TD_INTERVAL_MAP.get(interval, "15min")
     url = "https://api.twelvedata.com/time_series"
