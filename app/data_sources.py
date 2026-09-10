@@ -18,18 +18,18 @@ Sources :
 
     Twelve Data
         Source de secours intelligente.
-        Budget quotidien partagé : 800 appels maximum.
+        Budget quotidien partagé.
 
 Principes V4.2 :
-    - aucune dépendance à un ordre de fournisseurs rigide ;
-    - choix dynamique selon catégorie, disponibilité, fraîcheur et volume ;
+    - aucune dépendance à backtest.py ;
+    - choix dynamique des fournisseurs ;
     - fallback automatique ;
-    - cache des requêtes identiques pendant le processus ;
+    - cache des requêtes identiques ;
     - volume absent = NaN, jamais 0 ;
-    - couverture volume >= 80 % pour considérer le volume exploitable ;
+    - couverture volume >= 80 % = volume exploitable ;
     - agrégation correcte des bougies 1H -> 4H ;
-    - exclusion systématique des bougies incomplètes ;
-    - pas de retries inutiles sur Twelve Data ;
+    - exclusion des bougies incomplètes ;
+    - pas de retry inutile sur Twelve Data ;
     - compteur Twelve Data partagé entre toutes les instances ;
     - diagnostic du fournisseur réellement utilisé.
 """
@@ -42,8 +42,6 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-from backtest import klines as klines_binance
-
 
 load_dotenv()
 
@@ -54,6 +52,15 @@ load_dotenv()
 
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+
+# Binance public market-data API
+BINANCE_DATA_URL = os.getenv(
+    "BINANCE_DATA_URL",
+    "https://data-api.binance.vision",
+).rstrip("/")
+
+# Alias de compatibilité éventuelle
+BINANCE_URL = BINANCE_DATA_URL
 
 YAHOO_BASE = (
     "https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -67,17 +74,28 @@ FINNHUB_CANDLE_BASE = (
     "https://finnhub.io/api/v1/stock/candle"
 )
 
+FINNHUB_FOREX_CANDLE_BASE = (
+    "https://finnhub.io/api/v1/forex/candle"
+)
+
 REQUEST_TIMEOUT = 30
 
-# Volume considéré comme réellement exploitable
 VOLUME_MIN_COVERAGE = float(
     os.getenv("VOLUME_MIN_COVERAGE", "0.80")
 )
 
-# Budget Twelve Data demandé pour V4.2
 TWELVE_DATA_DAILY_BUDGET = int(
-    os.getenv("TWELVE_DATA_DAILY_BUDGET", "800")
+    os.getenv(
+        "TWELVE_DATA_DAILY_BUDGET",
+        os.getenv(
+            "TWELVE_DATA_DAILY_LIMIT",
+            "800",
+        ),
+    )
 )
+
+# Alias de compatibilité
+TWELVE_DATA_DAILY_LIMIT = TWELVE_DATA_DAILY_BUDGET
 
 
 # ======================================================================
@@ -94,6 +112,24 @@ _SESSION.headers.update(
         )
     }
 )
+
+
+# ======================================================================
+# STRUCTURE STANDARD
+# ======================================================================
+
+OHLCV_COLUMNS = [
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+]
+
+
+class DataSourceError(RuntimeError):
+    """Erreur standard du routeur de données."""
 
 
 # ======================================================================
@@ -141,7 +177,7 @@ def clear_cache():
 
 
 # ======================================================================
-# COMPTEURS ROUTEUR
+# STATISTIQUES
 # ======================================================================
 
 _ROUTER_STATS = {
@@ -167,31 +203,13 @@ def _stats_increment(key, amount=1):
         )
 
 
-def router_stats():
-    with _STATS_LOCK:
-        stats = dict(_ROUTER_STATS)
-
-    stats.update(
-        {
-            "twelvedata_used":
-                DataRouter.twelvedata_used(),
-            "twelvedata_remaining":
-                DataRouter.twelvedata_remaining(),
-            "twelvedata_budget":
-                TWELVE_DATA_DAILY_BUDGET,
-        }
-    )
-
-    return stats
-
-
 # ======================================================================
 # BUDGET TWELVE DATA
 # ======================================================================
 
 class _TwelveDataBudget:
     """
-    Compteur partagé au niveau du processus.
+    Compteur Twelve Data partagé au niveau du processus.
 
     Toutes les instances de DataRouter utilisent le même compteur.
     """
@@ -231,47 +249,44 @@ class _TwelveDataBudget:
     def remaining(cls):
         with cls.lock:
             cls._reset_if_needed()
+
             return max(
                 0,
-                TWELVE_DATA_DAILY_BUDGET - cls.used
+                TWELVE_DATA_DAILY_BUDGET - cls.used,
             )
+
+
+# ======================================================================
+# STATISTIQUES PUBLIQUES
+# ======================================================================
+
+def router_stats():
+    with _STATS_LOCK:
+        stats = dict(_ROUTER_STATS)
+
+    stats.update(
+        {
+            "twelvedata_used":
+                _TwelveDataBudget.used_today(),
+
+            "twelvedata_remaining":
+                _TwelveDataBudget.remaining(),
+
+            "twelvedata_budget":
+                TWELVE_DATA_DAILY_BUDGET,
+        }
+    )
+
+    return stats
+
+
+def get_router_stats():
+    return router_stats()
 
 
 # ======================================================================
 # UTILITAIRES
 # ======================================================================
-
-def interval_to_seconds(interval):
-    """
-    Convertit un intervalle en secondes.
-    """
-
-    value = str(
-        interval
-    ).strip().lower()
-
-    if value.endswith("m"):
-        return int(
-            value[:-1]
-        ) * 60
-
-    if value.endswith("h"):
-        return int(
-            value[:-1]
-        ) * 3600
-
-    if value.endswith("d"):
-        return int(
-            value[:-1]
-        ) * 86400
-
-    if value.endswith("w"):
-        return int(
-            value[:-1]
-        ) * 604800
-
-    return 60
-
 
 def normalize_interval(interval):
     return str(
@@ -279,24 +294,33 @@ def normalize_interval(interval):
     ).strip().lower()
 
 
-def empty_ohlcv():
-    df = pd.DataFrame(
-        columns=[
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-        ]
-    )
+def interval_to_seconds(interval):
+    value = normalize_interval(interval)
 
-    return df
+    if value.endswith("m"):
+        return int(value[:-1]) * 60
+
+    if value.endswith("h"):
+        return int(value[:-1]) * 3600
+
+    if value.endswith("d"):
+        return int(value[:-1]) * 86400
+
+    if value.endswith("w"):
+        return int(value[:-1]) * 604800
+
+    return 60
+
+
+def empty_ohlcv():
+    return pd.DataFrame(
+        columns=OHLCV_COLUMNS
+    )
 
 
 def ensure_ohlcv(df):
     """
-    Normalise systématiquement la structure de sortie.
+    Normalise systématiquement la structure OHLCV.
     """
 
     if df is None:
@@ -304,16 +328,7 @@ def ensure_ohlcv(df):
 
     d = df.copy()
 
-    required = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]
-
-    for column in required:
+    for column in OHLCV_COLUMNS:
         if column not in d.columns:
             d[column] = float("nan")
 
@@ -354,14 +369,14 @@ def ensure_ohlcv(df):
         .reset_index(drop=True)
     )
 
-    return d[
-        required
-    ]
+    return d[OHLCV_COLUMNS]
 
 
 def volume_coverage(df):
     """
-    Pourcentage de bougies disposant d'un volume exploitable.
+    Pourcentage de bougies disposant d'un volume réel.
+
+    Un volume manquant reste NaN.
     """
 
     if df is None or df.empty:
@@ -381,10 +396,6 @@ def volume_coverage(df):
 
 
 def volume_status(df):
-    """
-    Statut explicite du volume.
-    """
-
     coverage = volume_coverage(df)
 
     if coverage >= VOLUME_MIN_COVERAGE:
@@ -402,10 +413,6 @@ def attach_metadata(
     provider_symbol=None,
     asset_type=None,
 ):
-    """
-    Ajoute les informations du routeur dans DataFrame.attrs.
-    """
-
     d = ensure_ohlcv(df)
 
     status = volume_status(d)
@@ -434,6 +441,25 @@ def attach_metadata(
         status == "VOLUME_CONFIRMED"
     )
 
+    if not d.empty:
+        last = pd.Timestamp(
+            d["open_time"].iloc[-1]
+        )
+
+        now = pd.Timestamp.now(
+            tz="UTC"
+        )
+
+        d.attrs["last_candle"] = last
+
+        d.attrs["age_minutes"] = (
+            now - last
+        ).total_seconds() / 60.0
+
+    else:
+        d.attrs["last_candle"] = None
+        d.attrs["age_minutes"] = None
+
     return d
 
 
@@ -442,13 +468,11 @@ def keep_completed_candles(
     interval,
 ):
     """
-    Exclut les bougies encore en formation.
-
-    On utilise l'heure d'ouverture + durée de l'intervalle.
+    Supprime la bougie actuellement en formation.
     """
 
     if df is None or df.empty:
-        return df
+        return empty_ohlcv()
 
     d = ensure_ohlcv(df)
 
@@ -470,45 +494,46 @@ def keep_completed_candles(
         >= seconds
     )
 
-    d = (
+    return (
         d.loc[completed]
         .copy()
         .reset_index(drop=True)
     )
-
-    return d
 
 
 def _completed_limit(
     limit,
     interval,
 ):
-    """
-    Quantité brute à demander pour obtenir suffisamment
-    de bougies après exclusion des bougies incomplètes.
-
-    Pour 4H via agrégation 1H, on demande environ 4x.
-    """
-
     limit = max(
         1,
-        int(limit)
+        int(limit),
     )
 
-    if normalize_interval(interval) == "4h":
+    interval = normalize_interval(
+        interval
+    )
+
+    if interval == "4h":
         return min(
             5000,
-            limit * 4 + 20,
+            limit * 4 + 24,
+        )
+
+    if interval == "2h":
+        return min(
+            5000,
+            limit * 2 + 20,
         )
 
     return min(
         5000,
-        limit + 10,
+        limit + 20,
     )
 
 
 # ======================================================================
-# AGRÉGATION
+# AGRÉGATION OHLCV
 # ======================================================================
 
 def aggregate_ohlcv(
@@ -516,19 +541,10 @@ def aggregate_ohlcv(
     target_interval,
 ):
     """
-    Agrège des bougies inférieures vers l'intervalle cible.
+    Agrégation OHLCV.
 
-    Exemple :
-        1H -> 4H
-
-    Règle volume :
-        le volume agrégé n'est conservé que si TOUS les composants
-        disposent d'un volume réel.
-
-        Sinon :
-            NaN
-
-    On ne fabrique jamais un volume partiel.
+    Le volume agrégé est conservé uniquement si toutes les
+    bougies composantes disposent d'un volume réel.
     """
 
     if df is None or df.empty:
@@ -545,13 +561,18 @@ def aggregate_ohlcv(
 
     if target == "4h":
         rule = "4h"
+        expected_children = 4
+
     elif target == "2h":
         rule = "2h"
+        expected_children = 2
+
     elif target == "1h":
         return d
+
     else:
         raise ValueError(
-            f"Intervalle d'agrégation non supporté : "
+            "Intervalle d'agrégation non supporté : "
             f"{target_interval}"
         )
 
@@ -592,15 +613,6 @@ def aggregate_ohlcv(
         "volume"
     ].count()
 
-    expected_seconds = (
-        interval_to_seconds("1h")
-    )
-
-    expected_children = (
-        interval_to_seconds(target)
-        // expected_seconds
-    )
-
     result["volume"] = volume_sum.where(
         volume_count == expected_children
     )
@@ -624,6 +636,207 @@ def aggregate_ohlcv(
 
     return ensure_ohlcv(
         result
+    )
+
+
+# ======================================================================
+# BINANCE
+# ======================================================================
+
+_BINANCE_INTERVALS = {
+    "1m",
+    "3m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "4h",
+    "6h",
+    "8h",
+    "12h",
+    "1d",
+    "3d",
+    "1w",
+}
+
+
+def _normalize_binance_symbol(symbol):
+    value = str(symbol).strip().upper()
+
+    value = value.replace(
+        "/",
+        "",
+    )
+
+    value = value.replace(
+        "-",
+        "",
+    )
+
+    return value
+
+
+def _binance_raw(
+    symbol,
+    interval,
+    limit,
+):
+    interval = normalize_interval(
+        interval
+    )
+
+    if interval not in _BINANCE_INTERVALS:
+        raise DataSourceError(
+            f"Intervalle Binance non supporté : "
+            f"{interval}"
+        )
+
+    symbol = _normalize_binance_symbol(
+        symbol
+    )
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": min(
+            max(1, int(limit)),
+            1000,
+        ),
+    }
+
+    url = (
+        BINANCE_DATA_URL
+        + "/api/v3/klines"
+    )
+
+    response = _SESSION.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if response.status_code == 429:
+        raise DataSourceError(
+            f"Binance HTTP 429 pour {symbol}"
+        )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if not isinstance(
+        payload,
+        list,
+    ):
+        raise DataSourceError(
+            f"Binance réponse invalide pour {symbol}: "
+            f"{payload}"
+        )
+
+    if not payload:
+        return empty_ohlcv()
+
+    rows = []
+
+    for row in payload:
+        if not isinstance(
+            row,
+            (list, tuple),
+        ):
+            continue
+
+        if len(row) < 6:
+            continue
+
+        rows.append(
+            {
+                "open_time":
+                    pd.to_datetime(
+                        row[0],
+                        unit="ms",
+                        utc=True,
+                        errors="coerce",
+                    ),
+                "open": row[1],
+                "high": row[2],
+                "low": row[3],
+                "close": row[4],
+                "volume": row[5],
+            }
+        )
+
+    return ensure_ohlcv(
+        pd.DataFrame(rows)
+    )
+
+
+def klines_binance_v42(
+    symbol,
+    interval="15m",
+    limit=1000,
+    asset_type="crypto",
+):
+    key = _cache_key(
+        "binance",
+        symbol,
+        interval,
+        limit,
+        asset_type,
+    )
+
+    cached = _cache_get(key)
+
+    if cached is not None:
+        _stats_increment(
+            "cache_hits"
+        )
+
+        return attach_metadata(
+            cached,
+            "binance",
+            symbol,
+            asset_type,
+        )
+
+    raw_limit = _completed_limit(
+        limit,
+        interval,
+    )
+
+    df = _binance_raw(
+        symbol,
+        interval,
+        raw_limit,
+    )
+
+    df = keep_completed_candles(
+        df,
+        interval,
+    )
+
+    df = (
+        ensure_ohlcv(df)
+        .tail(int(limit))
+        .reset_index(drop=True)
+    )
+
+    if df.empty:
+        raise DataSourceError(
+            f"Binance : aucune donnée exploitable "
+            f"pour {symbol}"
+        )
+
+    _cache_set(
+        key,
+        df,
+    )
+
+    return attach_metadata(
+        df,
+        "binance",
+        symbol,
+        asset_type,
     )
 
 
@@ -662,31 +875,29 @@ _YAHOO_CONFIG = {
 def _yahoo_raw(
     symbol,
     interval,
-    limit,
 ):
-    """
-    Téléchargement brut Yahoo.
-    """
-
-    requested_interval = normalize_interval(
+    requested = normalize_interval(
         interval
     )
 
-    # Yahoo ne reçoit pas 4H directement :
-    # on demande du 1H puis on agrège.
     yahoo_interval = (
         "1h"
-        if requested_interval == "4h"
-        else requested_interval
+        if requested in {
+            "2h",
+            "4h",
+        }
+        else requested
     )
 
-    config = _YAHOO_CONFIG.get(
-        yahoo_interval,
-        {
-            "range": "60d",
-            "interval": yahoo_interval,
-        },
-    )
+    if yahoo_interval not in _YAHOO_CONFIG:
+        raise DataSourceError(
+            f"Intervalle Yahoo non supporté : "
+            f"{requested}"
+        )
+
+    config = _YAHOO_CONFIG[
+        yahoo_interval
+    ]
 
     url = (
         YAHOO_BASE
@@ -710,7 +921,7 @@ def _yahoo_raw(
     )
 
     if response.status_code == 429:
-        raise RuntimeError(
+        raise DataSourceError(
             f"Yahoo HTTP 429 pour {symbol}"
         )
 
@@ -728,13 +939,9 @@ def _yahoo_raw(
     )
 
     if not results:
-        error = chart.get(
-            "error"
-        )
-
-        raise RuntimeError(
+        raise DataSourceError(
             f"Yahoo : aucune donnée pour "
-            f"{symbol} : {error}"
+            f"{symbol}"
         )
 
     result = results[0]
@@ -746,8 +953,14 @@ def _yahoo_raw(
 
     quote_list = (
         result
-        .get("indicators", {})
-        .get("quote", [])
+        .get(
+            "indicators",
+            {},
+        )
+        .get(
+            "quote",
+            [],
+        )
     )
 
     if not timestamps or not quote_list:
@@ -797,13 +1010,6 @@ def klines_yahoo(
     limit=1000,
     asset_type="stock",
 ):
-    """
-    Récupère des bougies Yahoo.
-
-    4H :
-        Yahoo 1H -> agrégation V4.2 4H.
-    """
-
     interval = normalize_interval(
         interval
     )
@@ -816,9 +1022,7 @@ def klines_yahoo(
         asset_type,
     )
 
-    cached = _cache_get(
-        key
-    )
+    cached = _cache_get(key)
 
     if cached is not None:
         _stats_increment(
@@ -832,21 +1036,21 @@ def klines_yahoo(
             asset_type,
         )
 
-    raw_limit = _completed_limit(
-        limit,
-        interval,
-    )
-
     df = _yahoo_raw(
         symbol,
         interval,
-        raw_limit,
     )
 
     if interval == "4h":
         df = aggregate_ohlcv(
             df,
             "4h",
+        )
+
+    elif interval == "2h":
+        df = aggregate_ohlcv(
+            df,
+            "2h",
         )
 
     else:
@@ -860,6 +1064,12 @@ def klines_yahoo(
         .tail(int(limit))
         .reset_index(drop=True)
     )
+
+    if df.empty:
+        raise DataSourceError(
+            f"Yahoo : aucune donnée exploitable "
+            f"pour {symbol}"
+        )
 
     _cache_set(
         key,
@@ -893,10 +1103,6 @@ def _finnhub_period(
     interval,
     limit,
 ):
-    """
-    Calcule une fenêtre Unix suffisamment large.
-    """
-
     seconds = interval_to_seconds(
         interval
     )
@@ -907,12 +1113,10 @@ def _finnhub_period(
         ).timestamp()
     )
 
-    # Marge importante pour les marchés fermés
-    # et pour les périodes sans cotation.
     total = (
         max(100, int(limit))
         * seconds
-        * 2
+        * 3
     )
 
     return (
@@ -925,45 +1129,56 @@ def _finnhub_raw(
     symbol,
     interval,
     limit,
+    asset_type="stock",
 ):
-    """
-    Récupère les candles Finnhub.
-
-    Le volume 'v' est conservé lorsqu'il est fourni.
-    """
-
     if not FINNHUB_API_KEY:
-        raise RuntimeError(
+        raise DataSourceError(
             "FINNHUB_API_KEY absente."
         )
 
-    requested_interval = normalize_interval(
+    requested = normalize_interval(
         interval
     )
 
-    if requested_interval == "4h":
+    if requested in {
+        "2h",
+        "4h",
+    }:
         resolution = "60"
         raw_interval = "1h"
     else:
         resolution = _FINNHUB_RESOLUTION.get(
-            requested_interval
+            requested
         )
 
         if resolution is None:
-            raise RuntimeError(
+            raise DataSourceError(
                 f"Intervalle Finnhub non supporté : "
-                f"{interval}"
+                f"{requested}"
             )
 
-        raw_interval = requested_interval
+        raw_interval = requested
 
     start, end = _finnhub_period(
         raw_interval,
         _completed_limit(
             limit,
-            requested_interval,
+            requested,
         ),
     )
+
+    asset = str(
+        asset_type
+    ).lower()
+
+    if asset == "forex":
+        endpoint = (
+            FINNHUB_FOREX_CANDLE_BASE
+        )
+    else:
+        endpoint = (
+            FINNHUB_CANDLE_BASE
+        )
 
     params = {
         "symbol": symbol,
@@ -974,13 +1189,13 @@ def _finnhub_raw(
     }
 
     response = _SESSION.get(
-        FINNHUB_CANDLE_BASE,
+        endpoint,
         params=params,
         timeout=REQUEST_TIMEOUT,
     )
 
     if response.status_code == 429:
-        raise RuntimeError(
+        raise DataSourceError(
             f"Finnhub HTTP 429 pour {symbol}"
         )
 
@@ -991,16 +1206,15 @@ def _finnhub_raw(
     status = str(
         payload.get(
             "s",
-            ""
+            "",
         )
     ).lower()
 
-    if status not in {
-        "ok",
-    }:
-        raise RuntimeError(
+    if status != "ok":
+        raise DataSourceError(
             f"Finnhub : aucune donnée pour "
-            f"{symbol} : {payload}"
+            f"{symbol} : "
+            f"{payload}"
         )
 
     timestamps = payload.get(
@@ -1052,9 +1266,9 @@ def _finnhub_raw(
         }
     )
 
-    # Finnhub peut ne pas retourner le volume
-    # pour certains instruments.
-    if len(volumes) != len(timestamps):
+    if len(volumes) != len(
+        timestamps
+    ):
         df["volume"] = float("nan")
 
     return ensure_ohlcv(
@@ -1068,19 +1282,6 @@ def klines_finnhub(
     limit=1000,
     asset_type="stock",
 ):
-    """
-    Finnhub V4.2.
-
-    Pour les actions :
-        volume réel conservé.
-
-    Pour les instruments sans volume :
-        NaN.
-
-    Pour 4H :
-        1H -> 4H.
-    """
-
     interval = normalize_interval(
         interval
     )
@@ -1093,9 +1294,7 @@ def klines_finnhub(
         asset_type,
     )
 
-    cached = _cache_get(
-        key
-    )
+    cached = _cache_get(key)
 
     if cached is not None:
         _stats_increment(
@@ -1118,12 +1317,19 @@ def klines_finnhub(
         symbol,
         interval,
         raw_limit,
+        asset_type,
     )
 
     if interval == "4h":
         df = aggregate_ohlcv(
             df,
             "4h",
+        )
+
+    elif interval == "2h":
+        df = aggregate_ohlcv(
+            df,
+            "2h",
         )
 
     else:
@@ -1137,6 +1343,12 @@ def klines_finnhub(
         .tail(int(limit))
         .reset_index(drop=True)
     )
+
+    if df.empty:
+        raise DataSourceError(
+            f"Finnhub : aucune donnée exploitable "
+            f"pour {symbol}"
+        )
 
     _cache_set(
         key,
@@ -1174,9 +1386,7 @@ def _twelvedata_error_message(
     )
 
     if message:
-        return str(
-            message
-        )
+        return str(message)
 
     code = payload.get(
         "code"
@@ -1194,25 +1404,26 @@ def klines_twelvedata(
     limit=1000,
     asset_type="stock",
 ):
-    """
-    Twelve Data.
-
-    IMPORTANT :
-        - une seule requête par appel logique ;
-        - aucun retry automatique ;
-        - budget quotidien partagé ;
-        - volume absent = NaN ;
-        - volume réel conservé.
-    """
-
     if not TWELVE_DATA_API_KEY:
-        raise RuntimeError(
+        raise DataSourceError(
             "TWELVE_DATA_API_KEY absente."
         )
 
     interval = normalize_interval(
         interval
     )
+
+    td_interval = _TD_INTERVALS.get(
+        interval
+    )
+
+    # IMPORTANT :
+    # vérifier l'intervalle AVANT de réserver un crédit.
+    if td_interval is None:
+        raise DataSourceError(
+            f"Intervalle Twelve Data non supporté : "
+            f"{interval}"
+        )
 
     key = _cache_key(
         "twelvedata",
@@ -1222,9 +1433,7 @@ def klines_twelvedata(
         asset_type,
     )
 
-    cached = _cache_get(
-        key
-    )
+    cached = _cache_get(key)
 
     if cached is not None:
         _stats_increment(
@@ -1238,21 +1447,11 @@ def klines_twelvedata(
             asset_type,
         )
 
-    # Une réservation = une requête API.
+    # Une réservation = une véritable requête API.
     if not _TwelveDataBudget.reserve():
-        raise RuntimeError(
+        raise DataSourceError(
             "Budget Twelve Data quotidien atteint "
             f"({TWELVE_DATA_DAILY_BUDGET} appels)."
-        )
-
-    td_interval = _TD_INTERVALS.get(
-        interval
-    )
-
-    if td_interval is None:
-        raise RuntimeError(
-            f"Intervalle Twelve Data non supporté : "
-            f"{interval}"
         )
 
     outputsize = min(
@@ -1276,7 +1475,7 @@ def klines_twelvedata(
     )
 
     if response.status_code == 429:
-        raise RuntimeError(
+        raise DataSourceError(
             f"Twelve Data HTTP 429 pour {symbol}"
         )
 
@@ -1287,7 +1486,7 @@ def klines_twelvedata(
     if payload.get(
         "status"
     ) == "error":
-        raise RuntimeError(
+        raise DataSourceError(
             "Twelve Data : "
             + _twelvedata_error_message(
                 payload
@@ -1299,7 +1498,7 @@ def klines_twelvedata(
     )
 
     if not values:
-        raise RuntimeError(
+        raise DataSourceError(
             f"Twelve Data : aucune donnée pour "
             f"{symbol}"
         )
@@ -1309,7 +1508,7 @@ def klines_twelvedata(
     )
 
     if "datetime" not in df.columns:
-        raise RuntimeError(
+        raise DataSourceError(
             "Twelve Data : colonne datetime absente."
         )
 
@@ -1326,8 +1525,9 @@ def klines_twelvedata(
         "close",
     ]:
         if column not in df.columns:
-            raise RuntimeError(
-                f"Twelve Data : colonne {column} absente."
+            raise DataSourceError(
+                "Twelve Data : colonne "
+                f"{column} absente."
             )
 
         df[column] = pd.to_numeric(
@@ -1341,7 +1541,7 @@ def klines_twelvedata(
             errors="coerce",
         )
     else:
-        # JAMAIS 0 pour un volume absent.
+        # JAMAIS 0.
         df["volume"] = float("nan")
 
     df = ensure_ohlcv(
@@ -1358,6 +1558,12 @@ def klines_twelvedata(
         .reset_index(drop=True)
     )
 
+    if df.empty:
+        raise DataSourceError(
+            f"Twelve Data : aucune bougie complète "
+            f"pour {symbol}"
+        )
+
     _cache_set(
         key,
         df,
@@ -1366,82 +1572,6 @@ def klines_twelvedata(
     return attach_metadata(
         df,
         "twelvedata",
-        symbol,
-        asset_type,
-    )
-
-
-# ======================================================================
-# BINANCE WRAPPER
-# ======================================================================
-
-def klines_binance_v42(
-    symbol,
-    interval="5m",
-    limit=1000,
-    asset_type="crypto",
-):
-    """
-    Wrapper Binance pour le routeur.
-
-    Binance reste la source unique de la crypto.
-    """
-
-    key = _cache_key(
-        "binance",
-        symbol,
-        interval,
-        limit,
-        asset_type,
-    )
-
-    cached = _cache_get(
-        key
-    )
-
-    if cached is not None:
-        _stats_increment(
-            "cache_hits"
-        )
-
-        return attach_metadata(
-            cached,
-            "binance",
-            symbol,
-            asset_type,
-        )
-
-    df = klines_binance(
-        symbol,
-        interval=interval,
-        limit=min(
-            int(limit),
-            1000,
-        ),
-    )
-
-    df = ensure_ohlcv(
-        df
-    )
-
-    df = keep_completed_candles(
-        df,
-        interval,
-    )
-
-    df = (
-        df.tail(int(limit))
-        .reset_index(drop=True)
-    )
-
-    _cache_set(
-        key,
-        df,
-    )
-
-    return attach_metadata(
-        df,
-        "binance",
         symbol,
         asset_type,
     )
@@ -1457,22 +1587,18 @@ def _resolve_provider_symbol(
     symbol_map=None,
 ):
     """
-    Résolution flexible compatible avec plusieurs formats
-    de symbol_map.
+    Formats supportés :
 
-    Formats acceptés :
-
-    1.
         {"yahoo": "AAPL", "finnhub": "AAPL"}
 
-    2.
-        {"AAPL": {"yahoo": "AAPL", ...}}
+        {"AAPL": {
+            "yahoo": "AAPL",
+            "finnhub": "AAPL"
+        }}
 
-    3.
         {"AAPL": "AAPL"}
 
-    4.
-        [{"yahoo": "AAPL", ...}, ...]
+        [{"yahoo": "AAPL", ...}]
     """
 
     provider = str(
@@ -1482,27 +1608,44 @@ def _resolve_provider_symbol(
     if symbol_map is None:
         return symbol
 
-    # --------------------------------------------------------------
-    # Mapping direct provider -> symbole
-    # --------------------------------------------------------------
-
     if isinstance(
         symbol_map,
         dict,
     ):
+        # Mapping direct fournisseur -> symbole
         direct = symbol_map.get(
             provider
         )
 
         if direct:
-            return str(
-                direct
+            return str(direct)
+
+        # Alias possibles
+        aliases = {
+            "twelvedata": [
+                "twelve_data",
+                "td",
+            ],
+            "finnhub": [
+                "fh",
+            ],
+            "yahoo": [
+                "yf",
+            ],
+        }
+
+        for alias in aliases.get(
+            provider,
+            [],
+        ):
+            value = symbol_map.get(
+                alias
             )
 
-        # ----------------------------------------------------------
-        # Mapping symbole -> mapping fournisseurs
-        # ----------------------------------------------------------
+            if value:
+                return str(value)
 
+        # Mapping symbole -> fournisseur
         nested = symbol_map.get(
             symbol
         )
@@ -1516,19 +1659,24 @@ def _resolve_provider_symbol(
             )
 
             if value:
-                return str(
-                    value
+                return str(value)
+
+            for alias in aliases.get(
+                provider,
+                [],
+            ):
+                value = nested.get(
+                    alias
                 )
+
+                if value:
+                    return str(value)
 
         elif isinstance(
             nested,
             str,
         ):
             return nested
-
-    # --------------------------------------------------------------
-    # Liste / tuple de dictionnaires
-    # --------------------------------------------------------------
 
     if isinstance(
         symbol_map,
@@ -1541,41 +1689,36 @@ def _resolve_provider_symbol(
             ):
                 continue
 
-            display = entry.get(
-                "display"
+            candidates = {
+                entry.get("display"),
+                entry.get("symbol"),
+                entry.get("yahoo"),
+                entry.get("finnhub"),
+                entry.get("twelvedata"),
+                entry.get("twelve_data"),
+                entry.get("binance"),
+            }
+
+            if symbol not in candidates:
+                continue
+
+            value = entry.get(
+                provider
             )
 
-            yahoo = entry.get(
-                "yahoo"
-            )
-
-            td = entry.get(
-                "twelvedata"
-            )
-
-            finnhub = entry.get(
-                "finnhub"
-            )
-
-            binance = entry.get(
-                "binance"
-            )
-
-            if symbol in {
-                display,
-                yahoo,
-                td,
-                finnhub,
-                binance,
-            }:
+            if not value:
                 value = entry.get(
-                    provider
+                    {
+                        "twelvedata":
+                            "twelve_data"
+                    }.get(
+                        provider,
+                        provider,
+                    )
                 )
 
-                if value:
-                    return str(
-                        value
-                    )
+            if value:
+                return str(value)
 
     return symbol
 
@@ -1588,13 +1731,6 @@ def _provider_order(
     asset_type,
     require_volume=False,
 ):
-    """
-    Ordre initial intelligent.
-
-    Le routeur peut ensuite modifier cet ordre en fonction
-    des résultats et des capacités.
-    """
-
     asset = str(
         asset_type
     ).lower()
@@ -1605,14 +1741,6 @@ def _provider_order(
         ]
 
     if asset == "stock":
-        # Finnhub et Yahoo avant Twelve Data.
-        if require_volume:
-            return [
-                "finnhub",
-                "yahoo",
-                "twelvedata",
-            ]
-
         return [
             "finnhub",
             "yahoo",
@@ -1660,7 +1788,7 @@ def _provider_supports_interval(
     )
 
     if provider == "binance":
-        return True
+        return interval in _BINANCE_INTERVALS
 
     if provider == "yahoo":
         return interval in {
@@ -1669,6 +1797,7 @@ def _provider_supports_interval(
             "15m",
             "30m",
             "1h",
+            "2h",
             "4h",
             "1d",
         }
@@ -1680,6 +1809,7 @@ def _provider_supports_interval(
             "15m",
             "30m",
             "1h",
+            "2h",
             "4h",
             "1d",
         }
@@ -1723,22 +1853,13 @@ def _provider_function(
 
 
 # ======================================================================
-# ÉVALUATION D'UNE SOURCE
+# FRAÎCHEUR
 # ======================================================================
 
 def _freshness_score(
     df,
     interval,
 ):
-    """
-    Score de fraîcheur entre 0 et 1.
-
-    Une donnée récente obtient 1.
-    Une donnée plusieurs intervalles en retard voit son score diminuer.
-
-    On ne rejette pas automatiquement les marchés fermés.
-    """
-
     if df is None or df.empty:
         return 0.0
 
@@ -1789,6 +1910,10 @@ def _freshness_score(
     return 0.0
 
 
+# ======================================================================
+# SCORE SOURCE
+# ======================================================================
+
 def _source_score(
     provider,
     df,
@@ -1796,11 +1921,6 @@ def _source_score(
     interval,
     require_volume,
 ):
-    """
-    Score interne permettant de comparer les résultats
-    réellement obtenus.
-    """
-
     if df is None or df.empty:
         return -999.0
 
@@ -1815,50 +1935,37 @@ def _source_score(
 
     score = 0.0
 
-    # --------------------------------------------------------------
     # Fraîcheur
-    # --------------------------------------------------------------
-
     score += (
         freshness * 50.0
     )
 
-    # --------------------------------------------------------------
     # Volume
-    # --------------------------------------------------------------
-
     if coverage >= VOLUME_MIN_COVERAGE:
         score += 30.0
+
     elif coverage > 0:
         score += (
             10.0 * coverage
         )
 
-    # Si le volume est obligatoire, un fournisseur sans volume
-    # est fortement pénalisé.
     if require_volume:
         if coverage < VOLUME_MIN_COVERAGE:
             score -= 40.0
 
-    # --------------------------------------------------------------
-    # Qualité de données
-    # --------------------------------------------------------------
-
-    count = len(
-        df
-    )
+    # Nombre de bougies
+    count = len(df)
 
     if count >= 120:
         score += 15.0
+
     elif count >= 60:
         score += 8.0
+
     elif count >= 30:
         score += 3.0
 
-    # --------------------------------------------------------------
-    # Bonus provider par catégorie
-    # --------------------------------------------------------------
-
+    # Bonus catégorie
     provider = str(
         provider
     ).lower()
@@ -1879,8 +1986,7 @@ def _source_score(
     elif asset == "commodity" and provider == "yahoo":
         score += 15.0
 
-    # Twelve Data doit être conservé comme secours
-    # afin d'économiser le quota.
+    # Twelve Data reste un secours.
     if provider == "twelvedata":
         score -= 8.0
 
@@ -1893,28 +1999,12 @@ def _source_score(
 
 class DataRouter:
     """
-    Routeur V4.2.
-
-    Exemple :
-
-        router = DataRouter()
-
-        df = router.fetch(
-            "AAPL",
-            interval="15m",
-            limit=1000,
-            asset_type="stock",
-            symbol_map={
-                "yahoo": "AAPL",
-                "finnhub": "AAPL",
-                "twelvedata": "AAPL",
-            },
-        )
+    Routeur intelligent V4.2.
     """
 
-    # --------------------------------------------------------------
-    # Budget partagé
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Budget Twelve Data
+    # ------------------------------------------------------------------
 
     @staticmethod
     def twelvedata_used():
@@ -1928,7 +2018,7 @@ class DataRouter:
     def twelvedata_budget():
         return TWELVE_DATA_DAILY_BUDGET
 
-    # Alias utiles pour compatibilité.
+    # Alias
     @staticmethod
     def td_used():
         return _TwelveDataBudget.used_today()
@@ -1937,9 +2027,21 @@ class DataRouter:
     def td_remaining():
         return _TwelveDataBudget.remaining()
 
-    # --------------------------------------------------------------
+    @property
+    def twelve_data_used(self):
+        return _TwelveDataBudget.used_today()
+
+    @property
+    def twelve_data_remaining(self):
+        return _TwelveDataBudget.remaining()
+
+    @property
+    def twelvedata_used_count(self):
+        return _TwelveDataBudget.used_today()
+
+    # ------------------------------------------------------------------
     # Statistiques
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     @staticmethod
     def stats():
@@ -1949,17 +2051,17 @@ class DataRouter:
     def get_stats():
         return router_stats()
 
-    # --------------------------------------------------------------
-    # Réinitialisation du cache
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Cache
+    # ------------------------------------------------------------------
 
     @staticmethod
     def clear_cache():
         clear_cache()
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Fetch
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def fetch(
         self,
@@ -1978,11 +2080,10 @@ class DataRouter:
             fournisseur préféré optionnel.
 
         require_volume :
-            True pour actions/crypto/matières nécessitant
-            un volume exploitable.
+            True lorsque le volume est important.
 
-        Le routeur n'utilise pas Twelve Data avant les
-        autres sources lorsque celles-ci sont disponibles.
+        Le routeur essaie les fournisseurs gratuits avant
+        Twelve Data lorsque cela est possible.
         """
 
         asset = str(
@@ -1995,15 +2096,24 @@ class DataRouter:
 
         symbol = str(
             symbol
-        )
+        ).strip()
 
         _stats_increment(
             "requests"
         )
 
-        # ----------------------------------------------------------
-        # Crypto : Binance uniquement
-        # ----------------------------------------------------------
+        if not symbol:
+            _stats_increment(
+                "errors"
+            )
+
+            raise DataSourceError(
+                "Symbole vide."
+            )
+
+        # ==============================================================
+        # CRYPTO → BINANCE
+        # ==============================================================
 
         if asset == "crypto":
             provider = "binance"
@@ -2017,17 +2127,15 @@ class DataRouter:
             )
 
             try:
-                df = _provider_function(
-                    provider
-                )(
+                df = klines_binance_v42(
                     provider_symbol,
                     interval=interval,
                     limit=limit,
                     asset_type=asset,
                 )
 
-                if df is None or df.empty:
-                    raise RuntimeError(
+                if df.empty:
+                    raise DataSourceError(
                         "Binance : données vides."
                     )
 
@@ -2045,12 +2153,11 @@ class DataRouter:
                 _stats_increment(
                     "errors"
                 )
-
                 raise
 
-        # ----------------------------------------------------------
-        # Construction des candidats
-        # ----------------------------------------------------------
+        # ==============================================================
+        # CANDIDATS
+        # ==============================================================
 
         candidates = _provider_order(
             asset,
@@ -2071,10 +2178,6 @@ class DataRouter:
                     0,
                     preferred,
                 )
-
-        # ----------------------------------------------------------
-        # Suppression des fournisseurs non disponibles
-        # ----------------------------------------------------------
 
         filtered = []
 
@@ -2108,17 +2211,16 @@ class DataRouter:
                 "errors"
             )
 
-            raise RuntimeError(
+            raise DataSourceError(
                 f"Aucun fournisseur disponible pour "
                 f"{symbol} ({asset}, {interval})."
             )
 
-        # ----------------------------------------------------------
-        # Essai des sources
-        # ----------------------------------------------------------
+        # ==============================================================
+        # ESSAI DES SOURCES
+        # ==============================================================
 
         successful = []
-
         errors = []
 
         for index, provider in enumerate(
@@ -2132,7 +2234,6 @@ class DataRouter:
                 )
             )
 
-            # Une absence explicite de symbole peut être ignorée.
             if not provider_symbol:
                 errors.append(
                     f"{provider}: symbole absent"
@@ -2152,7 +2253,7 @@ class DataRouter:
                 )
 
                 if df is None or df.empty:
-                    raise RuntimeError(
+                    raise DataSourceError(
                         "données vides"
                     )
 
@@ -2161,7 +2262,7 @@ class DataRouter:
                 )
 
                 if df.empty:
-                    raise RuntimeError(
+                    raise DataSourceError(
                         "données OHLCV vides"
                     )
 
@@ -2182,11 +2283,6 @@ class DataRouter:
                     }
                 )
 
-                # --------------------------------------------------
-                # Cas normal :
-                # une source très bonne suffit.
-                # --------------------------------------------------
-
                 coverage = volume_coverage(
                     df
                 )
@@ -2201,25 +2297,27 @@ class DataRouter:
                     >= VOLUME_MIN_COVERAGE
                 )
 
-                # Crypto déjà traitée.
+                # ------------------------------------------------------
+                # Source suffisamment bonne.
+                # ------------------------------------------------------
+
                 if (
-                    asset == "crypto"
-                    or (
-                        require_volume
-                        and volume_good
-                        and freshness >= 0.5
-                    )
-                    or (
-                        not require_volume
-                        and freshness >= 0.5
-                    )
+                    require_volume
+                    and volume_good
+                    and freshness >= 0.5
                 ):
                     break
 
-                # --------------------------------------------------
-                # Si la source est exploitable mais volume absent,
-                # on continue pour tenter une source avec volume.
-                # --------------------------------------------------
+                if (
+                    not require_volume
+                    and freshness >= 0.5
+                ):
+                    break
+
+                # ------------------------------------------------------
+                # Volume requis mais non disponible :
+                # essayer la source suivante.
+                # ------------------------------------------------------
 
                 if (
                     require_volume
@@ -2250,21 +2348,20 @@ class DataRouter:
 
                 continue
 
-        # ----------------------------------------------------------
-        # Aucun succès
-        # ----------------------------------------------------------
+        # ==============================================================
+        # AUCUNE SOURCE
+        # ==============================================================
 
         if not successful:
-            raise RuntimeError(
+            raise DataSourceError(
                 f"Aucune source exploitable pour "
                 f"{symbol}. "
                 + " | ".join(errors)
             )
 
-        # ----------------------------------------------------------
-        # Choix final :
-        # meilleure qualité réelle, pas simplement premier venu.
-        # ----------------------------------------------------------
+        # ==============================================================
+        # MEILLEURE SOURCE
+        # ==============================================================
 
         selected = max(
             successful,
@@ -2283,9 +2380,9 @@ class DataRouter:
             "df"
         ]
 
-        # ----------------------------------------------------------
-        # Métadonnées
-        # ----------------------------------------------------------
+        # ==============================================================
+        # MÉTADONNÉES
+        # ==============================================================
 
         df = attach_metadata(
             df,
@@ -2342,7 +2439,7 @@ class DataRouter:
 
 
 # ======================================================================
-# FONCTIONS DE COMPATIBILITÉ
+# INTERFACE SIMPLE
 # ======================================================================
 
 def fetch_data(
@@ -2354,10 +2451,6 @@ def fetch_data(
     require_volume=False,
     symbol_map=None,
 ):
-    """
-    Interface fonctionnelle simple vers DataRouter.
-    """
-
     router = DataRouter()
 
     return router.fetch(
@@ -2371,15 +2464,16 @@ def fetch_data(
     )
 
 
-def get_router_stats():
-    return router_stats()
-
-
 def get_twelvedata_budget():
     return {
-        "used": DataRouter.twelvedata_used(),
-        "remaining": DataRouter.twelvedata_remaining(),
-        "budget": TWELVE_DATA_DAILY_BUDGET,
+        "used":
+            _TwelveDataBudget.used_today(),
+
+        "remaining":
+            _TwelveDataBudget.remaining(),
+
+        "budget":
+            TWELVE_DATA_DAILY_BUDGET,
     }
 
 
@@ -2394,14 +2488,14 @@ if __name__ == "__main__":
 
     print(
         "Twelve Data : "
-        f"{DataRouter.twelvedata_used()}/"
+        f"{_TwelveDataBudget.used_today()}/"
         f"{TWELVE_DATA_DAILY_BUDGET} "
         "appels utilisés."
     )
 
     print(
         "Twelve Data restant : "
-        f"{DataRouter.twelvedata_remaining()}"
+        f"{_TwelveDataBudget.remaining()}"
     )
 
     print(
