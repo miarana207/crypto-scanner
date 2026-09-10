@@ -1,5 +1,5 @@
 """
-V4.1 — Scanner multi-actifs + notifications.
+V4.1.1 — Scanner multi-actifs + notifications.
 
 SIGNAL FORT :
 
@@ -23,6 +23,12 @@ Sources :
                    Yahoo sinon
     Indices      = Yahoo
     Commodities  = Twelve Data/Yahoo
+
+V4.1.1 :
+    - détection des scans partiels
+    - couverture par catégorie
+    - fraîcheur améliorée
+    - distinction marché fermé / données anciennes
 """
 
 import argparse
@@ -32,7 +38,9 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from backtest import klines as klines_binance
+from backtest import (
+    klines as klines_binance,
+)
 
 from data_sources import (
     klines_yahoo,
@@ -68,7 +76,7 @@ PAUSE_BY_PROVIDER = {
 
 
 # ======================================================================
-# TWELVE DATA
+# FENÊTRE TWELVE DATA
 # ======================================================================
 
 def twelvedata_window_active(
@@ -76,13 +84,18 @@ def twelvedata_window_active(
 ):
     now = (
         now
-        or datetime.now(
+        or
+        datetime.now(
             timezone.utc
         )
     )
 
     return (
-        3 <= now.hour < 19
+        3
+        <=
+        now.hour
+        <
+        19
     )
 
 
@@ -108,7 +121,6 @@ def resolve_symbols(
             )
 
             if value:
-
                 result.append(
                     value
                 )
@@ -138,25 +150,29 @@ def build_categories(
     stock_provider = (
         "twelvedata"
         if use_twelvedata
-        else "yahoo"
+        else
+        "yahoo"
     )
 
     stock_fetcher = (
         klines_twelvedata
         if use_twelvedata
-        else klines_yahoo
+        else
+        klines_yahoo
     )
 
     stock_fallback = (
         klines_yahoo
         if use_twelvedata
-        else klines_twelvedata
+        else
+        klines_twelvedata
     )
 
     stock_fallback_name = (
         "yahoo"
         if use_twelvedata
-        else "twelvedata"
+        else
+        "twelvedata"
     )
 
     stock_pause = (
@@ -390,17 +406,25 @@ def scan_all(
 
     all_results = {}
 
+    coverage = {}
+
     for name, groups in (
         categories.items()
     ):
 
         frames = []
 
+        requested = 0
+
         for group in groups:
 
             symbols = group[
                 "symbols"
             ]
+
+            requested += len(
+                symbols
+            )
 
             if not symbols:
                 continue
@@ -445,12 +469,17 @@ def scan_all(
 
             if (
                 df is not None
-                and not df.empty
+                and
+                not df.empty
             ):
 
                 frames.append(
                     df
                 )
+
+        # ==============================================================
+        # RESULTATS
+        # ==============================================================
 
         if frames:
 
@@ -465,12 +494,18 @@ def scan_all(
                     "best_score",
                     ascending=False,
                 )
-                .reset_index(drop=True)
+                .reset_index(
+                    drop=True
+                )
             )
 
             all_results[
                 name
             ] = merged
+
+            analyzed = len(
+                merged
+            )
 
         else:
 
@@ -478,9 +513,30 @@ def scan_all(
                 name
             ] = pd.DataFrame()
 
+            analyzed = 0
+
+        failed = max(
+            requested
+            -
+            analyzed,
+            0,
+        )
+
+        coverage[name] = {
+            "requested":
+                requested,
+
+            "analyzed":
+                analyzed,
+
+            "failed":
+                failed,
+        }
+
     return (
         all_results,
         stock_provider,
+        coverage,
     )
 
 
@@ -495,10 +551,13 @@ def has_signal(
 
         if (
             not df.empty
-            and "status" in df.columns
-            and (
+            and
+            "status" in df.columns
+            and
+            (
                 df["status"]
-                == "SIGNAL FORT"
+                ==
+                "SIGNAL FORT"
             ).any()
         ):
 
@@ -516,17 +575,104 @@ def count_signals(
 
         if (
             not df.empty
-            and "status" in df.columns
+            and
+            "status" in df.columns
         ):
 
             total += int(
                 (
                     df["status"]
-                    == "SIGNAL FORT"
+                    ==
+                    "SIGNAL FORT"
                 ).sum()
             )
 
     return total
+
+
+# ======================================================================
+# COUVERTURE
+# ======================================================================
+
+def coverage_summary(
+    coverage,
+):
+    lines = [
+        "🛡️ COUVERTURE DU SCAN"
+    ]
+
+    total_requested = 0
+    total_analyzed = 0
+    total_failed = 0
+
+    for name, info in coverage.items():
+
+        requested = int(
+            info["requested"]
+        )
+
+        analyzed = int(
+            info["analyzed"]
+        )
+
+        failed = int(
+            info["failed"]
+        )
+
+        total_requested += requested
+        total_analyzed += analyzed
+        total_failed += failed
+
+        if requested == 0:
+
+            status = "—"
+
+        elif analyzed == requested:
+
+            status = "🟢 OK"
+
+        elif analyzed > 0:
+
+            status = "🟠 PARTIEL"
+
+        else:
+
+            status = "🔴 ÉCHEC"
+
+        lines.append(
+            f"{name}: "
+            f"{analyzed}/{requested} "
+            f"analysés — "
+            f"{status}"
+        )
+
+    if total_failed > 0:
+
+        lines.append(
+            ""
+        )
+
+        lines.append(
+            f"⚠️ SCAN PARTIEL : "
+            f"{total_analyzed}/"
+            f"{total_requested} actifs analysés"
+        )
+
+    else:
+
+        lines.append(
+            ""
+        )
+
+        lines.append(
+            f"🟢 SCAN COMPLET : "
+            f"{total_analyzed}/"
+            f"{total_requested} actifs analysés"
+        )
+
+    return "\n".join(
+        lines
+    )
 
 
 # ======================================================================
@@ -551,7 +697,9 @@ def relvol_text(
     if pd.isna(value):
         return "n/d"
 
-    return f"{float(value):.2f}"
+    return (
+        f"{float(value):.2f}"
+    )
 
 
 def rsi_text(
@@ -560,7 +708,9 @@ def rsi_text(
     if pd.isna(value):
         return "n/d"
 
-    return f"{float(value):.1f}"
+    return (
+        f"{float(value):.1f}"
+    )
 
 
 def missing_conditions(
@@ -606,7 +756,8 @@ def missing_conditions(
 
     if (
         volume_available
-        and not volume_ok
+        and
+        not volume_ok
     ):
 
         missing.append(
@@ -620,7 +771,8 @@ def missing_conditions(
 
     if (
         pd.isna(rr)
-        or rr < 1.5
+        or
+        rr < 1.5
     ):
 
         missing.append(
@@ -628,7 +780,6 @@ def missing_conditions(
         )
 
     if not missing:
-
         return "aucune"
 
     return " + ".join(
@@ -752,29 +903,24 @@ def format_signal_block(
         f"Qualité {quality} | "
         f"Score {score_value:.0f}/100\n"
 
-        f"   "
-        f"Entrée : {entry}\n"
+        f"   Entrée : {entry}\n"
 
-        f"   "
-        f"SL : {sl}\n"
+        f"   SL : {sl}\n"
 
-        f"   "
-        f"TP1 : {tp1} "
+        f"   TP1 : {tp1} "
         f"(R:R {number_text(rr1, 2)})\n"
 
-        f"   "
-        f"TP2 : {tp2} "
+        f"   TP2 : {tp2} "
         f"(R:R {number_text(rr2, 2)})\n"
 
-        f"   "
-        f"ATR : {atr} | "
+        f"   ATR : {atr} | "
         f"RSI : {rsi}\n"
 
-        f"   "
-        f"Volume : {volume_text}\n"
+        f"   Volume : "
+        f"{volume_text}\n"
 
-        f"   "
-        f"Source : {provider}"
+        f"   Source : "
+        f"{provider}"
     )
 
 
@@ -800,19 +946,66 @@ def format_watch_block(
         f"{row['status']} | "
         f"Q:{row.get('quality', 'D')}\n"
 
-        f"   "
-        f"Entry:{number_text(row.get('entry'))} "
-        f"| SL:{number_text(row.get('stop_loss'))} "
-        f"| TP2:{number_text(row.get('take_profit_2'))}\n"
+        f"   Entry:"
+        f"{number_text(row.get('entry'))} "
+        f"| SL:"
+        f"{number_text(row.get('stop_loss'))} "
+        f"| TP2:"
+        f"{number_text(row.get('take_profit_2'))}\n"
 
-        f"   "
-        f"RSI:{rsi_text(row.get('rsi'))} "
-        f"| RelVol:{relvol_text(row.get('relvol'))} "
-        f"| ATR:{number_text(row.get('atr'))}\n"
+        f"   RSI:"
+        f"{rsi_text(row.get('rsi'))} "
+        f"| RelVol:"
+        f"{relvol_text(row.get('relvol'))} "
+        f"| ATR:"
+        f"{number_text(row.get('atr'))}\n"
 
-        f"   "
-        f"Manque : {missing}"
+        f"   Manque : "
+        f"{missing}"
     )
+
+
+# ======================================================================
+# MARCHÉS FERMÉS
+# ======================================================================
+
+def market_closed_hint(
+    category,
+    now,
+):
+    """
+    Indication volontairement simple.
+
+    Le scanner ne considère pas automatiquement une donnée ancienne
+    comme une erreur lorsque le marché est fermé.
+    """
+
+    weekday = now.weekday()
+
+    # Samedi / dimanche
+    if weekday >= 5:
+
+        if (
+            "Crypto" not in category
+        ):
+
+            return True
+
+    # Actions / indices / matières dépendant de marchés traditionnels
+    if (
+        "Actions" in category
+        or
+        "Indices" in category
+        or
+        "Matières" in category
+    ):
+
+        # Fenêtre approximative UTC hors séance américaine/européenne.
+        # Ce n'est pas utilisé pour déclarer les données invalides.
+        if now.hour < 7 or now.hour >= 21:
+            return True
+
+    return False
 
 
 # ======================================================================
@@ -825,7 +1018,8 @@ def freshness_summary(
 ):
     now = (
         now
-        or datetime.now(
+        or
+        datetime.now(
             timezone.utc
         )
     )
@@ -840,9 +1034,15 @@ def freshness_summary(
 
         if (
             df.empty
-            or "last_candle"
+            or
+            "last_candle"
             not in df.columns
         ):
+
+            lines.append(
+                f"{name}: "
+                f"aucune donnée exploitable"
+            )
 
             continue
 
@@ -852,6 +1052,17 @@ def freshness_summary(
             errors="coerce",
         )
 
+        try:
+
+            timestamps = (
+                timestamps
+                .dt
+                .as_unit("ns")
+            )
+
+        except AttributeError:
+            pass
+
         most_recent = (
             timestamps.max()
         )
@@ -859,23 +1070,64 @@ def freshness_summary(
         if pd.isna(
             most_recent
         ):
-
             continue
 
-        age_min = (
+        now_ts = pd.Timestamp(
             now
-            - most_recent.to_pydatetime()
-        ).total_seconds() / 60
+        )
 
-        if age_min > 90:
+        try:
+
+            now_ts = now_ts.as_unit(
+                "ns"
+            )
+
+        except AttributeError:
+            pass
+
+        age_min = (
+            (
+                now_ts
+                -
+                most_recent
+            )
+            .total_seconds()
+            /
+            60
+        )
+
+        # --------------------------------------------------------------
+        # FRAIS
+        # --------------------------------------------------------------
+
+        if age_min <= 90:
 
             flag = (
-                " ⚠️ potentiellement figée"
+                " 🟢 frais"
             )
+
+        # --------------------------------------------------------------
+        # MARCHÉ PROBABLEMENT FERMÉ
+        # --------------------------------------------------------------
+
+        elif market_closed_hint(
+            name,
+            now,
+        ):
+
+            flag = (
+                " 🟡 marché fermé"
+            )
+
+        # --------------------------------------------------------------
+        # DONNÉES ANCIENNES
+        # --------------------------------------------------------------
 
         else:
 
-            flag = ""
+            flag = (
+                " 🔴 données anciennes"
+            )
 
         lines.append(
             f"{name}: "
@@ -899,10 +1151,12 @@ def format_full_message(
     threshold=75,
     top=5,
     now=None,
+    coverage=None,
 ):
     now = (
         now
-        or datetime.now(
+        or
+        datetime.now(
             timezone.utc
         )
     )
@@ -917,7 +1171,7 @@ def format_full_message(
 
     lines = [
 
-        "📊 SCAN MULTI-ACTIFS V4.1",
+        "📊 SCAN MULTI-ACTIFS V4.1.1",
 
         f"{ts}",
 
@@ -926,23 +1180,47 @@ def format_full_message(
 
         "",
 
-        "🔥 SIGNAL FORT",
-
-        "Conditions : "
-        "SCORE ≥ seuil + BREAKOUT "
-        "+ VOLUME si disponible "
-        "+ R:R ≥ 1.5",
-
-        f"Total SIGNAL FORT : "
-        f"{strong_count}",
-
-        f"Actions/Matières : "
-        f"{stock_provider}",
-
-        "Indices : yahoo",
-
-        "",
     ]
+
+    # ==================================================================
+    # COUVERTURE
+    # ==================================================================
+
+    if coverage:
+
+        lines.extend(
+            [
+                coverage_summary(
+                    coverage
+                ),
+                "",
+            ]
+        )
+
+    # ==================================================================
+    # SIGNAL FORT
+    # ==================================================================
+
+    lines.extend(
+        [
+            "🔥 SIGNAL FORT",
+
+            "Conditions : "
+            "SCORE ≥ seuil + BREAKOUT "
+            "+ VOLUME si disponible "
+            "+ R:R ≥ 1.5",
+
+            f"Total SIGNAL FORT : "
+            f"{strong_count}",
+
+            f"Actions/Matières : "
+            f"{stock_provider}",
+
+            "Indices : yahoo",
+
+            "",
+        ]
+    )
 
     # ==================================================================
     # SIGNALS FORTS
@@ -969,7 +1247,8 @@ def format_full_message(
 
             strong = df[
                 df["status"]
-                == "SIGNAL FORT"
+                ==
+                "SIGNAL FORT"
             ]
 
             if strong.empty:
@@ -992,7 +1271,7 @@ def format_full_message(
                 lines.append("")
 
     # ==================================================================
-    # SURVEILLANCE
+    # WATCHLIST
     # ==================================================================
 
     lines.extend(
@@ -1072,7 +1351,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=
-        "Scanner multi-actifs V4.1"
+        "Scanner multi-actifs V4.1.1"
     )
 
     parser.add_argument(
@@ -1117,6 +1396,7 @@ def main():
     (
         all_results,
         stock_provider,
+        coverage,
     ) = scan_all(
         threshold=args.threshold,
         limit=args.limit,
@@ -1133,6 +1413,7 @@ def main():
         threshold=args.threshold,
         top=args.top,
         now=now,
+        coverage=coverage,
     )
 
     print(
@@ -1156,7 +1437,7 @@ def main():
     # ==================================================================
 
     email_subject = (
-        f"Scan V4.1 — "
+        f"Scan V4.1.1 — "
         f"{signal_count} "
         f"signal(s) fort(s) — "
         f"{now.strftime('%Y-%m-%d %H:%M')} UTC"
