@@ -1,36 +1,25 @@
 """
-Scanner multi-actifs V4.
-
-Règles :
-
-Score maximum = 100
-
-    Tendance 1H : 25
-    EMA          : 20
-    RSI          : 15
-    Volume       : 15
-    Breakout     : 25
+V4.1 — Scanner multi-actifs + notifications.
 
 SIGNAL FORT :
-    score >= seuil
-    + BREAKOUT
-    + VOLUME
 
-ATTENTE :
-    score >= seuil
-    mais trigger incomplet
+    Score >= seuil
+    + breakout
+    + volume confirmé OU volume indisponible
+    + R:R >= 1.5
 
-SOUS SEUIL :
-    score < seuil
+Qualité :
 
-Notifications :
-    Email = chaque scan
-    Slack = uniquement SIGNAL FORT
+    A = excellent setup
+    B = bon setup
+    C = surveillance
+    D = faible
 
 Sources :
+
     Crypto       = Binance
     Forex        = Twelve Data
-    Actions      = Twelve Data 03:00-19:00 UTC,
+    Actions      = Twelve Data pendant fenêtre active,
                    Yahoo sinon
     Indices      = Yahoo
     Commodities  = Twelve Data/Yahoo
@@ -79,13 +68,12 @@ PAUSE_BY_PROVIDER = {
 
 
 # ======================================================================
-# FENÊTRE TWELVE DATA
+# TWELVE DATA
 # ======================================================================
 
 def twelvedata_window_active(
-    now=None
+    now=None,
 ):
-
     now = (
         now
         or datetime.now(
@@ -99,21 +87,20 @@ def twelvedata_window_active(
 
 
 # ======================================================================
-# RESOLUTION DES SYMBOLES
+# SYMBOLES
 # ======================================================================
 
 def resolve_symbols(
     entries,
-    key
+    key,
 ):
-
     result = []
 
     for entry in entries:
 
         if isinstance(
             entry,
-            dict
+            dict,
         ):
 
             value = entry.get(
@@ -121,6 +108,7 @@ def resolve_symbols(
             )
 
             if value:
+
                 result.append(
                     value
                 )
@@ -135,13 +123,12 @@ def resolve_symbols(
 
 
 # ======================================================================
-# CATEGORIES
+# CATÉGORIES
 # ======================================================================
 
 def build_categories(
-    now=None
+    now=None,
 ):
-
     use_twelvedata = (
         twelvedata_window_active(
             now
@@ -160,6 +147,18 @@ def build_categories(
         else klines_yahoo
     )
 
+    stock_fallback = (
+        klines_yahoo
+        if use_twelvedata
+        else klines_twelvedata
+    )
+
+    stock_fallback_name = (
+        "yahoo"
+        if use_twelvedata
+        else "twelvedata"
+    )
+
     stock_pause = (
         PAUSE_BY_PROVIDER[
             stock_provider
@@ -174,14 +173,27 @@ def build_categories(
 
         "🪙 Crypto": [
             {
-                "symbols": resolve_symbols(
-                    CRYPTO,
-                    "binance"
-                ),
+                "symbols":
+                    resolve_symbols(
+                        CRYPTO,
+                        "binance",
+                    ),
+
                 "fetcher":
                     klines_binance,
+
+                "fallback":
+                    None,
+
+                "provider":
+                    "binance",
+
+                "fallback_provider":
+                    None,
+
                 "interval":
                     "5m",
+
                 "pause":
                     PAUSE_BY_PROVIDER[
                         "binance"
@@ -195,14 +207,27 @@ def build_categories(
 
         "💵 Forex": [
             {
-                "symbols": resolve_symbols(
-                    FOREX,
-                    "twelvedata"
-                ),
+                "symbols":
+                    resolve_symbols(
+                        FOREX,
+                        "twelvedata",
+                    ),
+
                 "fetcher":
                     klines_twelvedata,
+
+                "fallback":
+                    None,
+
+                "provider":
+                    "twelvedata",
+
+                "fallback_provider":
+                    None,
+
                 "interval":
                     "15m",
+
                 "pause":
                     PAUSE_BY_PROVIDER[
                         "twelvedata"
@@ -216,14 +241,27 @@ def build_categories(
 
         "📈 Actions": [
             {
-                "symbols": resolve_symbols(
-                    ACTIONS,
-                    stock_provider
-                ),
+                "symbols":
+                    resolve_symbols(
+                        ACTIONS,
+                        stock_provider,
+                    ),
+
                 "fetcher":
                     stock_fetcher,
+
+                "fallback":
+                    stock_fallback,
+
+                "provider":
+                    stock_provider,
+
+                "fallback_provider":
+                    stock_fallback_name,
+
                 "interval":
                     "15m",
+
                 "pause":
                     stock_pause,
             }
@@ -235,14 +273,27 @@ def build_categories(
 
         "📊 Indices": [
             {
-                "symbols": resolve_symbols(
-                    INDICES,
-                    "yahoo"
-                ),
+                "symbols":
+                    resolve_symbols(
+                        INDICES,
+                        "yahoo",
+                    ),
+
                 "fetcher":
                     klines_yahoo,
+
+                "fallback":
+                    None,
+
+                "provider":
+                    "yahoo",
+
+                "fallback_provider":
+                    None,
+
                 "interval":
                     "15m",
+
                 "pause":
                     PAUSE_BY_PROVIDER[
                         "yahoo"
@@ -255,27 +306,55 @@ def build_categories(
         # ==============================================================
 
         "🛢️ Matières premières": [
+
             {
-                "symbols": resolve_symbols(
-                    COMMODITIES,
-                    stock_provider
-                ),
+                "symbols":
+                    resolve_symbols(
+                        COMMODITIES,
+                        stock_provider,
+                    ),
+
                 "fetcher":
                     stock_fetcher,
+
+                "fallback":
+                    stock_fallback,
+
+                "provider":
+                    stock_provider,
+
+                "fallback_provider":
+                    stock_fallback_name,
+
                 "interval":
                     "15m",
+
                 "pause":
                     stock_pause,
             },
+
             {
-                "symbols": resolve_symbols(
-                    COMMODITIES_YAHOO_ONLY,
-                    "yahoo"
-                ),
+                "symbols":
+                    resolve_symbols(
+                        COMMODITIES_YAHOO_ONLY,
+                        "yahoo",
+                    ),
+
                 "fetcher":
                     klines_yahoo,
+
+                "fallback":
+                    None,
+
+                "provider":
+                    "yahoo",
+
+                "fallback_provider":
+                    None,
+
                 "interval":
                     "15m",
+
                 "pause":
                     PAUSE_BY_PROVIDER[
                         "yahoo"
@@ -286,7 +365,7 @@ def build_categories(
 
     return (
         categories,
-        stock_provider
+        stock_provider,
     )
 
 
@@ -297,9 +376,8 @@ def build_categories(
 def scan_all(
     threshold=75,
     limit=1000,
-    top=5
+    top=5,
 ):
-
     now = datetime.now(
         timezone.utc
     )
@@ -334,14 +412,32 @@ def scan_all(
 
             df = scan(
                 symbols=symbols,
+
                 fetcher=group[
                     "fetcher"
                 ],
+
+                fallback_fetcher=group.get(
+                    "fallback"
+                ),
+
+                provider_name=group.get(
+                    "provider",
+                    "unknown",
+                ),
+
+                fallback_provider_name=group.get(
+                    "fallback_provider"
+                ),
+
                 interval=group[
                     "interval"
                 ],
+
                 limit=limit,
+
                 threshold=threshold,
+
                 pause=group[
                     "pause"
                 ],
@@ -360,18 +456,16 @@ def scan_all(
 
             merged = pd.concat(
                 frames,
-                ignore_index=True
+                ignore_index=True,
             )
 
             merged = (
                 merged
                 .sort_values(
                     "best_score",
-                    ascending=False
+                    ascending=False,
                 )
-                .reset_index(
-                    drop=True
-                )
+                .reset_index(drop=True)
             )
 
             all_results[
@@ -386,18 +480,17 @@ def scan_all(
 
     return (
         all_results,
-        stock_provider
+        stock_provider,
     )
 
 
 # ======================================================================
-# SIGNAL FORT
+# SIGNALS
 # ======================================================================
 
 def has_signal(
-    all_results
+    all_results,
 ):
-
     for df in all_results.values():
 
         if (
@@ -415,9 +508,8 @@ def has_signal(
 
 
 def count_signals(
-    all_results
+    all_results,
 ):
-
     total = 0
 
     for df in all_results.values():
@@ -441,33 +533,47 @@ def count_signals(
 # FORMATAGE
 # ======================================================================
 
-def relvol_text(
-    value
+def number_text(
+    value,
+    decimals=4,
 ):
+    if pd.isna(value):
+        return "n/d"
 
+    return (
+        f"{float(value):.{decimals}f}"
+    )
+
+
+def relvol_text(
+    value,
+):
     if pd.isna(value):
         return "n/d"
 
     return f"{float(value):.2f}"
 
 
+def rsi_text(
+    value,
+):
+    if pd.isna(value):
+        return "n/d"
+
+    return f"{float(value):.1f}"
+
+
 def missing_conditions(
     row,
-    threshold=75
+    threshold=75,
 ):
-
     missing = []
 
-    best_score = max(
-        float(
-            row["score_long"]
-        ),
-        float(
-            row["score_short"]
-        )
+    score_value = float(
+        row["best_score"]
     )
 
-    if best_score < threshold:
+    if score_value < threshold:
 
         missing.append(
             f"SCORE < {threshold:.0f}"
@@ -476,7 +582,7 @@ def missing_conditions(
     if not bool(
         row.get(
             "breakout_ok",
-            False
+            False,
         )
     ):
 
@@ -484,18 +590,45 @@ def missing_conditions(
             "BREAKOUT"
         )
 
-    if not bool(
+    volume_available = bool(
+        row.get(
+            "volume_available",
+            False,
+        )
+    )
+
+    volume_ok = bool(
         row.get(
             "volume_ok",
-            False
+            False,
         )
+    )
+
+    if (
+        volume_available
+        and not volume_ok
     ):
 
         missing.append(
             "VOLUME"
         )
 
+    rr = row.get(
+        "rr_tp2",
+        float("nan"),
+    )
+
+    if (
+        pd.isna(rr)
+        or rr < 1.5
+    ):
+
+        missing.append(
+            "R:R"
+        )
+
     if not missing:
+
         return "aucune"
 
     return " + ".join(
@@ -503,14 +636,13 @@ def missing_conditions(
     )
 
 
-def format_score_block(
-    row
+# ======================================================================
+# BLOC SIGNAL
+# ======================================================================
+
+def format_signal_block(
+    row,
 ):
-
-    score_value = float(
-        row["best_score"]
-    )
-
     direction = row[
         "direction"
     ]
@@ -519,36 +651,167 @@ def format_score_block(
         "status"
     ]
 
-    relvol = relvol_text(
+    quality = row.get(
+        "quality",
+        "D",
+    )
+
+    score_value = float(
+        row["best_score"]
+    )
+
+    entry = number_text(
         row.get(
-            "relvol",
-            float("nan")
+            "entry",
+            float("nan"),
         )
     )
 
-    rsi = row.get(
-        "rsi",
-        float("nan")
+    sl = number_text(
+        row.get(
+            "stop_loss",
+            float("nan"),
+        )
     )
 
-    if pd.isna(rsi):
-        rsi_text = "n/d"
+    tp1 = number_text(
+        row.get(
+            "take_profit_1",
+            float("nan"),
+        )
+    )
+
+    tp2 = number_text(
+        row.get(
+            "take_profit_2",
+            float("nan"),
+        )
+    )
+
+    rr1 = row.get(
+        "rr_tp1",
+        float("nan"),
+    )
+
+    rr2 = row.get(
+        "rr_tp2",
+        float("nan"),
+    )
+
+    rsi = rsi_text(
+        row.get(
+            "rsi",
+            float("nan"),
+        )
+    )
+
+    atr = number_text(
+        row.get(
+            "atr",
+            float("nan"),
+        )
+    )
+
+    relvol = relvol_text(
+        row.get(
+            "relvol",
+            float("nan"),
+        )
+    )
+
+    provider = row.get(
+        "provider",
+        "n/d",
+    )
+
+    volume_available = bool(
+        row.get(
+            "volume_available",
+            False,
+        )
+    )
+
+    if volume_available:
+
+        volume_text = (
+            f"confirmé "
+            f"(RelVol {relvol})"
+        )
+
     else:
-        rsi_text = f"{float(rsi):.1f}"
+
+        volume_text = (
+            "n/d — volume "
+            "non disponible"
+        )
 
     return (
         f"{row['symbol']} | "
-        f"{score_value:.0f}/100 "
         f"{direction} | "
-        f"{status}\n"
+        f"{status} | "
+        f"Qualité {quality} | "
+        f"Score {score_value:.0f}/100\n"
+
         f"   "
-        f"T:{row['trend_pts']:.0f} "
-        f"E:{row['ema_pts']:.0f} "
-        f"R:{row['rsi_pts']:.0f} "
-        f"V:{row['volume_pts']:.0f} "
-        f"B:{row['breakout_pts']:.0f} "
-        f"| RSI:{rsi_text} "
-        f"| RelVol:{relvol}"
+        f"Entrée : {entry}\n"
+
+        f"   "
+        f"SL : {sl}\n"
+
+        f"   "
+        f"TP1 : {tp1} "
+        f"(R:R {number_text(rr1, 2)})\n"
+
+        f"   "
+        f"TP2 : {tp2} "
+        f"(R:R {number_text(rr2, 2)})\n"
+
+        f"   "
+        f"ATR : {atr} | "
+        f"RSI : {rsi}\n"
+
+        f"   "
+        f"Volume : {volume_text}\n"
+
+        f"   "
+        f"Source : {provider}"
+    )
+
+
+# ======================================================================
+# WATCH
+# ======================================================================
+
+def format_watch_block(
+    row,
+    rank,
+    threshold,
+):
+    missing = missing_conditions(
+        row,
+        threshold,
+    )
+
+    return (
+        f"{rank}. "
+        f"{row['symbol']} | "
+        f"{row['best_score']:.0f}/100 | "
+        f"{row['direction']} | "
+        f"{row['status']} | "
+        f"Q:{row.get('quality', 'D')}\n"
+
+        f"   "
+        f"Entry:{number_text(row.get('entry'))} "
+        f"| SL:{number_text(row.get('stop_loss'))} "
+        f"| TP2:{number_text(row.get('take_profit_2'))}\n"
+
+        f"   "
+        f"RSI:{rsi_text(row.get('rsi'))} "
+        f"| RelVol:{relvol_text(row.get('relvol'))} "
+        f"| ATR:{number_text(row.get('atr'))}\n"
+
+        f"   "
+        f"Manque : {missing}"
     )
 
 
@@ -558,9 +821,8 @@ def format_score_block(
 
 def freshness_summary(
     all_results,
-    now=None
+    now=None,
 ):
-
     now = (
         now
         or datetime.now(
@@ -578,18 +840,21 @@ def freshness_summary(
 
         if (
             df.empty
-            or
-            "last_candle"
+            or "last_candle"
             not in df.columns
         ):
 
             continue
 
-        most_recent = pd.to_datetime(
+        timestamps = pd.to_datetime(
             df["last_candle"],
             utc=True,
-            errors="coerce"
-        ).max()
+            errors="coerce",
+        )
+
+        most_recent = (
+            timestamps.max()
+        )
 
         if pd.isna(
             most_recent
@@ -605,7 +870,7 @@ def freshness_summary(
         if age_min > 90:
 
             flag = (
-                " ⚠️ donnée potentiellement figée"
+                " ⚠️ potentiellement figée"
             )
 
         else:
@@ -615,7 +880,8 @@ def freshness_summary(
         lines.append(
             f"{name}: "
             f"{most_recent.strftime('%H:%M')} UTC "
-            f"({age_min:.0f} min){flag}"
+            f"({age_min:.0f} min)"
+            f"{flag}"
         )
 
     return "\n".join(
@@ -632,9 +898,8 @@ def format_full_message(
     stock_provider,
     threshold=75,
     top=5,
-    now=None
+    now=None,
 ):
-
     now = (
         now
         or datetime.now(
@@ -652,7 +917,7 @@ def format_full_message(
 
     lines = [
 
-        "📊 SCAN MULTI-ACTIFS V4",
+        "📊 SCAN MULTI-ACTIFS V4.1",
 
         f"{ts}",
 
@@ -664,12 +929,14 @@ def format_full_message(
         "🔥 SIGNAL FORT",
 
         "Conditions : "
-        "SCORE ≥ seuil + BREAKOUT + VOLUME",
+        "SCORE ≥ seuil + BREAKOUT "
+        "+ VOLUME si disponible "
+        "+ R:R ≥ 1.5",
 
         f"Total SIGNAL FORT : "
         f"{strong_count}",
 
-        f"Source Actions/Matières : "
+        f"Actions/Matières : "
         f"{stock_provider}",
 
         "Indices : yahoo",
@@ -677,9 +944,9 @@ def format_full_message(
         "",
     ]
 
-    # ==============================================================
+    # ==================================================================
     # SIGNALS FORTS
-    # ==============================================================
+    # ==================================================================
 
     if strong_count == 0:
 
@@ -717,23 +984,21 @@ def format_full_message(
             ):
 
                 lines.append(
-                    format_score_block(
+                    format_signal_block(
                         row
                     )
                 )
 
-            lines.append("")
+                lines.append("")
 
-    # ==============================================================
-    # À SURVEILLER
-    # ==============================================================
+    # ==================================================================
+    # SURVEILLANCE
+    # ==================================================================
 
     lines.extend(
         [
             "👀 À SURVEILLER",
             f"Top {top} par catégorie.",
-            "Les actifs sous le seuil "
-            "restent affichés.",
             "",
         ]
     )
@@ -757,70 +1022,39 @@ def format_full_message(
 
             continue
 
-        watch = df.copy()
-
         watch = (
-            watch
-            .sort_values(
+            df.sort_values(
                 "best_score",
-                ascending=False
+                ascending=False,
             )
             .head(top)
         )
 
         for rank, (_, row) in enumerate(
             watch.iterrows(),
-            start=1
+            start=1,
         ):
 
-            missing = (
-                missing_conditions(
+            lines.append(
+                format_watch_block(
                     row,
-                    threshold
+                    rank,
+                    threshold,
                 )
             )
 
-            relvol = relvol_text(
-                row.get(
-                    "relvol",
-                    float("nan")
-                )
-            )
+            lines.append("")
 
-            lines.append(
-                f"{rank}. "
-                f"{row['symbol']} | "
-                f"{row['best_score']:.0f}/100 "
-                f"{row['direction']} | "
-                f"{row['status']}"
-            )
-
-            lines.append(
-                f"   "
-                f"T:{row['trend_pts']:.0f} "
-                f"E:{row['ema_pts']:.0f} "
-                f"R:{row['rsi_pts']:.0f} "
-                f"V:{row['volume_pts']:.0f} "
-                f"B:{row['breakout_pts']:.0f}"
-                f" | RelVol:{relvol}"
-            )
-
-            lines.append(
-                f"   Manque : {missing}"
-            )
-
-        lines.append("")
-
-    # ==============================================================
+    # ==================================================================
     # FRAÎCHEUR
-    # ==============================================================
+    # ==================================================================
 
     lines.extend(
         [
             "",
             freshness_summary(
                 all_results,
-                now
+                now,
             ),
         ]
     )
@@ -838,25 +1072,25 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=
-        "Scanner multi-actifs V4"
+        "Scanner multi-actifs V4.1"
     )
 
     parser.add_argument(
         "--threshold",
         type=float,
-        default=75
+        default=75,
     )
 
     parser.add_argument(
         "--limit",
         type=int,
-        default=1000
+        default=1000,
     )
 
     parser.add_argument(
         "--top",
         type=int,
-        default=5
+        default=5,
     )
 
     args = parser.parse_args()
@@ -876,49 +1110,54 @@ def main():
         f"{args.limit}"
     )
 
-    # ----------------------------------------------------------
+    # ==================================================================
     # SCAN
-    # ----------------------------------------------------------
+    # ==================================================================
 
-    all_results, stock_provider = (
-        scan_all(
-            threshold=args.threshold,
-            limit=args.limit,
-            top=args.top
-        )
+    (
+        all_results,
+        stock_provider,
+    ) = scan_all(
+        threshold=args.threshold,
+        limit=args.limit,
+        top=args.top,
     )
 
-    # ----------------------------------------------------------
+    # ==================================================================
     # MESSAGE
-    # ----------------------------------------------------------
+    # ==================================================================
 
     message = format_full_message(
         all_results,
         stock_provider,
         threshold=args.threshold,
         top=args.top,
-        now=now
+        now=now,
     )
 
     print(
         "\n" + message
     )
 
-    # ----------------------------------------------------------
-    # SIGNAL FORT ?
-    # ----------------------------------------------------------
+    # ==================================================================
+    # SIGNAL
+    # ==================================================================
 
     signal_exists = has_signal(
         all_results
     )
 
-    # ----------------------------------------------------------
-    # EMAIL : TOUJOURS
-    # ----------------------------------------------------------
+    signal_count = count_signals(
+        all_results
+    )
+
+    # ==================================================================
+    # EMAIL
+    # ==================================================================
 
     email_subject = (
-        f"Scan V4 — "
-        f"{count_signals(all_results)} "
+        f"Scan V4.1 — "
+        f"{signal_count} "
         f"signal(s) fort(s) — "
         f"{now.strftime('%Y-%m-%d %H:%M')} UTC"
     )
@@ -926,28 +1165,34 @@ def main():
     send_email(
         os.getenv(
             "SMTP_HOST",
-            "smtp.gmail.com"
+            "smtp.gmail.com",
         ),
+
         os.getenv(
             "SMTP_PORT",
-            "465"
+            "465",
         ),
+
         os.getenv(
             "EMAIL_SENDER"
         ),
+
         os.getenv(
             "EMAIL_PASSWORD"
         ),
+
         os.getenv(
             "EMAIL_RECIPIENT"
         ),
+
         email_subject,
-        message
+
+        message,
     )
 
-    # ----------------------------------------------------------
-    # SLACK : UNIQUEMENT SIGNAL FORT
-    # ----------------------------------------------------------
+    # ==================================================================
+    # SLACK
+    # ==================================================================
 
     if signal_exists:
 
@@ -959,7 +1204,7 @@ def main():
 
             send_slack(
                 slack_url,
-                message
+                message,
             )
 
         else:
@@ -976,6 +1221,10 @@ def main():
             "— Slack non envoyé."
         )
 
+
+# ======================================================================
+# EXECUTION
+# ======================================================================
 
 if __name__ == "__main__":
     main()
