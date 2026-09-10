@@ -1,9 +1,32 @@
+"""
+V4.1 — Sources de données.
+
+Sources :
+    Binance
+        Crypto
+
+    Yahoo Finance
+        Actions
+        Indices
+        Futures / commodities
+
+    Twelve Data
+        Forex
+        Actions
+        Or
+
+Le volume absent est toujours représenté par NaN.
+Il ne faut jamais transformer un volume absent en 0.
+"""
+
 import os
 import time
-import requests
 
+import requests
 import pandas as pd
+
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
@@ -25,46 +48,69 @@ TWELVE_DATA_BASE = (
 )
 
 
+REQUEST_TIMEOUT = 30
+
+
 # ======================================================================
-# UTILITAIRES
+# INTERVALLES
 # ======================================================================
 
-def interval_to_seconds(interval):
-    interval = str(
-        interval
-    ).strip().lower()
+def interval_to_seconds(
+    interval,
+):
+    interval = (
+        str(interval)
+        .strip()
+        .lower()
+    )
 
     if interval.endswith("m"):
-        return int(
-            interval[:-1]
-        ) * 60
+
+        return (
+            int(
+                interval[:-1]
+            )
+            * 60
+        )
 
     if interval.endswith("h"):
-        return int(
-            interval[:-1]
-        ) * 3600
+
+        return (
+            int(
+                interval[:-1]
+            )
+            * 3600
+        )
 
     if interval.endswith("d"):
-        return int(
-            interval[:-1]
-        ) * 86400
+
+        return (
+            int(
+                interval[:-1]
+            )
+            * 86400
+        )
 
     if interval.endswith("w"):
-        return int(
-            interval[:-1]
-        ) * 604800
+
+        return (
+            int(
+                interval[:-1]
+            )
+            * 604800
+        )
 
     return 60
 
 
+# ======================================================================
+# BOUGIES CLÔTURÉES
+# ======================================================================
+
 def keep_completed_candles(
     df,
-    interval
+    interval,
 ):
-    """
-    Supprime toute bougie qui n'est pas encore complètement clôturée.
-    """
-
     if df is None or df.empty:
         return df
 
@@ -73,7 +119,7 @@ def keep_completed_candles(
     d["open_time"] = pd.to_datetime(
         d["open_time"],
         utc=True,
-        errors="coerce"
+        errors="coerce",
     )
 
     d = d.dropna(
@@ -83,7 +129,7 @@ def keep_completed_candles(
     if d.empty:
         return d
 
-    interval_seconds = interval_to_seconds(
+    seconds = interval_to_seconds(
         interval
     )
 
@@ -93,43 +139,56 @@ def keep_completed_candles(
 
     completed = (
         (
-            now - d["open_time"]
-        ).dt.total_seconds()
-        >= interval_seconds
+            now
+            - d["open_time"]
+        )
+        .dt.total_seconds()
+        >= seconds
     )
 
     return (
         d.loc[completed]
         .copy()
+        .sort_values("open_time")
+        .drop_duplicates(
+            subset=["open_time"],
+            keep="last",
+        )
         .reset_index(drop=True)
     )
 
 
 # ======================================================================
-# YAHOO
+# YAHOO CONFIG
 # ======================================================================
 
 _YF_CONFIG = {
+
     "1m": {
         "range": "7d",
         "interval": "1m",
     },
+
     "5m": {
         "range": "60d",
         "interval": "5m",
     },
+
     "15m": {
         "range": "60d",
         "interval": "15m",
     },
+
     "30m": {
         "range": "60d",
         "interval": "30m",
     },
+
     "1h": {
         "range": "730d",
         "interval": "1h",
     },
+
     "1d": {
         "range": "10y",
         "interval": "1d",
@@ -137,24 +196,29 @@ _YF_CONFIG = {
 }
 
 
+# ======================================================================
+# YAHOO
+# ======================================================================
+
 def klines_yahoo(
     symbol,
     interval="15m",
-    limit=1000
+    limit=1000,
 ):
     config = _YF_CONFIG.get(
         interval,
         {
             "range": "60d",
             "interval": interval,
-        }
+        },
     )
 
     url = (
         YAHOO_BASE
-        + requests.utils.quote(
+        +
+        requests.utils.quote(
             str(symbol),
-            safe=""
+            safe="",
         )
     )
 
@@ -165,15 +229,17 @@ def klines_yahoo(
         "events": "div,splits",
     }
 
+    headers = {
+        "User-Agent":
+            "Mozilla/5.0 "
+            "(compatible; scanner-v4.1/1.0)"
+    }
+
     response = requests.get(
         url,
         params=params,
-        timeout=30,
-        headers={
-            "User-Agent":
-                "Mozilla/5.0 "
-                "(compatible; scanner-v4/1.0)"
-        }
+        timeout=REQUEST_TIMEOUT,
+        headers=headers,
     )
 
     response.raise_for_status()
@@ -182,7 +248,7 @@ def klines_yahoo(
 
     chart = payload.get(
         "chart",
-        {}
+        {},
     )
 
     results = chart.get(
@@ -190,19 +256,21 @@ def klines_yahoo(
     )
 
     if not results:
+
         error = chart.get(
             "error"
         )
+
         raise RuntimeError(
-            f"Yahoo: aucune donnée pour "
-            f"{symbol}: {error}"
+            f"Yahoo : aucune donnée "
+            f"pour {symbol} : {error}"
         )
 
     result = results[0]
 
     timestamps = result.get(
         "timestamp",
-        []
+        [],
     )
 
     quote_list = (
@@ -211,38 +279,52 @@ def klines_yahoo(
         .get("quote", [])
     )
 
-    if not timestamps or not quote_list:
+    if (
+        not timestamps
+        or not quote_list
+    ):
         return pd.DataFrame()
 
     quote = quote_list[0]
 
     df = pd.DataFrame(
         {
-            "open_time": pd.to_datetime(
-                timestamps,
-                unit="s",
-                utc=True
-            ),
-            "open": quote.get(
-                "open",
-                []
-            ),
-            "high": quote.get(
-                "high",
-                []
-            ),
-            "low": quote.get(
-                "low",
-                []
-            ),
-            "close": quote.get(
-                "close",
-                []
-            ),
-            "volume": quote.get(
-                "volume",
-                []
-            ),
+            "open_time":
+                pd.to_datetime(
+                    timestamps,
+                    unit="s",
+                    utc=True,
+                ),
+
+            "open":
+                quote.get(
+                    "open",
+                    [],
+                ),
+
+            "high":
+                quote.get(
+                    "high",
+                    [],
+                ),
+
+            "low":
+                quote.get(
+                    "low",
+                    [],
+                ),
+
+            "close":
+                quote.get(
+                    "close",
+                    [],
+                ),
+
+            "volume":
+                quote.get(
+                    "volume",
+                    [],
+                ),
         }
     )
 
@@ -251,16 +333,18 @@ def klines_yahoo(
         "high",
         "low",
         "close",
+        "volume",
     ]:
+
         df[col] = pd.to_numeric(
             df[col],
-            errors="coerce"
+            errors="coerce",
         )
 
-    # Volume absent/invalide = NaN
+    # Volume absent = NaN
     df["volume"] = pd.to_numeric(
         df["volume"],
-        errors="coerce"
+        errors="coerce",
     )
 
     df = df.dropna(
@@ -274,27 +358,31 @@ def klines_yahoo(
 
     df = (
         df.sort_values("open_time")
+        .drop_duplicates(
+            subset=["open_time"],
+            keep="last",
+        )
         .reset_index(drop=True)
     )
 
     df = keep_completed_candles(
         df,
-        interval
+        interval,
     )
 
-    return df[
-        [
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
+    return (
+        df[
+            [
+                "open_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]
         ]
-    ].tail(
-        int(limit)
-    ).reset_index(
-        drop=True
+        .tail(int(limit))
+        .reset_index(drop=True)
     )
 
 
@@ -303,12 +391,19 @@ def klines_yahoo(
 # ======================================================================
 
 _TD_INTERVALS = {
+
     "1m": "1min",
+
     "5m": "5min",
+
     "15m": "15min",
+
     "30m": "30min",
+
     "1h": "1h",
+
     "4h": "4h",
+
     "1d": "1day",
 }
 
@@ -316,29 +411,22 @@ _TD_INTERVALS = {
 def klines_twelvedata(
     symbol,
     interval="15m",
-    limit=1000
+    limit=1000,
 ):
-    """
-    Twelve Data.
-
-    IMPORTANT :
-    absence de volume = NaN
-    et jamais 0 artificiel.
-    """
-
     if not TWELVE_DATA_API_KEY:
+
         raise RuntimeError(
             "TWELVE_DATA_API_KEY absente."
         )
 
     td_interval = _TD_INTERVALS.get(
         interval,
-        interval
+        interval,
     )
 
     outputsize = min(
         int(limit),
-        5000
+        5000,
     )
 
     params = {
@@ -359,7 +447,7 @@ def klines_twelvedata(
             response = requests.get(
                 TWELVE_DATA_BASE,
                 params=params,
-                timeout=30
+                timeout=REQUEST_TIMEOUT,
             )
 
             response.raise_for_status()
@@ -373,7 +461,7 @@ def klines_twelvedata(
                 raise RuntimeError(
                     payload.get(
                         "message",
-                        "Erreur Twelve Data"
+                        "Erreur Twelve Data",
                     )
                 )
 
@@ -382,9 +470,11 @@ def klines_twelvedata(
             )
 
             if not values:
+
                 raise RuntimeError(
-                    f"Aucune donnée Twelve Data "
-                    f"pour {symbol}"
+                    f"Aucune donnée "
+                    f"Twelve Data pour "
+                    f"{symbol}"
                 )
 
             df = pd.DataFrame(
@@ -392,14 +482,17 @@ def klines_twelvedata(
             )
 
             if "datetime" not in df.columns:
+
                 raise RuntimeError(
                     "Colonne datetime absente."
                 )
 
-            df["open_time"] = pd.to_datetime(
-                df["datetime"],
-                utc=True,
-                errors="coerce"
+            df["open_time"] = (
+                pd.to_datetime(
+                    df["datetime"],
+                    utc=True,
+                    errors="coerce",
+                )
             )
 
             for col in [
@@ -410,29 +503,29 @@ def klines_twelvedata(
             ]:
 
                 if col not in df.columns:
+
                     raise RuntimeError(
                         f"Colonne {col} absente."
                     )
 
                 df[col] = pd.to_numeric(
                     df[col],
-                    errors="coerce"
+                    errors="coerce",
                 )
 
             # ----------------------------------------------------------
-            # VOLUME
+            # Volume
             # ----------------------------------------------------------
 
             if "volume" in df.columns:
 
                 df["volume"] = pd.to_numeric(
                     df["volume"],
-                    errors="coerce"
+                    errors="coerce",
                 )
 
             else:
 
-                # Ne surtout pas mettre 0.
                 df["volume"] = float(
                     "nan"
                 )
@@ -449,33 +542,31 @@ def klines_twelvedata(
 
             df = (
                 df.sort_values("open_time")
+                .drop_duplicates(
+                    subset=["open_time"],
+                    keep="last",
+                )
                 .reset_index(drop=True)
             )
 
-            # ----------------------------------------------------------
-            # Bougie clôturée uniquement
-            # ----------------------------------------------------------
-
             df = keep_completed_candles(
                 df,
-                interval
+                interval,
             )
 
-            df = df[
-                [
-                    "open_time",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
+            return (
+                df[
+                    [
+                        "open_time",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                    ]
                 ]
-            ]
-
-            return df.tail(
-                int(limit)
-            ).reset_index(
-                drop=True
+                .tail(int(limit))
+                .reset_index(drop=True)
             )
 
         except Exception as exc:
@@ -495,19 +586,14 @@ def klines_twelvedata(
                     f"{exc}"
                 )
 
-                print(
-                    f"[Twelve Data] "
-                    f"Nouvelle tentative dans "
-                    f"{wait}s..."
-                )
-
                 time.sleep(
                     wait
                 )
 
     raise RuntimeError(
-        f"Twelve Data échoué pour "
-        f"{symbol}: {last_error}"
+        f"Twelve Data échoué "
+        f"pour {symbol}: "
+        f"{last_error}"
     )
 
 
@@ -518,11 +604,11 @@ def klines_twelvedata(
 def klines_finnhub(
     symbol,
     interval="15m",
-    limit=1000
+    limit=1000,
 ):
     """
-    Fonction conservée uniquement pour compatibilité.
-    V4 utilise Twelve Data pour le Forex.
+    Conservé pour compatibilité.
+    V4.1 n'utilise pas Finnhub par défaut.
     """
 
     api_key = os.getenv(
@@ -530,6 +616,7 @@ def klines_finnhub(
     )
 
     if not api_key:
+
         raise RuntimeError(
             "FINNHUB_API_KEY absente."
         )
@@ -543,4 +630,15 @@ def klines_finnhub(
             "close",
             "volume",
         ]
+    )
+
+
+# ======================================================================
+# TEST
+# ======================================================================
+
+if __name__ == "__main__":
+
+    print(
+        "Module data_sources.py V4.1 chargé correctement."
     )
