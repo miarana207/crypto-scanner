@@ -1,24 +1,61 @@
-import time
+"""
+V4.1 — Scanner technique.
+
+Sortie principale :
+
+    symbol
+    close
+    score_long
+    score_short
+    direction
+    best_score
+    status
+
+    entry
+    stop_loss
+    take_profit_1
+    take_profit_2
+
+    rr_tp1
+    rr_tp2
+    risk
+
+    quality
+
+    ATR
+    RSI
+    RelVol
+    trend1h
+
+    volume_available
+    volume_ok
+    breakout_ok
+"""
+
 import math
+import time
 
 import pandas as pd
 
 from backtest import (
     indicators,
     score,
-    BREAKOUT_BUFFER,
+    best_direction,
+    calculate_trade_levels,
+    signal_quality,
+    BREAKOUT_LOOKBACK,
+    BREAKOUT_ATR_MULT,
+    MIN_RR,
 )
 
 
 # ======================================================================
-# CONFIGURATION V4
+# CONFIGURATION
 # ======================================================================
 
 DEFAULT_THRESHOLD = 75
 
 VOLUME_THRESHOLD = 1.5
-
-BREAKOUT_LOOKBACK = 20
 
 
 # ======================================================================
@@ -27,7 +64,7 @@ BREAKOUT_LOOKBACK = 20
 
 def safe_float(
     value,
-    default=float("nan")
+    default=float("nan"),
 ):
     try:
 
@@ -39,27 +76,13 @@ def safe_float(
         return value
 
     except Exception:
+
         return default
 
 
-def best_direction(
-    score_long,
-    score_short
-):
-
-    if score_long > score_short:
-        return "LONG"
-
-    if score_short > score_long:
-        return "SHORT"
-
-    return "-"
-
-
 def format_relvol(
-    value
+    value,
 ):
-
     if pd.isna(value):
         return "n/d"
 
@@ -75,34 +98,76 @@ def scan(
     fetcher,
     interval="15m",
     limit=1000,
-    threshold=75,
-    pause=0.0
+    threshold=DEFAULT_THRESHOLD,
+    pause=0.0,
+    fallback_fetcher=None,
+    provider_name="unknown",
+    fallback_provider_name=None,
 ):
-
     results = []
 
     for symbol in symbols:
 
+        df = None
+        used_provider = provider_name
+
         try:
 
-            # ----------------------------------------------------------
-            # DONNÉES
-            # ----------------------------------------------------------
+            # ==========================================================
+            # DONNÉES — SOURCE PRINCIPALE
+            # ==========================================================
 
-            df = fetcher(
-                symbol,
-                interval=interval,
-                limit=limit
-            )
+            try:
+
+                df = fetcher(
+                    symbol,
+                    interval=interval,
+                    limit=limit,
+                )
+
+            except Exception as primary_error:
+
+                print(
+                    f"{symbol}: "
+                    f"échec source principale "
+                    f"{provider_name}: "
+                    f"{primary_error}"
+                )
+
+                # ------------------------------------------------------
+                # FALLBACK
+                # ------------------------------------------------------
+
+                if fallback_fetcher is None:
+
+                    raise
+
+                print(
+                    f"{symbol}: "
+                    f"fallback → "
+                    f"{fallback_provider_name}"
+                )
+
+                df = fallback_fetcher(
+                    symbol,
+                    interval=interval,
+                    limit=limit,
+                )
+
+                used_provider = (
+                    fallback_provider_name
+                    or "fallback"
+                )
+
+            # ==========================================================
+            # VALIDATION
+            # ==========================================================
 
             if df is None or df.empty:
 
                 print(
                     f"{symbol}: aucune donnée"
                 )
-
-                if pause:
-                    time.sleep(pause)
 
                 continue
 
@@ -126,20 +191,23 @@ def scan(
             if missing_columns:
 
                 print(
-                    f"{symbol}: colonnes absentes "
+                    f"{symbol}: colonnes "
+                    f"absentes "
                     f"{missing_columns}"
                 )
 
                 continue
 
-            # ----------------------------------------------------------
+            # ==========================================================
             # TYPES
-            # ----------------------------------------------------------
+            # ==========================================================
 
-            df["open_time"] = pd.to_datetime(
-                df["open_time"],
-                utc=True,
-                errors="coerce"
+            df["open_time"] = (
+                pd.to_datetime(
+                    df["open_time"],
+                    utc=True,
+                    errors="coerce",
+                )
             )
 
             for col in [
@@ -152,56 +220,58 @@ def scan(
 
                 df[col] = pd.to_numeric(
                     df[col],
-                    errors="coerce"
+                    errors="coerce",
                 )
-
-            df = df.dropna(
-                subset=[
-                    "open_time",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                ]
-            )
 
             df = (
-                df.sort_values(
-                    "open_time"
+                df.dropna(
+                    subset=[
+                        "open_time",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                    ]
                 )
-                .reset_index(
-                    drop=True
+                .sort_values("open_time")
+                .drop_duplicates(
+                    subset=["open_time"],
+                    keep="last",
                 )
+                .reset_index(drop=True)
             )
 
-            if len(df) < 60:
+            # ==========================================================
+            # MINIMUM DE DONNÉES
+            # ==========================================================
+
+            if len(df) < 120:
 
                 print(
-                    f"{symbol}: données insuffisantes "
+                    f"{symbol}: données "
+                    f"insuffisantes "
                     f"({len(df)} bougies)"
                 )
 
                 continue
 
-            # ----------------------------------------------------------
+            # ==========================================================
             # INDICATEURS
-            # ----------------------------------------------------------
+            # ==========================================================
 
             d = indicators(
                 df
             )
 
-            # ----------------------------------------------------------
-            # BREAKOUT
-            #
-            # Le niveau de référence est constitué des
-            # 20 bougies précédentes.
-            # ----------------------------------------------------------
+            # ==========================================================
+            # BREAKOUT ATR
+            # ==========================================================
 
             d["prev_high"] = (
                 d["high"]
                 .rolling(
-                    BREAKOUT_LOOKBACK
+                    BREAKOUT_LOOKBACK,
+                    min_periods=BREAKOUT_LOOKBACK,
                 )
                 .max()
                 .shift(1)
@@ -210,7 +280,8 @@ def scan(
             d["prev_low"] = (
                 d["low"]
                 .rolling(
-                    BREAKOUT_LOOKBACK
+                    BREAKOUT_LOOKBACK,
+                    min_periods=BREAKOUT_LOOKBACK,
                 )
                 .min()
                 .shift(1)
@@ -219,53 +290,57 @@ def scan(
             d["breakout_long"] = (
                 d["close"]
                 >
-                d["prev_high"]
-                * (
-                    1 + BREAKOUT_BUFFER
+                (
+                    d["prev_high"]
+                    +
+                    d["atr"]
+                    * BREAKOUT_ATR_MULT
                 )
             )
 
             d["breakout_short"] = (
                 d["close"]
                 <
-                d["prev_low"]
-                * (
-                    1 - BREAKOUT_BUFFER
+                (
+                    d["prev_low"]
+                    -
+                    d["atr"]
+                    * BREAKOUT_ATR_MULT
                 )
             )
 
-            # ----------------------------------------------------------
+            # ==========================================================
             # DERNIÈRE BOUGIE CLÔTURÉE
-            # ----------------------------------------------------------
+            # ==========================================================
 
             last = d.iloc[-1]
 
             (
                 score_long,
                 score_short,
-                details
+                details,
             ) = score(
                 last,
-                return_details=True
+                return_details=True,
             )
 
-            # ----------------------------------------------------------
+            # ==========================================================
             # DIRECTION
-            # ----------------------------------------------------------
+            # ==========================================================
 
             direction = best_direction(
                 score_long,
-                score_short
+                score_short,
             )
 
             best_score = max(
                 score_long,
-                score_short
+                score_short,
             )
 
-            # ----------------------------------------------------------
-            # BREAKOUT DU CÔTÉ RETENU
-            # ----------------------------------------------------------
+            # ==========================================================
+            # CONDITIONS DU CÔTÉ RETENU
+            # ==========================================================
 
             if direction == "LONG":
 
@@ -275,6 +350,10 @@ def scan(
                     ]
                 )
 
+                selected = details[
+                    "long"
+                ]
+
             elif direction == "SHORT":
 
                 breakout_ok = bool(
@@ -283,13 +362,31 @@ def scan(
                     ]
                 )
 
+                selected = details[
+                    "short"
+                ]
+
             else:
 
                 breakout_ok = False
 
-            # ----------------------------------------------------------
+                selected = {
+                    "trend": 0.0,
+                    "ema": 0.0,
+                    "rsi": 0.0,
+                    "volume": 0.0,
+                    "breakout": 0.0,
+                }
+
+            # ==========================================================
             # VOLUME
-            # ----------------------------------------------------------
+            # ==========================================================
+
+            volume_available = bool(
+                details[
+                    "volume_available"
+                ]
+            )
 
             volume_ok = bool(
                 details[
@@ -297,14 +394,45 @@ def scan(
                 ]
             )
 
-            # ----------------------------------------------------------
+            volume_trigger_ok = (
+                volume_ok
+                or not volume_available
+            )
+
+            # ==========================================================
+            # NIVEAUX DE TRADE
+            # ==========================================================
+
+            levels = calculate_trade_levels(
+                last["close"],
+                last["atr"],
+                direction,
+            )
+
+            # ==========================================================
+            # QUALITÉ
+            # ==========================================================
+
+            quality = signal_quality(
+                best_score,
+                breakout_ok,
+                volume_ok,
+                volume_available,
+                levels["rr_tp2"],
+            )
+
+            # ==========================================================
             # STATUT
-            # ----------------------------------------------------------
+            # ==========================================================
 
             if (
                 best_score >= threshold
                 and breakout_ok
-                and volume_ok
+                and volume_trigger_ok
+                and pd.notna(
+                    levels["rr_tp2"]
+                )
+                and levels["rr_tp2"] >= MIN_RR
             ):
 
                 status = "SIGNAL FORT"
@@ -317,9 +445,9 @@ def scan(
 
                 status = "SOUS SEUIL"
 
-            # ----------------------------------------------------------
+            # ==========================================================
             # CONDITIONS MANQUANTES
-            # ----------------------------------------------------------
+            # ==========================================================
 
             missing = []
 
@@ -330,13 +458,29 @@ def scan(
                 )
 
             if not breakout_ok:
+
                 missing.append(
                     "BREAKOUT"
                 )
 
-            if not volume_ok:
+            if (
+                volume_available
+                and not volume_ok
+            ):
+
                 missing.append(
                     "VOLUME"
+                )
+
+            if (
+                pd.isna(
+                    levels["rr_tp2"]
+                )
+                or levels["rr_tp2"] < MIN_RR
+            ):
+
+                missing.append(
+                    "R:R"
                 )
 
             if missing:
@@ -351,69 +495,36 @@ def scan(
 
                 missing_text = "aucune"
 
-            # ----------------------------------------------------------
-            # POINTS DU CÔTÉ RETENU
-            # ----------------------------------------------------------
+            # ==========================================================
+            # FRAÎCHEUR
+            # ==========================================================
 
-            if direction == "LONG":
+            last_candle = last[
+                "open_time"
+            ]
 
-                trend_pts = details[
-                    "long"
-                ]["trend"]
+            now = pd.Timestamp.now(
+                tz="UTC"
+            )
 
-                ema_pts = details[
-                    "long"
-                ]["ema"]
+            age_minutes = (
+                (
+                    now
+                    - last_candle
+                )
+                .total_seconds()
+                / 60
+            )
 
-                rsi_pts = details[
-                    "long"
-                ]["rsi"]
-
-                volume_pts = details[
-                    "long"
-                ]["volume"]
-
-                breakout_pts = details[
-                    "long"
-                ]["breakout"]
-
-            elif direction == "SHORT":
-
-                trend_pts = details[
-                    "short"
-                ]["trend"]
-
-                ema_pts = details[
-                    "short"
-                ]["ema"]
-
-                rsi_pts = details[
-                    "short"
-                ]["rsi"]
-
-                volume_pts = details[
-                    "short"
-                ]["volume"]
-
-                breakout_pts = details[
-                    "short"
-                ]["breakout"]
-
-            else:
-
-                trend_pts = 0
-                ema_pts = 0
-                rsi_pts = 0
-                volume_pts = 0
-                breakout_pts = 0
-
-            # ----------------------------------------------------------
+            # ==========================================================
             # RESULTAT
-            # ----------------------------------------------------------
+            # ==========================================================
 
             results.append(
                 {
                     "symbol": symbol,
+
+                    "provider": used_provider,
 
                     "close": safe_float(
                         last["close"]
@@ -435,27 +546,101 @@ def scan(
 
                     "status": status,
 
+                    "quality": quality,
+
                     "missing": missing_text,
 
+                    # --------------------------------------------------
+                    # POINTS
+                    # --------------------------------------------------
+
                     "trend_pts": float(
-                        trend_pts
+                        selected["trend"]
                     ),
 
                     "ema_pts": float(
-                        ema_pts
+                        selected["ema"]
                     ),
 
                     "rsi_pts": float(
-                        rsi_pts
+                        selected["rsi"]
                     ),
 
                     "volume_pts": float(
-                        volume_pts
+                        selected["volume"]
                     ),
 
                     "breakout_pts": float(
-                        breakout_pts
+                        selected["breakout"]
                     ),
+
+                    # --------------------------------------------------
+                    # TRADE
+                    # --------------------------------------------------
+
+                    "entry": safe_float(
+                        levels["entry"]
+                    ),
+
+                    "stop_loss": safe_float(
+                        levels["stop_loss"]
+                    ),
+
+                    "take_profit_1": safe_float(
+                        levels["take_profit_1"]
+                    ),
+
+                    "take_profit_2": safe_float(
+                        levels["take_profit_2"]
+                    ),
+
+                    "risk": safe_float(
+                        levels["risk"]
+                    ),
+
+                    "rr_tp1": safe_float(
+                        levels["rr_tp1"]
+                    ),
+
+                    "rr_tp2": safe_float(
+                        levels["rr_tp2"]
+                    ),
+
+                    # --------------------------------------------------
+                    # INDICATEURS
+                    # --------------------------------------------------
+
+                    "atr": safe_float(
+                        last.get(
+                            "atr",
+                            float("nan"),
+                        )
+                    ),
+
+                    "rsi": safe_float(
+                        last.get(
+                            "rsi",
+                            float("nan"),
+                        )
+                    ),
+
+                    "relvol": safe_float(
+                        last.get(
+                            "relvol",
+                            float("nan"),
+                        )
+                    ),
+
+                    "trend1h": int(
+                        last.get(
+                            "trend1h",
+                            0,
+                        )
+                    ),
+
+                    # --------------------------------------------------
+                    # TRIGGERS
+                    # --------------------------------------------------
 
                     "breakout_ok": bool(
                         breakout_ok
@@ -465,30 +650,19 @@ def scan(
                         volume_ok
                     ),
 
-                    "rsi": safe_float(
-                        last.get(
-                            "rsi",
-                            float("nan")
-                        )
+                    "volume_available": bool(
+                        volume_available
                     ),
 
-                    "relvol": safe_float(
-                        last.get(
-                            "relvol",
-                            float("nan")
-                        )
-                    ),
+                    # --------------------------------------------------
+                    # DONNÉES
+                    # --------------------------------------------------
 
-                    "trend1h": int(
-                        last.get(
-                            "trend1h",
-                            0
-                        )
-                    ),
+                    "last_candle": last_candle,
 
-                    "last_candle": last[
-                        "open_time"
-                    ],
+                    "age_minutes": float(
+                        age_minutes
+                    ),
                 }
             )
 
@@ -499,6 +673,7 @@ def scan(
             )
 
         if pause:
+
             time.sleep(
                 pause
             )
@@ -508,34 +683,54 @@ def scan(
         return pd.DataFrame(
             columns=[
                 "symbol",
+                "provider",
                 "close",
                 "score_long",
                 "score_short",
                 "direction",
                 "best_score",
                 "status",
+                "quality",
                 "missing",
                 "trend_pts",
                 "ema_pts",
                 "rsi_pts",
                 "volume_pts",
                 "breakout_pts",
-                "breakout_ok",
-                "volume_ok",
+                "entry",
+                "stop_loss",
+                "take_profit_1",
+                "take_profit_2",
+                "risk",
+                "rr_tp1",
+                "rr_tp2",
+                "atr",
                 "rsi",
                 "relvol",
                 "trend1h",
+                "breakout_ok",
+                "volume_ok",
+                "volume_available",
                 "last_candle",
+                "age_minutes",
             ]
         )
 
     return (
-        pd.DataFrame(results)
+        pd.DataFrame(
+            results
+        )
         .sort_values(
-            "best_score",
-            ascending=False
+            [
+                "status",
+                "best_score",
+                "quality",
+            ],
+            ascending=[
+                True,
+                False,
+                True,
+            ],
         )
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
