@@ -8,13 +8,15 @@ Sources :
     - Twelve Data
 
 Principes :
-    - Priorité aux sources gratuites hors Twelve Data.
-    - Twelve Data utilisé en fallback et avec quota journalier partagé.
-    - Cache des requêtes identiques pendant un même run.
+    - Binance prioritaire pour les cryptos.
+    - Finnhub/Yahoo prioritaires pour actions/forex selon disponibilité.
+    - Twelve Data utilisé intelligemment en fallback.
+    - Circuit breaker pour 403/429.
+    - Cache des requêtes identiques pendant un run.
     - Bougies incomplètes supprimées.
+    - Timestamps futurs rejetés.
     - Volume manquant = NaN, jamais 0.
-    - Sélection de la meilleure source selon qualité/fraîcheur/volume.
-    - Pas de Twelve Data si une source gratuite satisfaisante suffit.
+    - Sélection selon fraîcheur, quantité et qualité du volume.
 """
 
 import copy
@@ -29,13 +31,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-
 load_dotenv()
-
-
-# ======================================================================
-# CONFIGURATION
-# ======================================================================
 
 BINANCE_DATA_URL = os.getenv(
     "BINANCE_DATA_URL",
@@ -59,7 +55,6 @@ TWELVE_DATA_BASE_URL = os.getenv(
     "https://api.twelvedata.com",
 ).rstrip("/")
 
-
 TWELVE_DATA_API_KEY = (
     os.getenv("TWELVE_DATA_API_KEY")
     or os.getenv("TWELVEDATA_API_KEY")
@@ -70,44 +65,36 @@ FINNHUB_API_KEY = (
     or os.getenv("FINNHUB_API_TOKEN")
 )
 
-
-# ======================================================================
-# VOLUME
-# ======================================================================
-
 VOLUME_CONFIRMED = "confirmed"
 VOLUME_PARTIAL = "partial"
 VOLUME_UNAVAILABLE = "unavailable"
 VOLUME_INVALID = "invalid"
 
 VOLUME_COVERAGE_THRESHOLD = float(
-    os.getenv(
-        "VOLUME_COVERAGE_THRESHOLD",
-        "0.80",
-    )
+    os.getenv("VOLUME_COVERAGE_THRESHOLD", "0.80")
 )
-
-
-# ======================================================================
-# TWELVE DATA QUOTA
-# ======================================================================
 
 TD_DAILY_LIMIT = int(
     os.getenv(
         "TWELVE_DATA_DAILY_LIMIT",
-        os.getenv(
-            "TWELVE_DATA_DAILY_CREDITS",
-            "800",
-        ),
+        os.getenv("TWELVE_DATA_DAILY_CREDITS", "800"),
     )
 )
 
 TWELVE_DATA_DAILY_LIMIT = TD_DAILY_LIMIT
 
+FUTURE_TIMESTAMP_TOLERANCE_MINUTES = float(
+    os.getenv("FUTURE_TIMESTAMP_TOLERANCE_MINUTES", "2")
+)
 
-# ======================================================================
-# EXCEPTIONS
-# ======================================================================
+STALE_DATA_MINUTES = float(
+    os.getenv("STALE_DATA_MINUTES", "180")
+)
+
+CIRCUIT_BREAKER_SECONDS = int(
+    os.getenv("PROVIDER_COOLDOWN_SECONDS", "900")
+)
+
 
 class DataSourceError(Exception):
     """Erreur globale du routeur."""
@@ -117,9 +104,9 @@ class ProviderError(Exception):
     """Erreur d'un fournisseur."""
 
 
-# ======================================================================
-# INTERVALLES
-# ======================================================================
+class ProviderUnavailableError(ProviderError):
+    """Fournisseur temporairement indisponible."""
+
 
 YAHOO_INTERVALS = {
     "1m": "1m",
@@ -134,7 +121,6 @@ YAHOO_INTERVALS = {
     "1w": "1wk",
 }
 
-
 FINNHUB_INTERVALS = {
     "1m": "1",
     "5m": "5",
@@ -145,7 +131,6 @@ FINNHUB_INTERVALS = {
     "1d": "D",
     "1w": "W",
 }
-
 
 TWELVE_DATA_INTERVALS = {
     "1m": "1min",
@@ -162,10 +147,6 @@ TWELVE_DATA_INTERVALS = {
 }
 
 
-# ======================================================================
-# OUTILS
-# ======================================================================
-
 def _utc_now():
     return pd.Timestamp.now(tz="UTC")
 
@@ -173,12 +154,9 @@ def _utc_now():
 def _safe_float(value, default=np.nan):
     try:
         value = float(value)
-
         if math.isnan(value):
             return default
-
         return value
-
     except Exception:
         return default
 
@@ -190,27 +168,14 @@ def _normalize_datetime(value):
             utc=True,
             errors="coerce",
         )
-
         if pd.isna(result):
             return pd.NaT
-
         return result
-
     except Exception:
         return pd.NaT
 
 
-# ======================================================================
-# ROUTEUR
-# ======================================================================
-
 class DataRouter:
-    """
-    Routeur intelligent V4.2.
-
-    Le quota Twelve Data est partagé entre toutes les instances
-    du routeur dans le même processus.
-    """
 
     _td_lock = threading.Lock()
     _td_date = None
@@ -233,22 +198,22 @@ class DataRouter:
 
         self._provider_calls = {
             "binance": 0,
-            "yahoo": 0,
             "finnhub": 0,
+            "yahoo": 0,
             "twelve_data": 0,
         }
 
         self._provider_successes = {
             "binance": 0,
-            "yahoo": 0,
             "finnhub": 0,
+            "yahoo": 0,
             "twelve_data": 0,
         }
 
         self._provider_failures = {
             "binance": 0,
-            "yahoo": 0,
             "finnhub": 0,
+            "yahoo": 0,
             "twelve_data": 0,
         }
 
@@ -261,9 +226,37 @@ class DataRouter:
 
         self._last_errors = {}
 
-    # ==================================================================
-    # TWELVE DATA BUDGET
-    # ==================================================================
+        self._provider_cooldowns = {}
+
+    # ================================================================
+    # COOLDOWN
+    # ================================================================
+
+    def _provider_is_available(self, provider):
+        until = self._provider_cooldowns.get(provider)
+
+        if until is None:
+            return True
+
+        if time.time() >= until:
+            del self._provider_cooldowns[provider]
+            return True
+
+        return False
+
+    def _activate_cooldown(self, provider, reason):
+        self._provider_cooldowns[provider] = (
+            time.time() + CIRCUIT_BREAKER_SECONDS
+        )
+
+        print(
+            f"[Router] {provider} temporairement désactivé "
+            f"pendant {CIRCUIT_BREAKER_SECONDS}s : {reason}"
+        )
+
+    # ================================================================
+    # QUOTA TWELVE DATA
+    # ================================================================
 
     @classmethod
     def _reset_td_day_if_needed(cls):
@@ -277,19 +270,14 @@ class DataRouter:
     @property
     def twelve_data_used(self):
         self._reset_td_day_if_needed()
-
         with self._td_lock:
             return self._td_used
 
     @property
     def twelve_data_remaining(self):
         self._reset_td_day_if_needed()
-
         with self._td_lock:
-            return max(
-                0,
-                TD_DAILY_LIMIT - self._td_used,
-            )
+            return max(0, TD_DAILY_LIMIT - self._td_used)
 
     @property
     def twelvedata_used(self):
@@ -318,7 +306,6 @@ class DataRouter:
         self._reset_td_day_if_needed()
 
         with self._td_lock:
-
             if self._td_used >= TD_DAILY_LIMIT:
                 raise ProviderError(
                     "Twelve Data : quota journalière atteinte."
@@ -326,33 +313,26 @@ class DataRouter:
 
             self._td_used += 1
 
-    # ==================================================================
+    # ================================================================
     # STATS
-    # ==================================================================
+    # ================================================================
 
     def router_stats(self):
-
         return {
             "calls": self._calls,
             "successes": self._successes,
             "failures": self._failures,
             "cache_hits": self._cache_hits,
-            "provider_calls": dict(
-                self._provider_calls
-            ),
-            "provider_successes": dict(
-                self._provider_successes
-            ),
-            "provider_failures": dict(
-                self._provider_failures
-            ),
-            "volume_status": dict(
-                self._volume_status_counts
-            ),
+            "provider_calls": dict(self._provider_calls),
+            "provider_successes": dict(self._provider_successes),
+            "provider_failures": dict(self._provider_failures),
+            "volume_status": dict(self._volume_status_counts),
             "twelve_data": self.get_twelve_data_budget(),
-            "last_errors": copy.deepcopy(
-                self._last_errors
-            ),
+            "last_errors": copy.deepcopy(self._last_errors),
+            "provider_cooldowns": {
+                k: max(0, int(v - time.time()))
+                for k, v in self._provider_cooldowns.items()
+            },
         }
 
     def stats(self):
@@ -361,9 +341,9 @@ class DataRouter:
     def get_stats(self):
         return self.router_stats()
 
-    # ==================================================================
-    # REQUÊTES HTTP
-    # ==================================================================
+    # ================================================================
+    # HTTP
+    # ================================================================
 
     def _request_json(
         self,
@@ -372,22 +352,18 @@ class DataRouter:
         params=None,
         headers=None,
     ):
-
         provider_key = provider.lower()
 
+        if not self._provider_is_available(provider_key):
+            raise ProviderUnavailableError(
+                f"{provider}: circuit breaker actif."
+            )
+
         self._calls += 1
-
-        self._provider_calls.setdefault(
-            provider_key,
-            0,
-        )
-
-        self._provider_calls[
-            provider_key
-        ] += 1
+        self._provider_calls.setdefault(provider_key, 0)
+        self._provider_calls[provider_key] += 1
 
         try:
-
             response = requests.get(
                 url,
                 params=params,
@@ -395,14 +371,29 @@ class DataRouter:
                 timeout=self.timeout,
             )
 
-            if response.status_code == 429:
-                raise ProviderError(
-                    f"{provider}: HTTP 429 — limite de requêtes."
+            status = response.status_code
+
+            if status == 403:
+                self._activate_cooldown(
+                    provider_key,
+                    "HTTP 403",
+                )
+                raise ProviderUnavailableError(
+                    f"{provider}: HTTP 403."
                 )
 
-            if response.status_code >= 500:
+            if status == 429:
+                self._activate_cooldown(
+                    provider_key,
+                    "HTTP 429",
+                )
+                raise ProviderUnavailableError(
+                    f"{provider}: HTTP 429."
+                )
+
+            if status >= 500:
                 raise ProviderError(
-                    f"{provider}: HTTP {response.status_code}"
+                    f"{provider}: HTTP {status}"
                 )
 
             response.raise_for_status()
@@ -415,82 +406,45 @@ class DataRouter:
                 )
 
             self._successes += 1
-
-            self._provider_successes.setdefault(
-                provider_key,
-                0,
-            )
-
-            self._provider_successes[
-                provider_key
-            ] += 1
+            self._provider_successes.setdefault(provider_key, 0)
+            self._provider_successes[provider_key] += 1
 
             return data
 
-        except Exception as exc:
-
+        except Exception:
             self._failures += 1
-
-            self._provider_failures.setdefault(
-                provider_key,
-                0,
-            )
-
-            self._provider_failures[
-                provider_key
-            ] += 1
-
+            self._provider_failures.setdefault(provider_key, 0)
+            self._provider_failures[provider_key] += 1
             raise
 
-    # ==================================================================
+    # ================================================================
     # NORMALISATION
-    # ==================================================================
+    # ================================================================
 
-    def _canonicalize(
-        self,
-        df,
-    ):
-
+    def _canonicalize(self, df):
         if df is None:
             return None
 
         df = df.copy()
-
         rename_map = {}
 
         for column in df.columns:
-
             lower = str(column).lower()
 
-            if lower in {
-                "datetime",
-                "date",
-                "timestamp",
-                "time",
-            }:
+            if lower in {"datetime", "date", "timestamp", "time"}:
                 rename_map[column] = "open_time"
-
             elif lower == "open":
                 rename_map[column] = "open"
-
             elif lower == "high":
                 rename_map[column] = "high"
-
             elif lower == "low":
                 rename_map[column] = "low"
-
             elif lower == "close":
                 rename_map[column] = "close"
-
-            elif lower in {
-                "volume",
-                "vol",
-            }:
+            elif lower in {"volume", "vol"}:
                 rename_map[column] = "volume"
 
-        df = df.rename(
-            columns=rename_map
-        )
+        df = df.rename(columns=rename_map)
 
         required = [
             "open_time",
@@ -500,10 +454,8 @@ class DataRouter:
             "close",
         ]
 
-        for column in required:
-
-            if column not in df.columns:
-                return None
+        if any(column not in df.columns for column in required):
+            return None
 
         if "volume" not in df.columns:
             df["volume"] = np.nan
@@ -521,21 +473,12 @@ class DataRouter:
             "close",
             "volume",
         ]:
-
             df[column] = pd.to_numeric(
                 df[column],
                 errors="coerce",
             )
 
-        df = df.dropna(
-            subset=[
-                "open_time",
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        )
+        df = df.dropna(subset=required)
 
         df = (
             df.sort_values("open_time")
@@ -548,35 +491,69 @@ class DataRouter:
 
         return df
 
-    # ==================================================================
-    # VOLUME
-    # ==================================================================
+    # ================================================================
+    # TIMESTAMP
+    # ================================================================
 
-    def _volume_status(
-        self,
-        df,
-    ):
-
+    def _validate_timestamps(self, df):
         if df is None or df.empty:
-            return (
-                VOLUME_INVALID,
-                0.0,
+            raise ProviderError("Données vides.")
+
+        now = _utc_now()
+        tolerance = pd.Timedelta(
+            minutes=FUTURE_TIMESTAMP_TOLERANCE_MINUTES
+        )
+
+        future = df["open_time"] > now + tolerance
+
+        if future.any():
+            count = int(future.sum())
+            raise ProviderError(
+                f"timestamp futur détecté ({count} bougie(s))."
             )
+
+        df = df[
+            df["open_time"] <= now + tolerance
+        ].copy()
+
+        if df.empty:
+            raise ProviderError(
+                "Toutes les bougies sont dans le futur."
+            )
+
+        return df
+
+    # ================================================================
+    # VOLUME
+    # ================================================================
+
+    def _volume_status(self, df):
+        if df is None or df.empty:
+            return VOLUME_INVALID, 0.0
 
         if "volume" not in df.columns:
-            return (
-                VOLUME_UNAVAILABLE,
-                0.0,
-            )
+            return VOLUME_UNAVAILABLE, 0.0
 
         numeric = pd.to_numeric(
             df["volume"],
             errors="coerce",
         )
 
-        valid = numeric.notna() & np.isfinite(
-            numeric
+        invalid = numeric.notna() & (
+            numeric < 0
         )
+
+        if invalid.any():
+            valid = (
+                numeric.notna()
+                & np.isfinite(numeric)
+                & (numeric >= 0)
+            )
+        else:
+            valid = (
+                numeric.notna()
+                & np.isfinite(numeric)
+            )
 
         coverage = (
             float(valid.mean())
@@ -584,35 +561,22 @@ class DataRouter:
             else 0.0
         )
 
-        if coverage >= VOLUME_COVERAGE_THRESHOLD:
+        if invalid.any() and coverage == 0:
+            return VOLUME_INVALID, 0.0
 
-            return (
-                VOLUME_CONFIRMED,
-                coverage,
-            )
+        if coverage >= VOLUME_COVERAGE_THRESHOLD:
+            return VOLUME_CONFIRMED, coverage
 
         if coverage > 0:
+            return VOLUME_PARTIAL, coverage
 
-            return (
-                VOLUME_PARTIAL,
-                coverage,
-            )
+        return VOLUME_UNAVAILABLE, 0.0
 
-        return (
-            VOLUME_UNAVAILABLE,
-            0.0,
-        )
-
-    # ==================================================================
+    # ================================================================
     # BOUGIE INCOMPLÈTE
-    # ==================================================================
+    # ================================================================
 
-    def _drop_incomplete_last_candle(
-        self,
-        df,
-        interval,
-    ):
-
+    def _drop_incomplete_last_candle(self, df, interval):
         if df is None or df.empty:
             return df
 
@@ -630,10 +594,7 @@ class DataRouter:
             "1d": 1440,
             "1w": 10080,
             "1wk": 10080,
-        }.get(
-            interval,
-            None,
-        )
+        }.get(interval)
 
         if interval_minutes is None:
             return df
@@ -645,21 +606,17 @@ class DataRouter:
 
         expected_close = (
             last_open
-            + pd.Timedelta(
-                minutes=interval_minutes
-            )
+            + pd.Timedelta(minutes=interval_minutes)
         )
 
-        now = _utc_now()
-
-        if expected_close > now:
-            df = df.iloc[:-1].copy()
+        if expected_close > _utc_now():
+            return df.iloc[:-1].copy()
 
         return df
 
-    # ==================================================================
-    # METADATA
-    # ==================================================================
+    # ================================================================
+    # MÉTADONNÉES
+    # ================================================================
 
     def _attach_metadata(
         self,
@@ -670,112 +627,80 @@ class DataRouter:
         volume_status,
         volume_coverage,
     ):
-
         if df is None or df.empty:
             return df
 
         df = df.copy()
 
-        last_candle = df[
-            "open_time"
-        ].max()
+        last_candle = df["open_time"].max()
 
         age_minutes = np.nan
 
         if pd.notna(last_candle):
-
             age_minutes = (
-                _utc_now()
-                - last_candle
+                _utc_now() - last_candle
             ).total_seconds() / 60.0
 
         df["provider"] = provider
-
         df["provider_symbol"] = provider_symbol
-
-        df["requested_interval"] = (
-            requested_interval
-        )
-
-        df["volume_status"] = (
-            volume_status
-        )
-
-        df["volume_coverage"] = (
-            volume_coverage
-        )
-
-        df["last_candle"] = (
-            last_candle
-        )
-
-        df["age_minutes"] = (
-            age_minutes
-        )
-
+        df["requested_interval"] = requested_interval
+        df["volume_status"] = volume_status
+        df["volume_coverage"] = volume_coverage
+        df["last_candle"] = last_candle
+        df["age_minutes"] = age_minutes
         df["is_stale"] = bool(
             pd.notna(age_minutes)
-            and age_minutes > 180
+            and age_minutes > STALE_DATA_MINUTES
         )
 
         df.attrs["provider"] = provider
-        df.attrs["provider_symbol"] = (
-            provider_symbol
-        )
-        df.attrs["volume_status"] = (
-            volume_status
-        )
-        df.attrs["volume_coverage"] = (
-            volume_coverage
-        )
-        df.attrs["last_candle"] = (
-            last_candle
-        )
-        df.attrs["age_minutes"] = (
-            age_minutes
+        df.attrs["provider_symbol"] = provider_symbol
+        df.attrs["volume_status"] = volume_status
+        df.attrs["volume_coverage"] = volume_coverage
+        df.attrs["last_candle"] = last_candle
+        df.attrs["age_minutes"] = age_minutes
+        df.attrs["is_stale"] = bool(
+            pd.notna(age_minutes)
+            and age_minutes > STALE_DATA_MINUTES
         )
 
         return df
 
-    # ==================================================================
+    # ================================================================
     # BINANCE
-    # ==================================================================
+    # ================================================================
 
-    def _fetch_binance(
-        self,
-        symbol,
-        interval,
-        limit,
-    ):
-
-        url = (
-            f"{BINANCE_DATA_URL}"
-            "/api/v3/klines"
-        )
+    def _fetch_binance(self, symbol, interval, limit):
+        url = f"{BINANCE_DATA_URL}/api/v3/klines"
 
         params = {
             "symbol": symbol,
             "interval": interval,
-            "limit": min(
-                int(limit),
-                1000,
-            ),
+            "limit": min(int(limit), 1000),
         }
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=self.timeout,
-        )
+        if not self._provider_is_available("binance"):
+            raise ProviderUnavailableError(
+                "Binance: circuit breaker actif."
+            )
 
         self._calls += 1
         self._provider_calls["binance"] += 1
 
         try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=self.timeout,
+            )
 
             if response.status_code == 429:
-                raise ProviderError(
-                    "binance: HTTP 429"
+                self._activate_cooldown(
+                    "binance",
+                    "HTTP 429",
+                )
+                raise ProviderUnavailableError(
+                    "Binance: HTTP 429."
                 )
 
             response.raise_for_status()
@@ -826,7 +751,6 @@ class DataRouter:
                 "close",
                 "volume",
             ]:
-
                 df[column] = pd.to_numeric(
                     df[column],
                     errors="coerce",
@@ -848,50 +772,47 @@ class DataRouter:
                 df["close_time"] < now
             ].copy()
 
+            if df.empty:
+                raise ProviderError(
+                    f"Binance: aucune bougie complète pour {symbol}"
+                )
+
             self._successes += 1
-            self._provider_successes[
-                "binance"
-            ] += 1
+            self._provider_successes["binance"] += 1
 
             return df
 
         except Exception:
-
             self._failures += 1
-            self._provider_failures[
-                "binance"
-            ] += 1
-
+            self._provider_failures["binance"] += 1
             raise
 
-    # ==================================================================
+    # ================================================================
     # YAHOO
-    # ==================================================================
+    # ================================================================
 
-    def _fetch_yahoo(
-        self,
-        symbol,
-        interval,
-        limit,
-    ):
-
-        yahoo_interval = (
-            YAHOO_INTERVALS.get(
-                interval,
-                interval,
-            )
+    def _fetch_yahoo(self, symbol, interval, limit):
+        yahoo_interval = YAHOO_INTERVALS.get(
+            interval,
+            interval,
         )
 
-        period2 = int(
-            time.time()
-        )
+        period2 = int(time.time())
 
-        period1 = (
-            period2
-            - max(
-                int(limit) * 3600,
-                86400,
-            )
+        # Yahoo limite fortement les périodes disponibles
+        # en intraday. On demande une fenêtre raisonnable.
+        multiplier = {
+            "1m": 2,
+            "5m": 5,
+            "15m": 15,
+            "30m": 30,
+            "60m": 60,
+            "1h": 60,
+        }.get(interval, 60)
+
+        period1 = period2 - max(
+            int(limit) * multiplier * 60,
+            86400,
         )
 
         url = (
@@ -946,41 +867,24 @@ class DataRouter:
                 f"Yahoo: timestamps absents pour {symbol}"
             )
 
-        df = pd.DataFrame(
+        return pd.DataFrame(
             {
                 "open_time": pd.to_datetime(
                     timestamps,
                     unit="s",
                     utc=True,
                 ),
-                "open": quote.get(
-                    "open",
-                    [],
-                ),
-                "high": quote.get(
-                    "high",
-                    [],
-                ),
-                "low": quote.get(
-                    "low",
-                    [],
-                ),
-                "close": quote.get(
-                    "close",
-                    [],
-                ),
-                "volume": quote.get(
-                    "volume",
-                    [],
-                ),
+                "open": quote.get("open", []),
+                "high": quote.get("high", []),
+                "low": quote.get("low", []),
+                "close": quote.get("close", []),
+                "volume": quote.get("volume", []),
             }
         )
 
-        return df
-
-    # ==================================================================
+    # ================================================================
     # FINNHUB
-    # ==================================================================
+    # ================================================================
 
     def _fetch_finnhub(
         self,
@@ -989,9 +893,7 @@ class DataRouter:
         limit,
         asset_type,
     ):
-
         if not FINNHUB_API_KEY:
-
             raise ProviderError(
                 "Finnhub: API key absente."
             )
@@ -1001,23 +903,16 @@ class DataRouter:
             "15",
         )
 
-        now = int(
-            time.time()
-        )
+        now = int(time.time())
 
-        minutes_map = {
+        minutes = {
             "1m": 1,
             "5m": 5,
             "15m": 15,
             "30m": 30,
             "60m": 60,
             "1h": 60,
-        }
-
-        minutes = minutes_map.get(
-            interval,
-            15,
-        )
+        }.get(interval, 15)
 
         start = (
             now
@@ -1027,36 +922,22 @@ class DataRouter:
         )
 
         if asset_type == "forex":
-
-            finnhub_symbol = symbol
-
-            url = (
-                f"{FINNHUB_BASE_URL}"
-                "/forex/candle"
-            )
-
-            params = {
-                "symbol": finnhub_symbol,
-                "resolution": resolution,
-                "from": start,
-                "to": now,
-                "token": FINNHUB_API_KEY,
-            }
-
+            endpoint = "/forex/candle"
         else:
+            endpoint = "/stock/candle"
 
-            url = (
-                f"{FINNHUB_BASE_URL}"
-                "/stock/candle"
-            )
+        url = (
+            f"{FINNHUB_BASE_URL}"
+            f"{endpoint}"
+        )
 
-            params = {
-                "symbol": symbol,
-                "resolution": resolution,
-                "from": start,
-                "to": now,
-                "token": FINNHUB_API_KEY,
-            }
+        params = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "from": start,
+            "to": now,
+            "token": FINNHUB_API_KEY,
+        }
 
         data = self._request_json(
             "finnhub",
@@ -1069,51 +950,31 @@ class DataRouter:
                 f"Finnhub: statut {data.get('s')}"
             )
 
-        timestamps = data.get(
-            "t",
-            [],
-        )
+        timestamps = data.get("t", [])
 
         if not timestamps:
             raise ProviderError(
                 f"Finnhub: aucune donnée pour {symbol}"
             )
 
-        df = pd.DataFrame(
+        return pd.DataFrame(
             {
                 "open_time": pd.to_datetime(
                     timestamps,
                     unit="s",
                     utc=True,
                 ),
-                "open": data.get(
-                    "o",
-                    [],
-                ),
-                "high": data.get(
-                    "h",
-                    [],
-                ),
-                "low": data.get(
-                    "l",
-                    [],
-                ),
-                "close": data.get(
-                    "c",
-                    [],
-                ),
-                "volume": data.get(
-                    "v",
-                    [],
-                ),
+                "open": data.get("o", []),
+                "high": data.get("h", []),
+                "low": data.get("l", []),
+                "close": data.get("c", []),
+                "volume": data.get("v", []),
             }
         )
 
-        return df
-
-    # ==================================================================
+    # ================================================================
     # TWELVE DATA
-    # ==================================================================
+    # ================================================================
 
     def _fetch_twelvedata(
         self,
@@ -1121,20 +982,16 @@ class DataRouter:
         interval,
         limit,
     ):
-
         if not TWELVE_DATA_API_KEY:
-
             raise ProviderError(
                 "Twelve Data: API key absente."
             )
 
         self._reserve_twelve_data_credit()
 
-        td_interval = (
-            TWELVE_DATA_INTERVALS.get(
-                interval,
-                interval,
-            )
+        td_interval = TWELVE_DATA_INTERVALS.get(
+            interval,
+            interval,
         )
 
         url = (
@@ -1159,21 +1016,18 @@ class DataRouter:
             params=params,
         )
 
-        if "status" in data:
-            if data.get("status") == "error":
-                raise ProviderError(
-                    "Twelve Data: "
-                    + str(
-                        data.get(
-                            "message",
-                            "erreur inconnue",
-                        )
+        if data.get("status") == "error":
+            raise ProviderError(
+                "Twelve Data: "
+                + str(
+                    data.get(
+                        "message",
+                        "erreur inconnue",
                     )
                 )
+            )
 
-        values = data.get(
-            "values"
-        )
+        values = data.get("values")
 
         if not values:
             raise ProviderError(
@@ -1183,24 +1037,13 @@ class DataRouter:
         rows = []
 
         for item in values:
-
             rows.append(
                 {
-                    "open_time": item.get(
-                        "datetime"
-                    ),
-                    "open": item.get(
-                        "open"
-                    ),
-                    "high": item.get(
-                        "high"
-                    ),
-                    "low": item.get(
-                        "low"
-                    ),
-                    "close": item.get(
-                        "close"
-                    ),
+                    "open_time": item.get("datetime"),
+                    "open": item.get("open"),
+                    "high": item.get("high"),
+                    "low": item.get("low"),
+                    "close": item.get("close"),
                     "volume": item.get(
                         "volume",
                         np.nan,
@@ -1210,103 +1053,9 @@ class DataRouter:
 
         return pd.DataFrame(rows)
 
-    # ==================================================================
-    # AGRÉGATION INTRADAY
-    # ==================================================================
-
-    def _aggregate_intraday(
-        self,
-        df,
-        target_minutes,
-    ):
-
-        if df is None or df.empty:
-            return df
-
-        df = df.copy()
-
-        df = df.set_index(
-            "open_time"
-        )
-
-        rule = f"{int(target_minutes)}min"
-
-        result = pd.DataFrame()
-
-        result["open"] = (
-            df["open"]
-            .resample(rule)
-            .first()
-        )
-
-        result["high"] = (
-            df["high"]
-            .resample(rule)
-            .max()
-        )
-
-        result["low"] = (
-            df["low"]
-            .resample(rule)
-            .min()
-        )
-
-        result["close"] = (
-            df["close"]
-            .resample(rule)
-            .last()
-        )
-
-        if "volume" in df.columns:
-
-            volume = df["volume"]
-
-            counts = (
-                volume
-                .resample(rule)
-                .count()
-            )
-
-            expected = (
-                volume
-                .resample(rule)
-                .size()
-            )
-
-            summed = (
-                volume
-                .resample(rule)
-                .sum(
-                    min_count=1
-                )
-            )
-
-            result["volume"] = summed.where(
-                counts >= expected
-            )
-
-        else:
-
-            result["volume"] = np.nan
-
-        result = (
-            result
-            .dropna(
-                subset=[
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                ]
-            )
-            .reset_index()
-        )
-
-        return result
-
-    # ==================================================================
+    # ================================================================
     # SYMBOL MAP
-    # ==================================================================
+    # ================================================================
 
     def _resolve_symbol(
         self,
@@ -1314,68 +1063,41 @@ class DataRouter:
         provider,
         symbol_map=None,
     ):
-
         if not symbol_map:
             return symbol
 
         provider_key = provider.lower()
 
-        if symbol in symbol_map:
+        aliases = {
+            provider_key,
+            provider_key.replace("_", ""),
+        }
 
+        if provider_key == "twelve_data":
+            aliases.update({
+                "twelvedata",
+                "twelve_data",
+            })
+
+        mapping = symbol_map
+
+        if symbol in symbol_map:
             mapping = symbol_map[symbol]
 
-            if isinstance(
-                mapping,
-                str,
-            ):
-                return mapping
+        if isinstance(mapping, str):
+            return mapping
 
-            if isinstance(
-                mapping,
-                dict,
-            ):
-
-                aliases = {
-                    provider_key,
-                    provider_key.replace(
-                        "_",
-                        "",
-                    ),
-                    "twelvedata"
-                    if provider_key
-                    == "twelve_data"
-                    else provider_key,
-                }
-
-                for key in aliases:
-
-                    value = mapping.get(
-                        key
-                    )
-
-                    if value:
-                        return value
-
-        if isinstance(
-            symbol_map,
-            dict,
-        ):
-
-            value = symbol_map.get(
-                provider_key
-            )
-
-            if isinstance(
-                value,
-                str,
-            ):
-                return value
+        if isinstance(mapping, dict):
+            for key in aliases:
+                value = mapping.get(key)
+                if value:
+                    return value
 
         return symbol
 
-    # ==================================================================
+    # ================================================================
     # QUALITÉ
-    # ==================================================================
+    # ================================================================
 
     def _quality_score(
         self,
@@ -1384,7 +1106,6 @@ class DataRouter:
         volume_status,
         require_volume,
     ):
-
         if df is None or df.empty:
             return -999.0
 
@@ -1392,16 +1113,12 @@ class DataRouter:
 
         if volume_status == VOLUME_CONFIRMED:
             score += 30
-
         elif volume_status == VOLUME_PARTIAL:
             score += 15
-
         elif volume_status == VOLUME_UNAVAILABLE:
-            score -= (
-                20
-                if require_volume
-                else 0
-            )
+            score += -20 if require_volume else 0
+        elif volume_status == VOLUME_INVALID:
+            score -= 40
 
         age = df.attrs.get(
             "age_minutes",
@@ -1410,23 +1127,19 @@ class DataRouter:
 
         if pd.notna(age):
 
+            if age < 0:
+                return -999.0
+
             if age <= 15:
                 score += 30
-
             elif age <= 60:
                 score += 20
-
             elif age <= 180:
                 score += 10
-
             else:
                 score -= 20
 
-        quantity = min(
-            len(df),
-            300,
-        )
-
+        quantity = min(len(df), 300)
         score += (
             quantity / 300
         ) * 20
@@ -1438,48 +1151,38 @@ class DataRouter:
             "twelve_data": 5,
         }
 
-        score += preferred.get(
-            provider,
-            0,
-        )
+        score += preferred.get(provider, 0)
 
         return score
 
-    # ==================================================================
-    # CANDIDATS
-    # ==================================================================
+    # ================================================================
+    # FOURNISSEURS
+    # ================================================================
 
-    def _providers_for(
-        self,
-        asset_type,
-    ):
+    def _providers_for(self, asset_type):
 
         mapping = {
-
             "crypto": [
                 "binance",
+                "finnhub",
                 "yahoo",
                 "twelve_data",
             ],
-
             "stock": [
                 "finnhub",
                 "yahoo",
                 "twelve_data",
             ],
-
             "forex": [
                 "finnhub",
                 "yahoo",
                 "twelve_data",
             ],
-
             "index": [
                 "yahoo",
                 "finnhub",
                 "twelve_data",
             ],
-
             "commodity": [
                 "yahoo",
                 "finnhub",
@@ -1496,9 +1199,9 @@ class DataRouter:
             ],
         )
 
-    # ==================================================================
-    # FETCH PRINCIPAL
-    # ==================================================================
+    # ================================================================
+    # FETCH
+    # ================================================================
 
     def fetch(
         self,
@@ -1510,6 +1213,7 @@ class DataRouter:
         require_volume=False,
         symbol_map=None,
     ):
+        mapping_key = str(symbol_map)
 
         cache_key = (
             symbol,
@@ -1517,52 +1221,59 @@ class DataRouter:
             int(limit),
             asset_type,
             bool(require_volume),
-            str(symbol_map),
+            mapping_key,
         )
 
         if (
             self.cache_enabled
             and cache_key in self._cache
         ):
-
             self._cache_hits += 1
-
-            return self._cache[
-                cache_key
-            ].copy()
+            cached = self._cache[cache_key].copy()
+            cached.attrs = dict(
+                self._cache[cache_key].attrs
+            )
+            return cached
 
         providers = self._providers_for(
             asset_type
         )
 
         if preferred:
-
-            providers = [
-                preferred
-            ] + [
-                provider
-                for provider in providers
-                if provider != preferred
-            ]
+            providers = (
+                [preferred]
+                + [
+                    provider
+                    for provider in providers
+                    if provider != preferred
+                ]
+            )
 
         candidates = []
-
         errors = {}
 
         for provider in providers:
 
+            if not self._provider_is_available(provider):
+                errors[provider] = (
+                    "circuit breaker actif"
+                )
+                continue
+
             try:
 
-                provider_symbol = (
-                    self._resolve_symbol(
-                        symbol,
-                        provider,
-                        symbol_map,
-                    )
+                provider_symbol = self._resolve_symbol(
+                    symbol,
+                    provider,
+                    symbol_map,
                 )
 
-                if provider == "binance":
+                if not provider_symbol:
+                    raise ProviderError(
+                        f"{provider}: symbole absent."
+                    )
 
+                if provider == "binance":
                     df = self._fetch_binance(
                         provider_symbol,
                         interval,
@@ -1570,7 +1281,6 @@ class DataRouter:
                     )
 
                 elif provider == "yahoo":
-
                     df = self._fetch_yahoo(
                         provider_symbol,
                         interval,
@@ -1578,7 +1288,6 @@ class DataRouter:
                     )
 
                 elif provider == "finnhub":
-
                     df = self._fetch_finnhub(
                         provider_symbol,
                         interval,
@@ -1587,7 +1296,6 @@ class DataRouter:
                     )
 
                 elif provider == "twelve_data":
-
                     df = self._fetch_twelvedata(
                         provider_symbol,
                         interval,
@@ -1595,43 +1303,33 @@ class DataRouter:
                     )
 
                 else:
-
                     raise ProviderError(
                         f"Provider inconnu : {provider}"
                     )
 
-                df = self._canonicalize(
-                    df
+                df = self._canonicalize(df)
+
+                if df is None or df.empty:
+                    raise ProviderError(
+                        f"{provider}: données vides."
+                    )
+
+                df = self._validate_timestamps(df)
+
+                df = self._drop_incomplete_last_candle(
+                    df,
+                    interval,
                 )
 
                 if df is None or df.empty:
-
                     raise ProviderError(
-                        f"{provider}: "
-                        "données vides après normalisation."
-                    )
-
-                df = (
-                    self._drop_incomplete_last_candle(
-                        df,
-                        interval,
-                    )
-                )
-
-                if (
-                    df is None
-                    or df.empty
-                ):
-                    raise ProviderError(
-                        f"{provider}: "
-                        "aucune bougie complète."
+                        f"{provider}: aucune bougie complète."
                     )
 
                 if len(df) < 10:
-
                     raise ProviderError(
-                        f"{provider}: "
-                        f"seulement {len(df)} bougies."
+                        f"{provider}: seulement "
+                        f"{len(df)} bougies."
                     )
 
                 volume_status, volume_coverage = (
@@ -1658,9 +1356,7 @@ class DataRouter:
                     require_volume,
                 )
 
-                df.attrs["quality_score"] = (
-                    quality
-                )
+                df.attrs["quality_score"] = quality
 
                 candidates.append(
                     (
@@ -1670,44 +1366,26 @@ class DataRouter:
                     )
                 )
 
-                # ------------------------------------------------------
-                # ARRÊT INTELLIGENT
-                #
-                # Si le volume est requis :
-                #   on veut idéalement un volume confirmé.
-                #
-                # Si le volume n'est pas requis :
-                #   une source fraîche et suffisamment complète suffit.
-                #
-                # Cela évite de consommer inutilement Twelve Data
-                # pour le Forex / indices.
-                # ------------------------------------------------------
-
-                if len(df) >= min(
+                target = min(
                     int(limit),
                     120,
-                ):
+                )
 
-                    if (
-                        volume_status
-                        == VOLUME_CONFIRMED
-                    ):
+                if len(df) >= target:
 
+                    if volume_status == VOLUME_CONFIRMED:
                         break
 
                     if not require_volume:
-
                         break
 
             except Exception as exc:
 
-                errors[
-                    provider
-                ] = str(exc)
+                errors[provider] = str(exc)
 
-                self._last_errors[
-                    symbol
-                ] = dict(errors)
+                self._last_errors[symbol] = dict(
+                    errors
+                )
 
                 continue
 
@@ -1715,14 +1393,12 @@ class DataRouter:
 
             error_text = " | ".join(
                 f"{provider} ({symbol}) : {message}"
-                for provider, message
-                in errors.items()
+                for provider, message in errors.items()
             )
 
             raise DataSourceError(
-                f"Aucune source disponible "
-                f"pour {symbol} "
-                f"[{asset_type}/{interval}]. "
+                f"Aucune source disponible pour "
+                f"{symbol} [{asset_type}/{interval}]. "
                 f"{error_text}"
             )
 
@@ -1736,62 +1412,48 @@ class DataRouter:
         )
 
         best_df = best_df.copy()
+        best_df.attrs = dict(best_df.attrs)
 
-        best_df.attrs[
-            "quality_score"
-        ] = best_quality
-
-        best_df.attrs[
-            "provider"
-        ] = best_provider
+        best_df.attrs["quality_score"] = (
+            best_quality
+        )
+        best_df.attrs["provider"] = (
+            best_provider
+        )
 
         if self.cache_enabled:
-
-            self._cache[
-                cache_key
-            ] = best_df.copy()
+            self._cache[cache_key] = best_df.copy()
+            self._cache[cache_key].attrs = dict(
+                best_df.attrs
+            )
 
         return best_df
 
 
-# ======================================================================
-# COMPATIBILITÉ GLOBALE
-# ======================================================================
-
 def get_twelve_data_budget():
-
     DataRouter._reset_td_day_if_needed()
 
     with DataRouter._td_lock:
-
         return {
             "daily_limit": TD_DAILY_LIMIT,
             "used": DataRouter._td_used,
             "remaining": max(
                 0,
-                TD_DAILY_LIMIT
-                - DataRouter._td_used,
+                TD_DAILY_LIMIT - DataRouter._td_used,
             ),
         }
 
 
 def twelve_data_budget():
-
     return get_twelve_data_budget()
 
-
-# ======================================================================
-# COMPATIBILITÉ — ANCIENNES FONCTIONS
-# ======================================================================
 
 def klines_yahoo(
     symbol,
     interval="15m",
     limit=1000,
 ):
-
     router = DataRouter()
-
     return router._fetch_yahoo(
         symbol,
         interval,
@@ -1804,9 +1466,7 @@ def klines_twelvedata(
     interval="15m",
     limit=1000,
 ):
-
     router = DataRouter()
-
     return router._fetch_twelvedata(
         symbol,
         interval,
