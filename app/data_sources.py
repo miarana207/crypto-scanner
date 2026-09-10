@@ -1,624 +1,1425 @@
 """
-V4.2 — Routeur intelligent multi-sources.
+V4.2 — Moteur de données multi-sources.
 
 Sources :
-    Binance
-        Crypto — source principale et unique.
+    - Binance
+    - Yahoo Finance
+    - Finnhub
+    - Twelve Data
 
-    Finnhub
-        Actions — priorité élevée.
-        Forex — tentative lorsque disponible.
-        Volume actions conservé lorsqu'il est fourni.
-
-    Yahoo Finance
-        Actions
-        Indices
-        Futures / matières premières
-        Forex de secours.
-
-    Twelve Data
-        Source de secours intelligente.
-        Budget quotidien partagé.
-
-Principes V4.2 :
-    - aucune dépendance à backtest.py ;
-    - choix dynamique des fournisseurs ;
-    - fallback automatique ;
-    - cache des requêtes identiques ;
-    - volume absent = NaN, jamais 0 ;
-    - couverture volume >= 80 % = volume exploitable ;
-    - agrégation correcte des bougies 1H -> 4H ;
-    - exclusion des bougies incomplètes ;
-    - pas de retry inutile sur Twelve Data ;
-    - compteur Twelve Data partagé entre toutes les instances ;
-    - diagnostic du fournisseur réellement utilisé.
+Principes :
+    - Routage intelligent selon le type d'actif.
+    - Fallback automatique entre fournisseurs.
+    - Priorité aux sources gratuites hors Twelve Data.
+    - Utilisation de Twelve Data uniquement lorsque nécessaire.
+    - Quota Twelve Data partagé pendant toute l'exécution.
+    - Cache des requêtes identiques.
+    - Gestion robuste des volumes absents.
+    - Suppression des bougies incomplètes.
+    - Agrégation correcte des intervalles 2h / 4h.
 """
 
+from __future__ import annotations
+
+import copy
+import math
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import requests
-from dotenv import load_dotenv
 
 
-load_dotenv()
+# ============================================================
+# CONFIGURATION GÉNÉRALE
+# ============================================================
 
-
-# ======================================================================
-# CONFIGURATION
-# ======================================================================
-
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
-
-# Binance public market-data API
 BINANCE_DATA_URL = os.getenv(
     "BINANCE_DATA_URL",
     "https://data-api.binance.vision",
 ).rstrip("/")
 
-# Alias de compatibilité éventuelle
+# Alias de compatibilité éventuel.
 BINANCE_URL = BINANCE_DATA_URL
 
-YAHOO_BASE = (
-    "https://query1.finance.yahoo.com/v8/finance/chart/"
+YAHOO_BASE_URL = os.getenv(
+    "YAHOO_BASE_URL",
+    "https://query1.finance.yahoo.com",
+).rstrip("/")
+
+FINNHUB_BASE_URL = os.getenv(
+    "FINNHUB_BASE_URL",
+    "https://finnhub.io/api/v1",
+).rstrip("/")
+
+TWELVE_DATA_BASE_URL = os.getenv(
+    "TWELVE_DATA_BASE_URL",
+    "https://api.twelvedata.com",
+).rstrip("/")
+
+
+# ============================================================
+# CLÉS API
+# ============================================================
+
+TWELVE_DATA_API_KEY = (
+    os.getenv("TWELVE_DATA_API_KEY")
+    or os.getenv("TWELVEDATA_API_KEY")
+    or ""
+).strip()
+
+FINNHUB_API_KEY = (
+    os.getenv("FINNHUB_API_KEY")
+    or os.getenv("FINNHUB_API_TOKEN")
+    or ""
+).strip()
+
+
+# ============================================================
+# VOLUME
+# ============================================================
+
+VOLUME_CONFIRMED = "VOLUME_CONFIRMED"
+VOLUME_PARTIAL = "VOLUME_PARTIAL"
+VOLUME_UNAVAILABLE = "VOLUME_UNAVAILABLE"
+
+VOLUME_COVERAGE_THRESHOLD = float(
+    os.getenv("VOLUME_COVERAGE_THRESHOLD", "0.80")
 )
 
-TWELVE_DATA_BASE = (
-    "https://api.twelvedata.com/time_series"
-)
 
-FINNHUB_CANDLE_BASE = (
-    "https://finnhub.io/api/v1/stock/candle"
-)
+# ============================================================
+# TWELVE DATA — BUDGET JOURNALIER
+# ============================================================
 
-FINNHUB_FOREX_CANDLE_BASE = (
-    "https://finnhub.io/api/v1/forex/candle"
-)
-
-REQUEST_TIMEOUT = 30
-
-VOLUME_MIN_COVERAGE = float(
-    os.getenv("VOLUME_MIN_COVERAGE", "0.80")
-)
-
-TWELVE_DATA_DAILY_BUDGET = int(
+# Le scanner doit pouvoir exploiter au maximum le quota gratuit
+# configuré. Valeur par défaut : 800 crédits/jour.
+TD_DAILY_LIMIT = int(
     os.getenv(
-        "TWELVE_DATA_DAILY_BUDGET",
-        os.getenv(
-            "TWELVE_DATA_DAILY_LIMIT",
-            "800",
-        ),
+        "TWELVE_DATA_DAILY_LIMIT",
+        os.getenv("TWELVE_DATA_DAILY_CREDITS", "800"),
     )
 )
 
-# Alias de compatibilité
-TWELVE_DATA_DAILY_LIMIT = TWELVE_DATA_DAILY_BUDGET
+TWELVE_DATA_DAILY_LIMIT = TD_DAILY_LIMIT
 
 
-# ======================================================================
-# SESSION HTTP
-# ======================================================================
-
-_SESSION = requests.Session()
-
-_SESSION.headers.update(
-    {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(compatible; crypto-scanner-v4.2/1.0)"
-        )
-    }
-)
-
-
-# ======================================================================
-# STRUCTURE STANDARD
-# ======================================================================
-
-OHLCV_COLUMNS = [
-    "open_time",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-]
-
+# ============================================================
+# EXCEPTIONS
+# ============================================================
 
 class DataSourceError(RuntimeError):
-    """Erreur standard du routeur de données."""
+    """Erreur lorsqu'aucune source ne peut fournir les données."""
 
 
-# ======================================================================
-# CACHE
-# ======================================================================
-
-_CACHE = {}
-_CACHE_LOCK = threading.Lock()
+class ProviderError(RuntimeError):
+    """Erreur provenant d'un fournisseur de données."""
 
 
-def _cache_key(
-    provider,
-    symbol,
-    interval,
-    limit,
-    asset_type,
-):
-    return (
-        str(provider).lower(),
-        str(symbol),
-        str(interval).lower(),
-        int(limit),
-        str(asset_type).lower(),
-    )
+# ============================================================
+# OUTILS
+# ============================================================
 
-
-def _cache_get(key):
-    with _CACHE_LOCK:
-        value = _CACHE.get(key)
-
-        if value is None:
-            return None
-
-        return value.copy(deep=True)
-
-
-def _cache_set(key, df):
-    with _CACHE_LOCK:
-        _CACHE[key] = df.copy(deep=True)
-
-
-def clear_cache():
-    with _CACHE_LOCK:
-        _CACHE.clear()
-
-
-# ======================================================================
-# STATISTIQUES
-# ======================================================================
-
-_ROUTER_STATS = {
-    "requests": 0,
-    "success": 0,
-    "errors": 0,
-    "cache_hits": 0,
-    "binance": 0,
-    "finnhub": 0,
-    "yahoo": 0,
-    "twelvedata": 0,
-    "fallbacks": 0,
-}
-
-_STATS_LOCK = threading.Lock()
-
-
-def _stats_increment(key, amount=1):
-    with _STATS_LOCK:
-        _ROUTER_STATS[key] = (
-            _ROUTER_STATS.get(key, 0)
-            + amount
-        )
-
-
-# ======================================================================
-# BUDGET TWELVE DATA
-# ======================================================================
-
-class _TwelveDataBudget:
+def interval_to_minutes(interval: str) -> int:
     """
-    Compteur Twelve Data partagé au niveau du processus.
+    Convertit un intervalle en minutes.
 
-    Toutes les instances de DataRouter utilisent le même compteur.
+    Exemples :
+        1m   -> 1
+        15m  -> 15
+        1h   -> 60
+        4h   -> 240
+        1d   -> 1440
     """
+    if not interval:
+        raise ValueError("Intervalle vide.")
 
-    used = 0
-    day = None
-    lock = threading.Lock()
+    value = str(interval).strip().lower()
 
-    @classmethod
-    def _reset_if_needed(cls):
-        today = datetime.now(
-            timezone.utc
-        ).date()
+    mapping = {
+        "1m": 1,
+        "5m": 5,
+        "15m": 15,
+        "30m": 30,
+        "45m": 45,
+        "1h": 60,
+        "2h": 120,
+        "4h": 240,
+        "1d": 1440,
+        "1w": 10080,
+        "1wk": 10080,
+    }
 
-        if cls.day != today:
-            cls.day = today
-            cls.used = 0
+    if value in mapping:
+        return mapping[value]
 
-    @classmethod
-    def reserve(cls):
-        with cls.lock:
-            cls._reset_if_needed()
-
-            if cls.used >= TWELVE_DATA_DAILY_BUDGET:
-                return False
-
-            cls.used += 1
-            return True
-
-    @classmethod
-    def used_today(cls):
-        with cls.lock:
-            cls._reset_if_needed()
-            return cls.used
-
-    @classmethod
-    def remaining(cls):
-        with cls.lock:
-            cls._reset_if_needed()
-
-            return max(
-                0,
-                TWELVE_DATA_DAILY_BUDGET - cls.used,
-            )
-
-
-# ======================================================================
-# STATISTIQUES PUBLIQUES
-# ======================================================================
-
-def router_stats():
-    with _STATS_LOCK:
-        stats = dict(_ROUTER_STATS)
-
-    stats.update(
-        {
-            "twelvedata_used":
-                _TwelveDataBudget.used_today(),
-
-            "twelvedata_remaining":
-                _TwelveDataBudget.remaining(),
-
-            "twelvedata_budget":
-                TWELVE_DATA_DAILY_BUDGET,
-        }
-    )
-
-    return stats
-
-
-def get_router_stats():
-    return router_stats()
-
-
-# ======================================================================
-# UTILITAIRES
-# ======================================================================
-
-def normalize_interval(interval):
-    return str(
-        interval
-    ).strip().lower()
-
-
-def interval_to_seconds(interval):
-    value = normalize_interval(interval)
+    if value.endswith("min"):
+        return int(value[:-3])
 
     if value.endswith("m"):
-        return int(value[:-1]) * 60
+        return int(value[:-1])
 
     if value.endswith("h"):
-        return int(value[:-1]) * 3600
+        return int(value[:-1]) * 60
 
     if value.endswith("d"):
-        return int(value[:-1]) * 86400
+        return int(value[:-1]) * 1440
 
     if value.endswith("w"):
-        return int(value[:-1]) * 604800
+        return int(value[:-1]) * 10080
 
-    return 60
-
-
-def empty_ohlcv():
-    return pd.DataFrame(
-        columns=OHLCV_COLUMNS
-    )
+    raise ValueError(f"Intervalle non supporté : {interval}")
 
 
-def ensure_ohlcv(df):
+def _interval_to_twelve_data(interval: str) -> str:
+    """Format d'intervalle Twelve Data."""
+    value = str(interval).lower().strip()
+
+    mapping = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "45m": "45min",
+        "1h": "1h",
+        "2h": "2h",
+        "4h": "4h",
+        "1d": "1day",
+        "1w": "1week",
+        "1wk": "1week",
+    }
+
+    return mapping.get(value, value)
+
+
+def _interval_to_yahoo(interval: str) -> str:
+    """Format d'intervalle Yahoo."""
+    value = str(interval).lower().strip()
+
+    mapping = {
+        "1m": "1m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "45m": "15m",
+        "1h": "1h",
+        "2h": "1h",
+        "4h": "1h",
+        "1d": "1d",
+        "1w": "1wk",
+        "1wk": "1wk",
+    }
+
+    return mapping.get(value, value)
+
+
+def _interval_to_finnhub(interval: str) -> str:
+    """Format d'intervalle Finnhub."""
+    value = str(interval).lower().strip()
+
+    mapping = {
+        "1m": "1",
+        "5m": "5",
+        "15m": "15",
+        "30m": "30",
+        "45m": "15",
+        "1h": "60",
+        "2h": "60",
+        "4h": "60",
+        "1d": "D",
+        "1w": "W",
+        "1wk": "W",
+    }
+
+    return mapping.get(value, value)
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        x = float(value)
+        return x if math.isfinite(x) else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _deepcopy_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Copie dataframe + attrs."""
+    result = df.copy(deep=True)
+    result.attrs = copy.deepcopy(df.attrs)
+    return result
+
+
+# ============================================================
+# DATA ROUTER
+# ============================================================
+
+class DataRouter:
     """
-    Normalise systématiquement la structure OHLCV.
+    Routeur intelligent V4.2.
+
+    Un seul objet DataRouter doit idéalement être utilisé pendant
+    toute une exécution du scanner.
     """
 
-    if df is None:
-        return empty_ohlcv()
+    _td_lock = threading.Lock()
+    _td_date: Optional[str] = None
+    _td_used: int = 0
 
-    d = df.copy()
+    def __init__(
+        self,
+        session: Optional[requests.Session] = None,
+        timeout: int = 20,
+    ):
+        self.session = session or requests.Session()
+        self.timeout = int(timeout)
 
-    for column in OHLCV_COLUMNS:
-        if column not in d.columns:
-            d[column] = float("nan")
+        self._cache: Dict[Tuple[Any, ...], pd.DataFrame] = {}
+        self._cache_hits = 0
 
-    d["open_time"] = pd.to_datetime(
-        d["open_time"],
-        utc=True,
-        errors="coerce",
-    )
+        self._calls = 0
+        self._successes = 0
+        self._failures = 0
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]:
-        d[column] = pd.to_numeric(
-            d[column],
-            errors="coerce",
+        self._provider_calls: Dict[str, int] = {
+            "binance": 0,
+            "yahoo": 0,
+            "finnhub": 0,
+            "twelve_data": 0,
+        }
+
+        self._provider_successes: Dict[str, int] = {
+            "binance": 0,
+            "yahoo": 0,
+            "finnhub": 0,
+            "twelve_data": 0,
+        }
+
+        self._provider_failures: Dict[str, int] = {
+            "binance": 0,
+            "yahoo": 0,
+            "finnhub": 0,
+            "twelve_data": 0,
+        }
+
+        self._volume_status_counts: Dict[str, int] = {
+            VOLUME_CONFIRMED: 0,
+            VOLUME_PARTIAL: 0,
+            VOLUME_UNAVAILABLE: 0,
+        }
+
+        self._last_errors: Dict[str, List[str]] = {}
+
+        self.session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(compatible; CryptoScanner-V4.2/1.0)"
+                )
+            }
         )
 
-    d = d.dropna(
-        subset=[
+    # ========================================================
+    # QUOTA TWELVE DATA
+    # ========================================================
+
+    @classmethod
+    def _reset_td_counter_if_needed(cls) -> None:
+        today = datetime.now(timezone.utc).date().isoformat()
+
+        with cls._td_lock:
+            if cls._td_date != today:
+                cls._td_date = today
+                cls._td_used = 0
+
+    @classmethod
+    def twelve_data_used_count(cls) -> int:
+        cls._reset_td_counter_if_needed()
+        with cls._td_lock:
+            return cls._td_used
+
+    @classmethod
+    def twelve_data_remaining_count(cls) -> int:
+        cls._reset_td_counter_if_needed()
+        with cls._td_lock:
+            return max(0, TD_DAILY_LIMIT - cls._td_used)
+
+    @classmethod
+    def _reserve_twelve_data_credit(cls) -> bool:
+        cls._reset_td_counter_if_needed()
+
+        with cls._td_lock:
+            if cls._td_used >= TD_DAILY_LIMIT:
+                return False
+
+            cls._td_used += 1
+            return True
+
+    @property
+    def twelve_data_used(self) -> int:
+        return self.twelve_data_used_count()
+
+    @property
+    def twelve_data_remaining(self) -> int:
+        return self.twelve_data_remaining_count()
+
+    @property
+    def twelvedata_used(self) -> int:
+        return self.twelve_data_used_count()
+
+    @property
+    def twelvedata_remaining(self) -> int:
+        return self.twelve_data_remaining_count()
+
+    @property
+    def td_used(self) -> int:
+        return self.twelve_data_used_count()
+
+    @property
+    def td_remaining(self) -> int:
+        return self.twelve_data_remaining_count()
+
+    def get_twelve_data_budget(self) -> Dict[str, Any]:
+        return {
+            "daily_limit": TD_DAILY_LIMIT,
+            "used": self.twelve_data_used_count(),
+            "remaining": self.twelve_data_remaining_count(),
+        }
+
+    # ========================================================
+    # STATISTIQUES
+    # ========================================================
+
+    def router_stats(self) -> Dict[str, Any]:
+        return {
+            "calls": self._calls,
+            "successes": self._successes,
+            "failures": self._failures,
+            "cache_hits": self._cache_hits,
+            "provider_calls": dict(self._provider_calls),
+            "provider_successes": dict(self._provider_successes),
+            "provider_failures": dict(self._provider_failures),
+            "volume_status": dict(self._volume_status_counts),
+            "twelve_data": self.get_twelve_data_budget(),
+            "last_errors": copy.deepcopy(self._last_errors),
+        }
+
+    def stats(self) -> Dict[str, Any]:
+        return self.router_stats()
+
+    def get_stats(self) -> Dict[str, Any]:
+        return self.router_stats()
+
+    # ========================================================
+    # NORMALISATION SYMBOL MAP
+    # ========================================================
+
+    def _resolve_symbol(
+        self,
+        symbol: str,
+        provider: str,
+        symbol_map: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Résout le symbole pour un fournisseur.
+
+        Supporte plusieurs structures :
+
+        {
+            "yahoo": "^GSPC",
+            "finnhub": "^GSPC",
+            "twelve_data": "SPX"
+        }
+
+        ou :
+
+        {
+            "^GSPC": {
+                "yahoo": "^GSPC",
+                "finnhub": "^GSPC"
+            }
+        }
+        """
+
+        if not symbol_map:
+            return symbol
+
+        provider_keys = {
+            "twelve_data": [
+                "twelve_data",
+                "twelvedata",
+                "td",
+            ],
+            "finnhub": [
+                "finnhub",
+            ],
+            "yahoo": [
+                "yahoo",
+            ],
+            "binance": [
+                "binance",
+            ],
+        }
+
+        # Cas 1 : mapping directement fournisseur -> symbole.
+        if isinstance(symbol_map, dict):
+            direct_value = symbol_map.get(provider)
+
+            if direct_value is None:
+                for key in provider_keys.get(provider, []):
+                    if key in symbol_map:
+                        direct_value = symbol_map[key]
+                        break
+
+            if isinstance(direct_value, str):
+                return direct_value
+
+            # Cas 2 : symbol_map contient le symbole original.
+            nested = symbol_map.get(symbol)
+
+            if isinstance(nested, str):
+                return nested
+
+            if isinstance(nested, dict):
+                for key in [provider] + provider_keys.get(
+                    provider, []
+                ):
+                    value = nested.get(key)
+
+                    if isinstance(value, str):
+                        return value
+
+        return symbol
+
+    # ========================================================
+    # TYPE D'ACTIF
+    # ========================================================
+
+    @staticmethod
+    def _normalise_asset_type(asset_type: str) -> str:
+        value = str(asset_type or "stock").lower().strip()
+
+        aliases = {
+            "stocks": "stock",
+            "actions": "stock",
+            "equity": "stock",
+            "equities": "stock",
+            "forex": "forex",
+            "fx": "forex",
+            "currency": "forex",
+            "currencies": "forex",
+            "indices": "index",
+            "indice": "index",
+            "index": "index",
+            "crypto": "crypto",
+            "cryptocurrency": "crypto",
+            "cryptocurrencies": "crypto",
+            "commodities": "commodity",
+            "commodity": "commodity",
+            "matiere": "commodity",
+            "matières": "commodity",
+        }
+
+        return aliases.get(value, value)
+
+    # ========================================================
+    # ORDRE DES FOURNISSEURS
+    # ========================================================
+
+    def _provider_candidates(
+        self,
+        asset_type: str,
+        preferred: Optional[str],
+    ) -> List[str]:
+        """
+        Détermine l'ordre intelligent des fournisseurs.
+
+        Objectif :
+            1. sources gratuites
+            2. source avec volume
+            3. Twelve Data en dernier recours
+        """
+
+        asset_type = self._normalise_asset_type(asset_type)
+
+        if preferred:
+            preferred = str(preferred).lower().strip()
+
+        if asset_type == "crypto":
+            base = [
+                "binance",
+                "yahoo",
+                "twelve_data",
+            ]
+
+        elif asset_type == "stock":
+            base = [
+                "finnhub",
+                "yahoo",
+                "twelve_data",
+            ]
+
+        elif asset_type == "forex":
+            base = [
+                "finnhub",
+                "yahoo",
+                "twelve_data",
+            ]
+
+        elif asset_type == "index":
+            base = [
+                "yahoo",
+                "finnhub",
+                "twelve_data",
+            ]
+
+        elif asset_type == "commodity":
+            base = [
+                "yahoo",
+                "finnhub",
+                "twelve_data",
+            ]
+
+        else:
+            base = [
+                "yahoo",
+                "finnhub",
+                "twelve_data",
+            ]
+
+        if preferred and preferred in base:
+            base.remove(preferred)
+            base.insert(0, preferred)
+
+        return base
+
+    # ========================================================
+    # HTTP
+    # ========================================================
+
+    def _request_json(
+        self,
+        provider: str,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+
+        provider = provider.lower()
+
+        self._calls += 1
+        self._provider_calls[provider] = (
+            self._provider_calls.get(provider, 0) + 1
+        )
+
+        try:
+            response = self.session.get(
+                url,
+                params=params,
+                timeout=self.timeout,
+            )
+
+            if response.status_code == 429:
+                raise ProviderError(
+                    f"{provider}: HTTP 429 — limite atteinte."
+                )
+
+            if response.status_code >= 500:
+                raise ProviderError(
+                    f"{provider}: HTTP {response.status_code}."
+                )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            if not isinstance(data, dict):
+                raise ProviderError(
+                    f"{provider}: réponse JSON inattendue."
+                )
+
+            self._provider_successes[provider] = (
+                self._provider_successes.get(provider, 0) + 1
+            )
+
+            return data
+
+        except Exception:
+            self._provider_failures[provider] = (
+                self._provider_failures.get(provider, 0) + 1
+            )
+            raise
+
+    # ========================================================
+    # DATAFRAME CANONIQUE
+    # ========================================================
+
+    @staticmethod
+    def _canonicalize(
+        rows: Iterable[Dict[str, Any]],
+    ) -> pd.DataFrame:
+
+        df = pd.DataFrame(list(rows))
+
+        columns = [
             "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
-    )
-
-    d = (
-        d.sort_values("open_time")
-        .drop_duplicates(
-            subset=["open_time"],
-            keep="last",
-        )
-        .reset_index(drop=True)
-    )
-
-    return d[OHLCV_COLUMNS]
-
-
-def volume_coverage(df):
-    """
-    Pourcentage de bougies disposant d'un volume réel.
-
-    Un volume manquant reste NaN.
-    """
-
-    if df is None or df.empty:
-        return 0.0
-
-    if "volume" not in df.columns:
-        return 0.0
-
-    volume = pd.to_numeric(
-        df["volume"],
-        errors="coerce",
-    )
-
-    return float(
-        volume.notna().mean()
-    )
-
-
-def volume_status(df):
-    coverage = volume_coverage(df)
-
-    if coverage >= VOLUME_MIN_COVERAGE:
-        return "VOLUME_CONFIRMED"
-
-    if coverage > 0:
-        return "VOLUME_PARTIAL"
-
-    return "VOLUME_UNAVAILABLE"
-
-
-def attach_metadata(
-    df,
-    provider,
-    provider_symbol=None,
-    asset_type=None,
-):
-    d = ensure_ohlcv(df)
-
-    status = volume_status(d)
-
-    d.attrs["provider"] = provider
-
-    d.attrs["provider_symbol"] = (
-        provider_symbol
-        if provider_symbol is not None
-        else ""
-    )
-
-    d.attrs["asset_type"] = (
-        asset_type
-        if asset_type is not None
-        else ""
-    )
-
-    d.attrs["volume_coverage"] = (
-        volume_coverage(d)
-    )
-
-    d.attrs["volume_status"] = status
-
-    d.attrs["volume_available"] = (
-        status == "VOLUME_CONFIRMED"
-    )
-
-    if not d.empty:
-        last = pd.Timestamp(
-            d["open_time"].iloc[-1]
-        )
-
-        now = pd.Timestamp.now(
-            tz="UTC"
-        )
-
-        d.attrs["last_candle"] = last
-
-        d.attrs["age_minutes"] = (
-            now - last
-        ).total_seconds() / 60.0
-
-    else:
-        d.attrs["last_candle"] = None
-        d.attrs["age_minutes"] = None
-
-    return d
-
-
-def keep_completed_candles(
-    df,
-    interval,
-):
-    """
-    Supprime la bougie actuellement en formation.
-    """
-
-    if df is None or df.empty:
-        return empty_ohlcv()
-
-    d = ensure_ohlcv(df)
-
-    if d.empty:
-        return d
-
-    seconds = interval_to_seconds(
-        interval
-    )
-
-    now = pd.Timestamp.now(
-        tz="UTC"
-    )
-
-    completed = (
-        (
-            now - d["open_time"]
-        ).dt.total_seconds()
-        >= seconds
-    )
-
-    return (
-        d.loc[completed]
-        .copy()
-        .reset_index(drop=True)
-    )
-
-
-def _completed_limit(
-    limit,
-    interval,
-):
-    limit = max(
-        1,
-        int(limit),
-    )
-
-    interval = normalize_interval(
-        interval
-    )
-
-    if interval == "4h":
-        return min(
-            5000,
-            limit * 4 + 24,
-        )
-
-    if interval == "2h":
-        return min(
-            5000,
-            limit * 2 + 20,
-        )
-
-    return min(
-        5000,
-        limit + 20,
-    )
-
-
-# ======================================================================
-# AGRÉGATION OHLCV
-# ======================================================================
-
-def aggregate_ohlcv(
-    df,
-    target_interval,
-):
-    """
-    Agrégation OHLCV.
-
-    Le volume agrégé est conservé uniquement si toutes les
-    bougies composantes disposent d'un volume réel.
-    """
-
-    if df is None or df.empty:
-        return empty_ohlcv()
-
-    d = ensure_ohlcv(df)
-
-    if d.empty:
-        return d
-
-    target = normalize_interval(
-        target_interval
-    )
-
-    if target == "4h":
-        rule = "4h"
-        expected_children = 4
-
-    elif target == "2h":
-        rule = "2h"
-        expected_children = 2
-
-    elif target == "1h":
-        return d
-
-    else:
-        raise ValueError(
-            "Intervalle d'agrégation non supporté : "
-            f"{target_interval}"
-        )
-
-    x = d.set_index(
-        "open_time"
-    )
-
-    grouped = x[
-        [
             "open",
             "high",
             "low",
             "close",
             "volume",
         ]
-    ].resample(
-        rule,
-        label="left",
-        closed="left",
-    )
 
-    result = grouped.agg(
-        {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
+        if df.empty:
+            return pd.DataFrame(columns=columns)
+
+        for column in columns:
+            if column not in df.columns:
+                df[column] = np.nan
+
+        df = df[columns].copy()
+
+        df["open_time"] = pd.to_datetime(
+            df["open_time"],
+            utc=True,
+            errors="coerce",
+        )
+
+        for column in [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]:
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
+
+        df = df.dropna(
+            subset=[
+                "open_time",
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        )
+
+        df = (
+            df.sort_values("open_time")
+            .drop_duplicates(
+                "open_time",
+                keep="last",
+            )
+            .reset_index(drop=True)
+        )
+
+        return df
+
+    # ========================================================
+    # VOLUME
+    # ========================================================
+
+    @staticmethod
+    def _volume_status(
+        df: pd.DataFrame,
+    ) -> Tuple[str, float]:
+        if df.empty or "volume" not in df.columns:
+            return VOLUME_UNAVAILABLE, 0.0
+
+        numeric = pd.to_numeric(
+            df["volume"],
+            errors="coerce",
+        )
+
+        available = numeric.notna()
+
+        coverage = (
+            float(available.mean())
+            if len(available)
+            else 0.0
+        )
+
+        if available.sum() == 0:
+            return VOLUME_UNAVAILABLE, coverage
+
+        if coverage >= VOLUME_COVERAGE_THRESHOLD:
+            return VOLUME_CONFIRMED, coverage
+
+        return VOLUME_PARTIAL, coverage
+
+    # ========================================================
+    # BOUGIE INCOMPLÈTE
+    # ========================================================
+
+    @staticmethod
+    def _drop_incomplete_last_candle(
+        df: pd.DataFrame,
+        interval: str,
+    ) -> pd.DataFrame:
+
+        if df.empty:
+            return df
+
+        minutes = interval_to_minutes(interval)
+
+        last_time = pd.Timestamp(
+            df.iloc[-1]["open_time"]
+        )
+
+        if last_time.tzinfo is None:
+            last_time = last_time.tz_localize("UTC")
+        else:
+            last_time = last_time.tz_convert("UTC")
+
+        now = _utc_now()
+
+        # Une bougie est considérée complète seulement si
+        # son intervalle est entièrement écoulé.
+        candle_end = last_time + pd.Timedelta(
+            minutes=minutes
+        )
+
+        if candle_end > now:
+            return df.iloc[:-1].reset_index(drop=True)
+
+        return df.reset_index(drop=True)
+
+    # ========================================================
+    # MÉTADONNÉES
+    # ========================================================
+
+    @staticmethod
+    def _attach_metadata(
+        df: pd.DataFrame,
+        provider: str,
+        provider_symbol: str,
+        requested_interval: str,
+    ) -> pd.DataFrame:
+
+        df = df.copy()
+
+        if df.empty:
+            status = VOLUME_UNAVAILABLE
+            coverage = 0.0
+            last_candle = pd.NaT
+            age_minutes = float("nan")
+
+        else:
+            status, coverage = DataRouter._volume_status(df)
+
+            last_candle = pd.Timestamp(
+                df.iloc[-1]["open_time"]
+            )
+
+            if last_candle.tzinfo is None:
+                last_candle = last_candle.tz_localize("UTC")
+            else:
+                last_candle = last_candle.tz_convert("UTC")
+
+            age_minutes = (
+                _utc_now() - last_candle
+            ).total_seconds() / 60.0
+
+        df.attrs["provider"] = provider
+        df.attrs["provider_symbol"] = provider_symbol
+        df.attrs["requested_interval"] = requested_interval
+        df.attrs["volume_status"] = status
+        df.attrs["volume_coverage"] = coverage
+        df.attrs["last_candle"] = last_candle
+        df.attrs["age_minutes"] = age_minutes
+
+        # "stale" n'est pas automatiquement synonyme de marché fermé.
+        # On fournit l'information au scanner mais on ne détruit pas
+        # les données simplement parce qu'un marché est fermé.
+        interval_minutes = interval_to_minutes(
+            requested_interval
+        )
+
+        df.attrs["is_stale"] = bool(
+            pd.notna(age_minutes)
+            and age_minutes > max(
+                interval_minutes * 3,
+                180,
+            )
+        )
+
+        return df
+
+    # ========================================================
+    # BINANCE
+    # ========================================================
+
+    def _fetch_binance(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+    ) -> pd.DataFrame:
+
+        url = f"{BINANCE_DATA_URL}/api/v3/klines"
+
+        params = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "limit": min(int(limit), 1000),
         }
-    )
 
-    volume_sum = grouped[
-        "volume"
-    ].sum(
-        min_count=1
-    )
+        data = self._request_json(
+            "binance",
+            url,
+            params,
+        )
 
-    volume_count = grouped[
-        "volume"
-    ].count()
+        # Binance renvoie une liste, pas un dict.
+        # _request_json est donc inadapté à ce endpoint.
+        # Ce bloc ne devrait pas être atteint normalement.
+        if isinstance(data, list):
+            raw = data
+        else:
+            raw = data.get("data", [])
 
-    result["volume"] = volume_sum.where(
-        volume_count == expected_children
-    )
+        rows = []
 
-    result = (
-        result.dropna(
+        for item in raw:
+            if len(item) < 6:
+                continue
+
+            rows.append(
+                {
+                    "open_time": pd.to_datetime(
+                        item[0],
+                        unit="ms",
+                        utc=True,
+                        errors="coerce",
+                    ),
+                    "open": item[1],
+                    "high": item[2],
+                    "low": item[3],
+                    "close": item[4],
+                    "volume": item[5],
+                }
+            )
+
+        return self._canonicalize(rows)
+
+    def _fetch_binance_direct(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+    ) -> pd.DataFrame:
+
+        url = f"{BINANCE_DATA_URL}/api/v3/klines"
+
+        params = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "limit": min(int(limit), 1000),
+        }
+
+        self._calls += 1
+        self._provider_calls["binance"] += 1
+
+        try:
+            response = self.session.get(
+                url,
+                params=params,
+                timeout=self.timeout,
+            )
+
+            response.raise_for_status()
+            raw = response.json()
+
+            if not isinstance(raw, list):
+                raise ProviderError(
+                    f"Binance: réponse inattendue pour {symbol}."
+                )
+
+            self._provider_successes["binance"] += 1
+
+            rows = []
+
+            for item in raw:
+                if len(item) < 6:
+                    continue
+
+                rows.append(
+                    {
+                        "open_time": pd.to_datetime(
+                            item[0],
+                            unit="ms",
+                            utc=True,
+                            errors="coerce",
+                        ),
+                        "open": item[1],
+                        "high": item[2],
+                        "low": item[3],
+                        "close": item[4],
+                        "volume": item[5],
+                    }
+                )
+
+            return self._canonicalize(rows)
+
+        except Exception:
+            self._provider_failures["binance"] += 1
+            raise
+
+    # ========================================================
+    # YAHOO FINANCE
+    # ========================================================
+
+    def _fetch_yahoo_raw(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+    ) -> pd.DataFrame:
+
+        yahoo_interval = _interval_to_yahoo(interval)
+        requested_minutes = interval_to_minutes(interval)
+
+        raw_minutes = interval_to_minutes(
+            yahoo_interval
+        )
+
+        candles_needed = max(
+            int(limit),
+            120,
+        )
+
+        # Marge pour les marchés fermés / agrégation.
+        total_minutes = (
+            candles_needed
+            * raw_minutes
+            * 2
+        )
+
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(
+            minutes=total_minutes
+        )
+
+        url = (
+            f"{YAHOO_BASE_URL}/v8/finance/chart/"
+            f"{symbol}"
+        )
+
+        params = {
+            "period1": int(start.timestamp()),
+            "period2": int(end.timestamp()),
+            "interval": yahoo_interval,
+            "events": "history",
+            "includeAdjustedClose": "true",
+        }
+
+        data = self._request_json(
+            "yahoo",
+            url,
+            params,
+        )
+
+        chart = data.get("chart", {})
+        result = chart.get("result")
+
+        if not result:
+            error = chart.get("error")
+            raise ProviderError(
+                f"Yahoo: aucune donnée pour {symbol}. "
+                f"{error or ''}"
+            )
+
+        result = result[0]
+
+        timestamps = result.get("timestamp", [])
+        indicators = result.get(
+            "indicators",
+            {},
+        )
+
+        quote_list = indicators.get(
+            "quote",
+            [],
+        )
+
+        if not timestamps or not quote_list:
+            raise ProviderError(
+                f"Yahoo: données OHLC absentes pour {symbol}."
+            )
+
+        quote = quote_list[0]
+
+        opens = quote.get("open", [])
+        highs = quote.get("high", [])
+        lows = quote.get("low", [])
+        closes = quote.get("close", [])
+        volumes = quote.get("volume", [])
+
+        rows = []
+
+        for i, timestamp in enumerate(timestamps):
+            rows.append(
+                {
+                    "open_time": pd.to_datetime(
+                        timestamp,
+                        unit="s",
+                        utc=True,
+                        errors="coerce",
+                    ),
+                    "open": (
+                        opens[i]
+                        if i < len(opens)
+                        else np.nan
+                    ),
+                    "high": (
+                        highs[i]
+                        if i < len(highs)
+                        else np.nan
+                    ),
+                    "low": (
+                        lows[i]
+                        if i < len(lows)
+                        else np.nan
+                    ),
+                    "close": (
+                        closes[i]
+                        if i < len(closes)
+                        else np.nan
+                    ),
+                    "volume": (
+                        volumes[i]
+                        if i < len(volumes)
+                        else np.nan
+                    ),
+                }
+            )
+
+        df = self._canonicalize(rows)
+
+        if requested_minutes in {
+            120,
+            240,
+        }:
+            df = self._aggregate_intraday(
+                df,
+                requested_minutes,
+            )
+
+        elif requested_minutes == 45:
+            df = self._aggregate_intraday(
+                df,
+                45,
+            )
+
+        return df.tail(limit).reset_index(drop=True)
+
+    # ========================================================
+    # FINNHUB
+    # ========================================================
+
+    def _fetch_finnhub(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+        asset_type: str,
+    ) -> pd.DataFrame:
+
+        if not FINNHUB_API_KEY:
+            raise ProviderError(
+                "Finnhub: FINNHUB_API_KEY absente."
+            )
+
+        resolution = _interval_to_finnhub(interval)
+        minutes = interval_to_minutes(interval)
+
+        raw_resolution_minutes = (
+            int(resolution)
+            if resolution.isdigit()
+            else 1440
+        )
+
+        candles_needed = max(
+            int(limit),
+            120,
+        )
+
+        total_minutes = (
+            candles_needed
+            * raw_resolution_minutes
+            * 2
+        )
+
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(
+            minutes=total_minutes
+        )
+
+        endpoint = "stock/candle"
+
+        # Forex Finnhub utilise une API différente.
+        if self._normalise_asset_type(asset_type) == "forex":
+            endpoint = "forex/candle"
+
+        url = f"{FINNHUB_BASE_URL}/{endpoint}"
+
+        params = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "from": int(start.timestamp()),
+            "to": int(end.timestamp()),
+            "token": FINNHUB_API_KEY,
+        }
+
+        data = self._request_json(
+            "finnhub",
+            url,
+            params,
+        )
+
+        status = str(data.get("s", "")).lower()
+
+        if status != "ok":
+            raise ProviderError(
+                f"Finnhub: statut '{status}' pour {symbol}."
+            )
+
+        timestamps = data.get("t", [])
+        opens = data.get("o", [])
+        highs = data.get("h", [])
+        lows = data.get("l", [])
+        closes = data.get("c", [])
+        volumes = data.get("v", [])
+
+        if not timestamps:
+            raise ProviderError(
+                f"Finnhub: aucune donnée pour {symbol}."
+            )
+
+        rows = []
+
+        for i, timestamp in enumerate(timestamps):
+            rows.append(
+                {
+                    "open_time": pd.to_datetime(
+                        timestamp,
+                        unit="s",
+                        utc=True,
+                        errors="coerce",
+                    ),
+                    "open": (
+                        opens[i]
+                        if i < len(opens)
+                        else np.nan
+                    ),
+                    "high": (
+                        highs[i]
+                        if i < len(highs)
+                        else np.nan
+                    ),
+                    "low": (
+                        lows[i]
+                        if i < len(lows)
+                        else np.nan
+                    ),
+                    "close": (
+                        closes[i]
+                        if i < len(closes)
+                        else np.nan
+                    ),
+                    "volume": (
+                        volumes[i]
+                        if i < len(volumes)
+                        else np.nan
+                    ),
+                }
+            )
+
+        df = self._canonicalize(rows)
+
+        if minutes in {
+            120,
+            240,
+            45,
+        }:
+            df = self._aggregate_intraday(
+                df,
+                minutes,
+            )
+
+        return df.tail(limit).reset_index(drop=True)
+
+    # ========================================================
+    # TWELVE DATA
+    # ========================================================
+
+    def _fetch_twelve_data(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+    ) -> pd.DataFrame:
+
+        if not TWELVE_DATA_API_KEY:
+            raise ProviderError(
+                "Twelve Data: TWELVE_DATA_API_KEY absente."
+            )
+
+        # IMPORTANT :
+        # une requête Twelve Data = une unité de quota.
+        if not self._reserve_twelve_data_credit():
+            raise ProviderError(
+                "Twelve Data: quota journalier épuisé."
+            )
+
+        url = f"{TWELVE_DATA_BASE_URL}/time_series"
+
+        params = {
+            "symbol": symbol,
+            "interval": _interval_to_twelve_data(interval),
+            "outputsize": min(int(limit), 5000),
+            "timezone": "UTC",
+            "apikey": TWELVE_DATA_API_KEY,
+        }
+
+        data = self._request_json(
+            "twelve_data",
+            url,
+            params,
+        )
+
+        if "status" in data:
+            status = str(data.get("status")).lower()
+
+            if status == "error":
+                raise ProviderError(
+                    "Twelve Data: "
+                    + str(
+                        data.get(
+                            "message",
+                            "erreur inconnue",
+                        )
+                    )
+                )
+
+        values = data.get("values")
+
+        if not values:
+            raise ProviderError(
+                f"Twelve Data: aucune donnée pour {symbol}."
+            )
+
+        rows = []
+
+        for item in values:
+            rows.append(
+                {
+                    "open_time": item.get(
+                        "datetime"
+                    ),
+                    "open": item.get("open"),
+                    "high": item.get("high"),
+                    "low": item.get("low"),
+                    "close": item.get("close"),
+                    # IMPORTANT :
+                    # absence de volume = NaN,
+                    # jamais 0.
+                    "volume": item.get(
+                        "volume",
+                        np.nan,
+                    ),
+                }
+            )
+
+        df = self._canonicalize(rows)
+
+        return df.tail(limit).reset_index(drop=True)
+
+    # ========================================================
+    # AGRÉGATION 2H / 4H / 45M
+    # ========================================================
+
+    @staticmethod
+    def _aggregate_intraday(
+        df: pd.DataFrame,
+        target_minutes: int,
+    ) -> pd.DataFrame:
+
+        if df.empty:
+            return df
+
+        df = df.copy()
+
+        df["open_time"] = pd.to_datetime(
+            df["open_time"],
+            utc=True,
+            errors="coerce",
+        )
+
+        df = df.dropna(
+            subset=["open_time"]
+        )
+
+        df = df.set_index("open_time")
+
+        rule = f"{target_minutes}min"
+
+        grouped = df.resample(
+            rule,
+            origin="epoch",
+            label="left",
+            closed="left",
+        )
+
+        result = grouped.agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+            }
+        )
+
+        # ----------------------------------------------------
+        # Volume
+        #
+        # On ne somme les volumes que lorsque TOUTES les
+        # bougies sous-jacentes disposent d'un volume.
+        #
+        # Cela évite de fabriquer artificiellement un volume
+        # à partir de données partielles.
+        # ----------------------------------------------------
+
+        if "volume" in df.columns:
+
+            volume_count = grouped["volume"].count()
+            row_count = grouped["volume"].size()
+
+            volume_sum = grouped["volume"].sum(
+                min_count=1
+            )
+
+            complete_volume = (
+                volume_count == row_count
+            )
+
+            result["volume"] = volume_sum.where(
+                complete_volume,
+                np.nan,
+            )
+
+        else:
+            result["volume"] = np.nan
+
+        result = result.dropna(
             subset=[
                 "open",
                 "high",
@@ -626,1882 +1427,444 @@ def aggregate_ohlcv(
                 "close",
             ]
         )
-        .reset_index()
-    )
 
-    result = keep_completed_candles(
-        result,
-        target,
-    )
-
-    return ensure_ohlcv(
-        result
-    )
-
-
-# ======================================================================
-# BINANCE
-# ======================================================================
-
-_BINANCE_INTERVALS = {
-    "1m",
-    "3m",
-    "5m",
-    "15m",
-    "30m",
-    "1h",
-    "2h",
-    "4h",
-    "6h",
-    "8h",
-    "12h",
-    "1d",
-    "3d",
-    "1w",
-}
-
-
-def _normalize_binance_symbol(symbol):
-    value = str(symbol).strip().upper()
-
-    value = value.replace(
-        "/",
-        "",
-    )
-
-    value = value.replace(
-        "-",
-        "",
-    )
-
-    return value
-
-
-def _binance_raw(
-    symbol,
-    interval,
-    limit,
-):
-    interval = normalize_interval(
-        interval
-    )
-
-    if interval not in _BINANCE_INTERVALS:
-        raise DataSourceError(
-            f"Intervalle Binance non supporté : "
-            f"{interval}"
+        result = (
+            result.reset_index()
+            .sort_values("open_time")
+            .drop_duplicates(
+                "open_time",
+                keep="last",
+            )
+            .reset_index(drop=True)
         )
 
-    symbol = _normalize_binance_symbol(
-        symbol
-    )
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": min(
-            max(1, int(limit)),
-            1000,
-        ),
-    }
-
-    url = (
-        BINANCE_DATA_URL
-        + "/api/v3/klines"
-    )
-
-    response = _SESSION.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    if response.status_code == 429:
-        raise DataSourceError(
-            f"Binance HTTP 429 pour {symbol}"
-        )
-
-    response.raise_for_status()
-
-    payload = response.json()
-
-    if not isinstance(
-        payload,
-        list,
-    ):
-        raise DataSourceError(
-            f"Binance réponse invalide pour {symbol}: "
-            f"{payload}"
-        )
-
-    if not payload:
-        return empty_ohlcv()
-
-    rows = []
-
-    for row in payload:
-        if not isinstance(
-            row,
-            (list, tuple),
-        ):
-            continue
-
-        if len(row) < 6:
-            continue
-
-        rows.append(
-            {
-                "open_time":
-                    pd.to_datetime(
-                        row[0],
-                        unit="ms",
-                        utc=True,
-                        errors="coerce",
-                    ),
-                "open": row[1],
-                "high": row[2],
-                "low": row[3],
-                "close": row[4],
-                "volume": row[5],
-            }
-        )
-
-    return ensure_ohlcv(
-        pd.DataFrame(rows)
-    )
-
-
-def klines_binance_v42(
-    symbol,
-    interval="15m",
-    limit=1000,
-    asset_type="crypto",
-):
-    key = _cache_key(
-        "binance",
-        symbol,
-        interval,
-        limit,
-        asset_type,
-    )
-
-    cached = _cache_get(key)
-
-    if cached is not None:
-        _stats_increment(
-            "cache_hits"
-        )
-
-        return attach_metadata(
-            cached,
-            "binance",
-            symbol,
-            asset_type,
-        )
-
-    raw_limit = _completed_limit(
-        limit,
-        interval,
-    )
-
-    df = _binance_raw(
-        symbol,
-        interval,
-        raw_limit,
-    )
-
-    df = keep_completed_candles(
-        df,
-        interval,
-    )
-
-    df = (
-        ensure_ohlcv(df)
-        .tail(int(limit))
-        .reset_index(drop=True)
-    )
-
-    if df.empty:
-        raise DataSourceError(
-            f"Binance : aucune donnée exploitable "
-            f"pour {symbol}"
-        )
-
-    _cache_set(
-        key,
-        df,
-    )
-
-    return attach_metadata(
-        df,
-        "binance",
-        symbol,
-        asset_type,
-    )
-
-
-# ======================================================================
-# YAHOO FINANCE
-# ======================================================================
-
-_YAHOO_CONFIG = {
-    "1m": {
-        "range": "7d",
-        "interval": "1m",
-    },
-    "5m": {
-        "range": "60d",
-        "interval": "5m",
-    },
-    "15m": {
-        "range": "60d",
-        "interval": "15m",
-    },
-    "30m": {
-        "range": "60d",
-        "interval": "30m",
-    },
-    "1h": {
-        "range": "730d",
-        "interval": "1h",
-    },
-    "1d": {
-        "range": "10y",
-        "interval": "1d",
-    },
-}
-
-
-def _yahoo_raw(
-    symbol,
-    interval,
-):
-    requested = normalize_interval(
-        interval
-    )
-
-    yahoo_interval = (
-        "1h"
-        if requested in {
-            "2h",
-            "4h",
-        }
-        else requested
-    )
-
-    if yahoo_interval not in _YAHOO_CONFIG:
-        raise DataSourceError(
-            f"Intervalle Yahoo non supporté : "
-            f"{requested}"
-        )
-
-    config = _YAHOO_CONFIG[
-        yahoo_interval
-    ]
-
-    url = (
-        YAHOO_BASE
-        + requests.utils.quote(
-            str(symbol),
-            safe="",
-        )
-    )
-
-    params = {
-        "range": config["range"],
-        "interval": config["interval"],
-        "includePrePost": "false",
-        "events": "div,splits",
-    }
-
-    response = _SESSION.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    if response.status_code == 429:
-        raise DataSourceError(
-            f"Yahoo HTTP 429 pour {symbol}"
-        )
-
-    response.raise_for_status()
-
-    payload = response.json()
-
-    chart = payload.get(
-        "chart",
-        {},
-    )
-
-    results = chart.get(
-        "result"
-    )
-
-    if not results:
-        raise DataSourceError(
-            f"Yahoo : aucune donnée pour "
-            f"{symbol}"
-        )
-
-    result = results[0]
-
-    timestamps = result.get(
-        "timestamp",
-        [],
-    )
-
-    quote_list = (
-        result
-        .get(
-            "indicators",
-            {},
-        )
-        .get(
-            "quote",
-            [],
-        )
-    )
-
-    if not timestamps or not quote_list:
-        return empty_ohlcv()
-
-    quote = quote_list[0]
-
-    df = pd.DataFrame(
-        {
-            "open_time": pd.to_datetime(
-                timestamps,
-                unit="s",
-                utc=True,
-                errors="coerce",
-            ),
-            "open": quote.get(
-                "open",
-                [],
-            ),
-            "high": quote.get(
-                "high",
-                [],
-            ),
-            "low": quote.get(
-                "low",
-                [],
-            ),
-            "close": quote.get(
-                "close",
-                [],
-            ),
-            "volume": quote.get(
-                "volume",
-                [],
-            ),
-        }
-    )
-
-    return ensure_ohlcv(
-        df
-    )
-
-
-def klines_yahoo(
-    symbol,
-    interval="15m",
-    limit=1000,
-    asset_type="stock",
-):
-    interval = normalize_interval(
-        interval
-    )
-
-    key = _cache_key(
-        "yahoo",
-        symbol,
-        interval,
-        limit,
-        asset_type,
-    )
-
-    cached = _cache_get(key)
-
-    if cached is not None:
-        _stats_increment(
-            "cache_hits"
-        )
-
-        return attach_metadata(
-            cached,
-            "yahoo",
-            symbol,
-            asset_type,
-        )
-
-    df = _yahoo_raw(
-        symbol,
-        interval,
-    )
-
-    if interval == "4h":
-        df = aggregate_ohlcv(
-            df,
-            "4h",
-        )
-
-    elif interval == "2h":
-        df = aggregate_ohlcv(
-            df,
-            "2h",
-        )
-
-    else:
-        df = keep_completed_candles(
-            df,
-            interval,
-        )
-
-    df = (
-        ensure_ohlcv(df)
-        .tail(int(limit))
-        .reset_index(drop=True)
-    )
-
-    if df.empty:
-        raise DataSourceError(
-            f"Yahoo : aucune donnée exploitable "
-            f"pour {symbol}"
-        )
-
-    _cache_set(
-        key,
-        df,
-    )
-
-    return attach_metadata(
-        df,
-        "yahoo",
-        symbol,
-        asset_type,
-    )
-
-
-# ======================================================================
-# FINNHUB
-# ======================================================================
-
-_FINNHUB_RESOLUTION = {
-    "1m": "1",
-    "5m": "5",
-    "15m": "15",
-    "30m": "30",
-    "1h": "60",
-    "1d": "D",
-    "1w": "W",
-}
-
-
-def _finnhub_period(
-    interval,
-    limit,
-):
-    seconds = interval_to_seconds(
-        interval
-    )
-
-    now = int(
-        datetime.now(
-            timezone.utc
-        ).timestamp()
-    )
-
-    total = (
-        max(100, int(limit))
-        * seconds
-        * 3
-    )
-
-    return (
-        now - total,
-        now,
-    )
-
-
-def _finnhub_raw(
-    symbol,
-    interval,
-    limit,
-    asset_type="stock",
-):
-    if not FINNHUB_API_KEY:
-        raise DataSourceError(
-            "FINNHUB_API_KEY absente."
-        )
-
-    requested = normalize_interval(
-        interval
-    )
-
-    if requested in {
-        "2h",
-        "4h",
-    }:
-        resolution = "60"
-        raw_interval = "1h"
-    else:
-        resolution = _FINNHUB_RESOLUTION.get(
-            requested
-        )
-
-        if resolution is None:
-            raise DataSourceError(
-                f"Intervalle Finnhub non supporté : "
-                f"{requested}"
+        return result
+
+    # ========================================================
+    # FETCH FOURNISSEUR UNIQUE
+    # ========================================================
+
+    def _fetch_provider(
+        self,
+        provider: str,
+        symbol: str,
+        interval: str,
+        limit: int,
+        asset_type: str,
+    ) -> pd.DataFrame:
+
+        provider = provider.lower()
+
+        if provider == "binance":
+            return self._fetch_binance_direct(
+                symbol,
+                interval,
+                limit,
             )
 
-        raw_interval = requested
+        if provider == "yahoo":
+            return self._fetch_yahoo_raw(
+                symbol,
+                interval,
+                limit,
+            )
 
-    start, end = _finnhub_period(
-        raw_interval,
-        _completed_limit(
-            limit,
-            requested,
-        ),
-    )
+        if provider == "finnhub":
+            return self._fetch_finnhub(
+                symbol,
+                interval,
+                limit,
+                asset_type,
+            )
 
-    asset = str(
-        asset_type
-    ).lower()
+        if provider == "twelve_data":
+            return self._fetch_twelve_data(
+                symbol,
+                interval,
+                limit,
+            )
 
-    if asset == "forex":
-        endpoint = (
-            FINNHUB_FOREX_CANDLE_BASE
-        )
-    else:
-        endpoint = (
-            FINNHUB_CANDLE_BASE
-        )
-
-    params = {
-        "symbol": symbol,
-        "resolution": resolution,
-        "from": start,
-        "to": end,
-        "token": FINNHUB_API_KEY,
-    }
-
-    response = _SESSION.get(
-        endpoint,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    if response.status_code == 429:
-        raise DataSourceError(
-            f"Finnhub HTTP 429 pour {symbol}"
+        raise ProviderError(
+            f"Fournisseur inconnu : {provider}"
         )
 
-    response.raise_for_status()
+    # ========================================================
+    # QUALITÉ D'UNE RÉPONSE
+    # ========================================================
 
-    payload = response.json()
+    @staticmethod
+    def _quality_score(
+        df: pd.DataFrame,
+        provider: str,
+        require_volume: bool,
+        preferred: Optional[str],
+    ) -> float:
 
-    status = str(
-        payload.get(
-            "s",
-            "",
-        )
-    ).lower()
+        if df is None or df.empty:
+            return -1e9
 
-    if status != "ok":
-        raise DataSourceError(
-            f"Finnhub : aucune donnée pour "
-            f"{symbol} : "
-            f"{payload}"
-        )
+        score = 0.0
 
-    timestamps = payload.get(
-        "t",
-        [],
-    )
-
-    opens = payload.get(
-        "o",
-        [],
-    )
-
-    highs = payload.get(
-        "h",
-        [],
-    )
-
-    lows = payload.get(
-        "l",
-        [],
-    )
-
-    closes = payload.get(
-        "c",
-        [],
-    )
-
-    volumes = payload.get(
-        "v",
-        [],
-    )
-
-    if not timestamps:
-        return empty_ohlcv()
-
-    df = pd.DataFrame(
-        {
-            "open_time": pd.to_datetime(
-                timestamps,
-                unit="s",
-                utc=True,
-                errors="coerce",
-            ),
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": volumes,
-        }
-    )
-
-    if len(volumes) != len(
-        timestamps
-    ):
-        df["volume"] = float("nan")
-
-    return ensure_ohlcv(
-        df
-    )
-
-
-def klines_finnhub(
-    symbol,
-    interval="15m",
-    limit=1000,
-    asset_type="stock",
-):
-    interval = normalize_interval(
-        interval
-    )
-
-    key = _cache_key(
-        "finnhub",
-        symbol,
-        interval,
-        limit,
-        asset_type,
-    )
-
-    cached = _cache_get(key)
-
-    if cached is not None:
-        _stats_increment(
-            "cache_hits"
+        status = df.attrs.get(
+            "volume_status",
+            VOLUME_UNAVAILABLE,
         )
 
-        return attach_metadata(
-            cached,
-            "finnhub",
-            symbol,
-            asset_type,
-        )
-
-    raw_limit = _completed_limit(
-        limit,
-        interval,
-    )
-
-    df = _finnhub_raw(
-        symbol,
-        interval,
-        raw_limit,
-        asset_type,
-    )
-
-    if interval == "4h":
-        df = aggregate_ohlcv(
-            df,
-            "4h",
-        )
-
-    elif interval == "2h":
-        df = aggregate_ohlcv(
-            df,
-            "2h",
-        )
-
-    else:
-        df = keep_completed_candles(
-            df,
-            interval,
-        )
-
-    df = (
-        ensure_ohlcv(df)
-        .tail(int(limit))
-        .reset_index(drop=True)
-    )
-
-    if df.empty:
-        raise DataSourceError(
-            f"Finnhub : aucune donnée exploitable "
-            f"pour {symbol}"
-        )
-
-    _cache_set(
-        key,
-        df,
-    )
-
-    return attach_metadata(
-        df,
-        "finnhub",
-        symbol,
-        asset_type,
-    )
-
-
-# ======================================================================
-# TWELVE DATA
-# ======================================================================
-
-_TD_INTERVALS = {
-    "1m": "1min",
-    "5m": "5min",
-    "15m": "15min",
-    "30m": "30min",
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1day",
-}
-
-
-def _twelvedata_error_message(
-    payload,
-):
-    message = payload.get(
-        "message"
-    )
-
-    if message:
-        return str(message)
-
-    code = payload.get(
-        "code"
-    )
-
-    if code:
-        return f"code={code}"
-
-    return "Erreur Twelve Data"
-
-
-def klines_twelvedata(
-    symbol,
-    interval="15m",
-    limit=1000,
-    asset_type="stock",
-):
-    if not TWELVE_DATA_API_KEY:
-        raise DataSourceError(
-            "TWELVE_DATA_API_KEY absente."
-        )
-
-    interval = normalize_interval(
-        interval
-    )
-
-    td_interval = _TD_INTERVALS.get(
-        interval
-    )
-
-    # IMPORTANT :
-    # vérifier l'intervalle AVANT de réserver un crédit.
-    if td_interval is None:
-        raise DataSourceError(
-            f"Intervalle Twelve Data non supporté : "
-            f"{interval}"
-        )
-
-    key = _cache_key(
-        "twelvedata",
-        symbol,
-        interval,
-        limit,
-        asset_type,
-    )
-
-    cached = _cache_get(key)
-
-    if cached is not None:
-        _stats_increment(
-            "cache_hits"
-        )
-
-        return attach_metadata(
-            cached,
-            "twelvedata",
-            symbol,
-            asset_type,
-        )
-
-    # Une réservation = une véritable requête API.
-    if not _TwelveDataBudget.reserve():
-        raise DataSourceError(
-            "Budget Twelve Data quotidien atteint "
-            f"({TWELVE_DATA_DAILY_BUDGET} appels)."
-        )
-
-    outputsize = min(
-        max(1, int(limit)),
-        5000,
-    )
-
-    params = {
-        "symbol": symbol,
-        "interval": td_interval,
-        "outputsize": outputsize,
-        "apikey": TWELVE_DATA_API_KEY,
-        "format": "JSON",
-        "timezone": "UTC",
-    }
-
-    response = _SESSION.get(
-        TWELVE_DATA_BASE,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    if response.status_code == 429:
-        raise DataSourceError(
-            f"Twelve Data HTTP 429 pour {symbol}"
-        )
-
-    response.raise_for_status()
-
-    payload = response.json()
-
-    if payload.get(
-        "status"
-    ) == "error":
-        raise DataSourceError(
-            "Twelve Data : "
-            + _twelvedata_error_message(
-                payload
+        coverage = float(
+            df.attrs.get(
+                "volume_coverage",
+                0.0,
             )
         )
 
-    values = payload.get(
-        "values"
-    )
+        # Volume.
+        if status == VOLUME_CONFIRMED:
+            score += 50.0
+        elif status == VOLUME_PARTIAL:
+            score += 15.0
 
-    if not values:
-        raise DataSourceError(
-            f"Twelve Data : aucune donnée pour "
-            f"{symbol}"
+        if require_volume and status == VOLUME_UNAVAILABLE:
+            score -= 80.0
+
+        score += coverage * 20.0
+
+        # Fraîcheur.
+        age = df.attrs.get(
+            "age_minutes",
+            float("nan"),
         )
 
-    df = pd.DataFrame(
-        values
-    )
+        if pd.notna(age):
+            if age <= 30:
+                score += 30
+            elif age <= 60:
+                score += 20
+            elif age <= 180:
+                score += 10
+            elif age <= 720:
+                score -= 5
+            else:
+                score -= 20
 
-    if "datetime" not in df.columns:
-        raise DataSourceError(
-            "Twelve Data : colonne datetime absente."
+        # Taille.
+        score += min(
+            len(df) / 20.0,
+            25.0,
         )
 
-    df["open_time"] = pd.to_datetime(
-        df["datetime"],
-        utc=True,
-        errors="coerce",
-    )
-
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-    ]:
-        if column not in df.columns:
-            raise DataSourceError(
-                "Twelve Data : colonne "
-                f"{column} absente."
-            )
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
-
-    if "volume" in df.columns:
-        df["volume"] = pd.to_numeric(
-            df["volume"],
-            errors="coerce",
-        )
-    else:
-        # JAMAIS 0.
-        df["volume"] = float("nan")
-
-    df = ensure_ohlcv(
-        df
-    )
-
-    df = keep_completed_candles(
-        df,
-        interval,
-    )
-
-    df = (
-        df.tail(int(limit))
-        .reset_index(drop=True)
-    )
-
-    if df.empty:
-        raise DataSourceError(
-            f"Twelve Data : aucune bougie complète "
-            f"pour {symbol}"
-        )
-
-    _cache_set(
-        key,
-        df,
-    )
-
-    return attach_metadata(
-        df,
-        "twelvedata",
-        symbol,
-        asset_type,
-    )
-
-
-# ======================================================================
-# RÉSOLUTION DES SYMBOLES
-# ======================================================================
-
-def _resolve_provider_symbol(
-    symbol,
-    provider,
-    symbol_map=None,
-):
-    """
-    Formats supportés :
-
-        {"yahoo": "AAPL", "finnhub": "AAPL"}
-
-        {"AAPL": {
-            "yahoo": "AAPL",
-            "finnhub": "AAPL"
-        }}
-
-        {"AAPL": "AAPL"}
-
-        [{"yahoo": "AAPL", ...}]
-    """
-
-    provider = str(
-        provider
-    ).lower()
-
-    if symbol_map is None:
-        return symbol
-
-    if isinstance(
-        symbol_map,
-        dict,
-    ):
-        # Mapping direct fournisseur -> symbole
-        direct = symbol_map.get(
-            provider
-        )
-
-        if direct:
-            return str(direct)
-
-        # Alias possibles
-        aliases = {
-            "twelvedata": [
-                "twelve_data",
-                "td",
-            ],
-            "finnhub": [
-                "fh",
-            ],
-            "yahoo": [
-                "yf",
-            ],
-        }
-
-        for alias in aliases.get(
-            provider,
-            [],
-        ):
-            value = symbol_map.get(
-                alias
-            )
-
-            if value:
-                return str(value)
-
-        # Mapping symbole -> fournisseur
-        nested = symbol_map.get(
-            symbol
-        )
-
-        if isinstance(
-            nested,
-            dict,
-        ):
-            value = nested.get(
-                provider
-            )
-
-            if value:
-                return str(value)
-
-            for alias in aliases.get(
-                provider,
-                [],
-            ):
-                value = nested.get(
-                    alias
-                )
-
-                if value:
-                    return str(value)
-
-        elif isinstance(
-            nested,
-            str,
-        ):
-            return nested
-
-    if isinstance(
-        symbol_map,
-        (list, tuple),
-    ):
-        for entry in symbol_map:
-            if not isinstance(
-                entry,
-                dict,
-            ):
-                continue
-
-            candidates = {
-                entry.get("display"),
-                entry.get("symbol"),
-                entry.get("yahoo"),
-                entry.get("finnhub"),
-                entry.get("twelvedata"),
-                entry.get("twelve_data"),
-                entry.get("binance"),
-            }
-
-            if symbol not in candidates:
-                continue
-
-            value = entry.get(
-                provider
-            )
-
-            if not value:
-                value = entry.get(
-                    {
-                        "twelvedata":
-                            "twelve_data"
-                    }.get(
-                        provider,
-                        provider,
-                    )
-                )
-
-            if value:
-                return str(value)
-
-    return symbol
-
-
-# ======================================================================
-# CAPACITÉS FOURNISSEURS
-# ======================================================================
-
-def _provider_order(
-    asset_type,
-    require_volume=False,
-):
-    asset = str(
-        asset_type
-    ).lower()
-
-    if asset == "crypto":
-        return [
-            "binance",
-        ]
-
-    if asset == "stock":
-        return [
-            "finnhub",
-            "yahoo",
-            "twelvedata",
-        ]
-
-    if asset == "forex":
-        return [
-            "finnhub",
-            "yahoo",
-            "twelvedata",
-        ]
-
-    if asset == "index":
-        return [
-            "yahoo",
-            "finnhub",
-            "twelvedata",
-        ]
-
-    if asset == "commodity":
-        return [
-            "yahoo",
-            "finnhub",
-            "twelvedata",
-        ]
-
-    return [
-        "finnhub",
-        "yahoo",
-        "twelvedata",
-    ]
-
-
-def _provider_supports_interval(
-    provider,
-    interval,
-):
-    provider = str(
-        provider
-    ).lower()
-
-    interval = normalize_interval(
-        interval
-    )
-
-    if provider == "binance":
-        return interval in _BINANCE_INTERVALS
-
-    if provider == "yahoo":
-        return interval in {
-            "1m",
-            "5m",
-            "15m",
-            "30m",
-            "1h",
-            "2h",
-            "4h",
-            "1d",
-        }
-
-    if provider == "finnhub":
-        return interval in {
-            "1m",
-            "5m",
-            "15m",
-            "30m",
-            "1h",
-            "2h",
-            "4h",
-            "1d",
-        }
-
-    if provider == "twelvedata":
-        return interval in {
-            "1m",
-            "5m",
-            "15m",
-            "30m",
-            "1h",
-            "4h",
-            "1d",
-        }
-
-    return False
-
-
-def _provider_function(
-    provider,
-):
-    provider = str(
-        provider
-    ).lower()
-
-    if provider == "binance":
-        return klines_binance_v42
-
-    if provider == "finnhub":
-        return klines_finnhub
-
-    if provider == "yahoo":
-        return klines_yahoo
-
-    if provider == "twelvedata":
-        return klines_twelvedata
-
-    raise ValueError(
-        f"Fournisseur inconnu : {provider}"
-    )
-
-
-# ======================================================================
-# FRAÎCHEUR
-# ======================================================================
-
-def _freshness_score(
-    df,
-    interval,
-):
-    if df is None or df.empty:
-        return 0.0
-
-    last = pd.to_datetime(
-        df["open_time"].iloc[-1],
-        utc=True,
-        errors="coerce",
-    )
-
-    if pd.isna(last):
-        return 0.0
-
-    now = pd.Timestamp.now(
-        tz="UTC"
-    )
-
-    age_seconds = max(
-        0.0,
-        (
-            now - last
-        ).total_seconds(),
-    )
-
-    interval_seconds = max(
-        60,
-        interval_to_seconds(
-            interval
-        ),
-    )
-
-    ratio = (
-        age_seconds
-        / interval_seconds
-    )
-
-    if ratio <= 1.5:
-        return 1.0
-
-    if ratio <= 3:
-        return 0.8
-
-    if ratio <= 6:
-        return 0.5
-
-    if ratio <= 12:
-        return 0.2
-
-    return 0.0
-
-
-# ======================================================================
-# SCORE SOURCE
-# ======================================================================
-
-def _source_score(
-    provider,
-    df,
-    asset_type,
-    interval,
-    require_volume,
-):
-    if df is None or df.empty:
-        return -999.0
-
-    coverage = volume_coverage(
-        df
-    )
-
-    freshness = _freshness_score(
-        df,
-        interval,
-    )
-
-    score = 0.0
-
-    # Fraîcheur
-    score += (
-        freshness * 50.0
-    )
-
-    # Volume
-    if coverage >= VOLUME_MIN_COVERAGE:
-        score += 30.0
-
-    elif coverage > 0:
-        score += (
-            10.0 * coverage
-        )
-
-    if require_volume:
-        if coverage < VOLUME_MIN_COVERAGE:
-            score -= 40.0
-
-    # Nombre de bougies
-    count = len(df)
-
-    if count >= 120:
-        score += 15.0
-
-    elif count >= 60:
-        score += 8.0
-
-    elif count >= 30:
-        score += 3.0
-
-    # Bonus catégorie
-    provider = str(
-        provider
-    ).lower()
-
-    asset = str(
-        asset_type
-    ).lower()
-
-    if asset == "crypto" and provider == "binance":
-        score += 100.0
-
-    elif asset == "stock" and provider == "finnhub":
-        score += 12.0
-
-    elif asset == "index" and provider == "yahoo":
-        score += 15.0
-
-    elif asset == "commodity" and provider == "yahoo":
-        score += 15.0
-
-    # Twelve Data reste un secours.
-    if provider == "twelvedata":
-        score -= 8.0
-
-    return score
-
-
-# ======================================================================
-# DATA ROUTER
-# ======================================================================
-
-class DataRouter:
-    """
-    Routeur intelligent V4.2.
-    """
-
-    # ------------------------------------------------------------------
-    # Budget Twelve Data
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def twelvedata_used():
-        return _TwelveDataBudget.used_today()
-
-    @staticmethod
-    def twelvedata_remaining():
-        return _TwelveDataBudget.remaining()
-
-    @staticmethod
-    def twelvedata_budget():
-        return TWELVE_DATA_DAILY_BUDGET
-
-    # Alias
-    @staticmethod
-    def td_used():
-        return _TwelveDataBudget.used_today()
-
-    @staticmethod
-    def td_remaining():
-        return _TwelveDataBudget.remaining()
-
-    @property
-    def twelve_data_used(self):
-        return _TwelveDataBudget.used_today()
-
-    @property
-    def twelve_data_remaining(self):
-        return _TwelveDataBudget.remaining()
-
-    @property
-    def twelvedata_used_count(self):
-        return _TwelveDataBudget.used_today()
-
-    # ------------------------------------------------------------------
-    # Statistiques
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def stats():
-        return router_stats()
-
-    @staticmethod
-    def get_stats():
-        return router_stats()
-
-    # ------------------------------------------------------------------
-    # Cache
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def clear_cache():
-        clear_cache()
-
-    # ------------------------------------------------------------------
-    # Fetch
-    # ------------------------------------------------------------------
+        # Préférence explicite.
+        if preferred and provider == preferred:
+            score += 100.0
+
+        # Twelve Data est volontairement pénalisé légèrement
+        # lorsqu'une source gratuite équivalente est disponible.
+        if provider == "twelve_data":
+            score -= 5.0
+
+        return score
+
+    # ========================================================
+    # FETCH INTELLIGENT
+    # ========================================================
 
     def fetch(
         self,
-        symbol,
-        interval="15m",
-        limit=1000,
-        asset_type="stock",
-        preferred=None,
-        require_volume=False,
-        symbol_map=None,
-    ):
+        symbol: str,
+        interval: str = "15m",
+        limit: int = 1000,
+        asset_type: str = "stock",
+        preferred: Optional[str] = None,
+        require_volume: bool = False,
+        symbol_map: Optional[Dict[str, Any]] = None,
+    ) -> pd.DataFrame:
         """
-        Sélectionne automatiquement la meilleure source.
+        Récupère les données avec routage intelligent.
 
-        preferred :
-            fournisseur préféré optionnel.
+        Parameters
+        ----------
+        symbol:
+            Symbole logique de l'actif.
 
-        require_volume :
-            True lorsque le volume est important.
+        interval:
+            15m, 30m, 1h, 4h, etc.
 
-        Le routeur essaie les fournisseurs gratuits avant
-        Twelve Data lorsque cela est possible.
+        limit:
+            Nombre maximal de bougies.
+
+        asset_type:
+            crypto / forex / stock / index / commodity.
+
+        preferred:
+            Fournisseur préféré facultatif.
+
+        require_volume:
+            Si True, privilégie fortement les sources avec volume.
+
+        symbol_map:
+            Mapping éventuel des symboles par fournisseur.
         """
-
-        asset = str(
-            asset_type
-        ).lower()
-
-        interval = normalize_interval(
-            interval
-        )
-
-        symbol = str(
-            symbol
-        ).strip()
-
-        _stats_increment(
-            "requests"
-        )
 
         if not symbol:
-            _stats_increment(
-                "errors"
-            )
-
             raise DataSourceError(
                 "Symbole vide."
             )
 
-        # ==============================================================
-        # CRYPTO → BINANCE
-        # ==============================================================
-
-        if asset == "crypto":
-            provider = "binance"
-
-            provider_symbol = (
-                _resolve_provider_symbol(
-                    symbol,
-                    provider,
-                    symbol_map,
-                )
-            )
-
-            try:
-                df = klines_binance_v42(
-                    provider_symbol,
-                    interval=interval,
-                    limit=limit,
-                    asset_type=asset,
-                )
-
-                if df.empty:
-                    raise DataSourceError(
-                        "Binance : données vides."
-                    )
-
-                _stats_increment(
-                    "success"
-                )
-
-                _stats_increment(
-                    "binance"
-                )
-
-                return df
-
-            except Exception:
-                _stats_increment(
-                    "errors"
-                )
-                raise
-
-        # ==============================================================
-        # CANDIDATS
-        # ==============================================================
-
-        candidates = _provider_order(
-            asset,
-            require_volume=require_volume,
+        interval = str(interval).lower().strip()
+        asset_type = self._normalise_asset_type(
+            asset_type
         )
 
-        if preferred:
-            preferred = str(
-                preferred
-            ).lower()
+        limit = max(
+            10,
+            min(int(limit), 5000),
+        )
 
-            if preferred in candidates:
-                candidates.remove(
-                    preferred
-                )
+        providers = self._provider_candidates(
+            asset_type,
+            preferred,
+        )
 
-                candidates.insert(
-                    0,
-                    preferred,
-                )
+        errors: List[str] = []
+        candidates: List[Tuple[float, str, pd.DataFrame]] = []
 
-        filtered = []
+        cache_key = (
+            symbol,
+            interval,
+            limit,
+            asset_type,
+            preferred,
+            bool(require_volume),
+            repr(symbol_map),
+        )
 
-        for provider in candidates:
-            if not _provider_supports_interval(
-                provider,
-                interval,
-            ):
-                continue
+        if cache_key in self._cache:
+            self._cache_hits += 1
+            return _deepcopy_df(
+                self._cache[cache_key]
+            )
 
+        # ====================================================
+        # CAS CRYPTO
+        # ====================================================
+
+        if asset_type == "crypto":
+            providers = [
+                p
+                for p in providers
+                if p in {
+                    "binance",
+                    "yahoo",
+                    "twelve_data",
+                }
+            ]
+
+        # ====================================================
+        # ESSAIS
+        # ====================================================
+
+        for provider in providers:
+
+            # Twelve Data ne doit jamais être appelé si le
+            # quota est déjà à zéro.
             if (
-                provider == "twelvedata"
-                and not TWELVE_DATA_API_KEY
+                provider == "twelve_data"
+                and self.twelve_data_remaining_count() <= 0
             ):
-                continue
-
-            if (
-                provider == "finnhub"
-                and not FINNHUB_API_KEY
-            ):
-                continue
-
-            filtered.append(
-                provider
-            )
-
-        candidates = filtered
-
-        if not candidates:
-            _stats_increment(
-                "errors"
-            )
-
-            raise DataSourceError(
-                f"Aucun fournisseur disponible pour "
-                f"{symbol} ({asset}, {interval})."
-            )
-
-        # ==============================================================
-        # ESSAI DES SOURCES
-        # ==============================================================
-
-        successful = []
-        errors = []
-
-        for index, provider in enumerate(
-            candidates
-        ):
-            provider_symbol = (
-                _resolve_provider_symbol(
-                    symbol,
-                    provider,
-                    symbol_map,
-                )
-            )
-
-            if not provider_symbol:
                 errors.append(
-                    f"{provider}: symbole absent"
+                    "twelve_data: quota journalier épuisé"
                 )
                 continue
+
+            provider_symbol = self._resolve_symbol(
+                symbol,
+                provider,
+                symbol_map,
+            )
 
             try:
-                fetcher = _provider_function(
-                    provider
-                )
-
-                df = fetcher(
+                df = self._fetch_provider(
+                    provider,
                     provider_symbol,
-                    interval=interval,
-                    limit=limit,
-                    asset_type=asset,
+                    interval,
+                    limit,
+                    asset_type,
                 )
 
                 if df is None or df.empty:
-                    raise DataSourceError(
-                        "données vides"
+                    raise ProviderError(
+                        "aucune bougie reçue"
                     )
 
-                df = ensure_ohlcv(
-                    df
+                # Supprime la dernière bougie si elle est
+                # encore en cours de formation.
+                df = self._drop_incomplete_last_candle(
+                    df,
+                    interval,
                 )
 
-                if df.empty:
-                    raise DataSourceError(
-                        "données OHLCV vides"
+                if len(df) < 10:
+                    raise ProviderError(
+                        f"données insuffisantes "
+                        f"({len(df)} bougies)"
                     )
 
-                score = _source_score(
+                # Conserve uniquement les dernières bougies.
+                df = (
+                    df.tail(limit)
+                    .reset_index(drop=True)
+                )
+
+                # Métadonnées.
+                df = self._attach_metadata(
+                    df,
                     provider,
-                    df,
-                    asset,
+                    provider_symbol,
                     interval,
+                )
+
+                quality = self._quality_score(
+                    df,
+                    provider,
                     require_volume,
+                    preferred,
                 )
 
-                successful.append(
-                    {
-                        "provider": provider,
-                        "symbol": provider_symbol,
-                        "df": df,
-                        "score": score,
-                    }
-                )
-
-                coverage = volume_coverage(
-                    df
-                )
-
-                freshness = _freshness_score(
-                    df,
-                    interval,
-                )
-
-                volume_good = (
-                    coverage
-                    >= VOLUME_MIN_COVERAGE
-                )
-
-                # ------------------------------------------------------
-                # Source suffisamment bonne.
-                # ------------------------------------------------------
-
-                if (
-                    require_volume
-                    and volume_good
-                    and freshness >= 0.5
-                ):
-                    break
-
-                if (
-                    not require_volume
-                    and freshness >= 0.5
-                ):
-                    break
-
-                # ------------------------------------------------------
-                # Volume requis mais non disponible :
-                # essayer la source suivante.
-                # ------------------------------------------------------
-
-                if (
-                    require_volume
-                    and not volume_good
-                    and index < len(candidates) - 1
-                ):
-                    _stats_increment(
-                        "fallbacks"
+                candidates.append(
+                    (
+                        quality,
+                        provider,
+                        df,
                     )
+                )
 
-                    continue
-
-                break
+                # Si on a exactement ce que l'on veut :
+                # volume confirmé + données suffisantes,
+                # inutile de consommer une autre API.
+                if (
+                    df.attrs.get(
+                        "volume_status"
+                    ) == VOLUME_CONFIRMED
+                    and len(df) >= min(limit, 120)
+                ):
+                    break
 
             except Exception as exc:
-                errors.append(
-                    f"{provider}: {exc}"
+                message = (
+                    f"{provider} "
+                    f"({provider_symbol}) : {exc}"
                 )
 
-                _stats_increment(
-                    "errors"
-                )
+                errors.append(message)
 
-                if index < len(candidates) - 1:
-                    _stats_increment(
-                        "fallbacks"
-                    )
+                self._last_errors.setdefault(
+                    symbol,
+                    [],
+                ).append(message)
 
                 continue
 
-        # ==============================================================
+        # ====================================================
         # AUCUNE SOURCE
-        # ==============================================================
+        # ====================================================
 
-        if not successful:
+        if not candidates:
+
+            self._failures += 1
+
             raise DataSourceError(
-                f"Aucune source exploitable pour "
-                f"{symbol}. "
+                f"Aucune source disponible pour "
+                f"{symbol} [{asset_type}/{interval}]. "
                 + " | ".join(errors)
             )
 
-        # ==============================================================
+        # ====================================================
         # MEILLEURE SOURCE
-        # ==============================================================
+        # ====================================================
 
-        selected = max(
-            successful,
-            key=lambda item: item["score"],
+        candidates.sort(
+            key=lambda x: x[0],
+            reverse=True,
         )
 
-        provider = selected[
-            "provider"
+        _, provider, result = candidates[0]
+
+        self._successes += 1
+
+        status = result.attrs.get(
+            "volume_status",
+            VOLUME_UNAVAILABLE,
+        )
+
+        self._volume_status_counts[
+            status
+        ] = (
+            self._volume_status_counts.get(
+                status,
+                0,
+            )
+            + 1
+        )
+
+        result.attrs["router_errors"] = errors
+        result.attrs["router_candidates"] = [
+            {
+                "provider": p,
+                "quality": q,
+                "volume_status": d.attrs.get(
+                    "volume_status"
+                ),
+                "volume_coverage": d.attrs.get(
+                    "volume_coverage"
+                ),
+                "age_minutes": d.attrs.get(
+                    "age_minutes"
+                ),
+            }
+            for q, p, d in candidates
         ]
 
-        provider_symbol = selected[
-            "symbol"
-        ]
-
-        df = selected[
-            "df"
-        ]
-
-        # ==============================================================
-        # MÉTADONNÉES
-        # ==============================================================
-
-        df = attach_metadata(
-            df,
-            provider,
-            provider_symbol,
-            asset,
+        self._cache[cache_key] = _deepcopy_df(
+            result
         )
 
-        df.attrs[
-            "router_candidates"
-        ] = [
-            item["provider"]
-            for item in successful
-        ]
-
-        df.attrs[
-            "router_scores"
-        ] = {
-            item["provider"]:
-                round(
-                    float(item["score"]),
-                    2,
-                )
-            for item in successful
-        }
-
-        df.attrs[
-            "router_errors"
-        ] = errors
-
-        df.attrs[
-            "router_selected_score"
-        ] = round(
-            float(selected["score"]),
-            2,
-        )
-
-        df.attrs[
-            "router_fallback_count"
-        ] = max(
-            0,
-            len(successful) - 1,
-        )
-
-        _stats_increment(
-            "success"
-        )
-
-        _stats_increment(
-            provider
-        )
-
-        return df
+        return _deepcopy_df(result)
 
 
-# ======================================================================
-# INTERFACE SIMPLE
-# ======================================================================
+# ============================================================
+# FONCTIONS DE COMPATIBILITÉ
+# ============================================================
 
-def fetch_data(
-    symbol,
-    interval="15m",
-    limit=1000,
-    asset_type="stock",
-    preferred=None,
-    require_volume=False,
-    symbol_map=None,
-):
-    router = DataRouter()
-
-    return router.fetch(
-        symbol=symbol,
-        interval=interval,
-        limit=limit,
-        asset_type=asset_type,
-        preferred=preferred,
-        require_volume=require_volume,
-        symbol_map=symbol_map,
-    )
-
-
-def get_twelvedata_budget():
+def get_twelve_data_budget() -> Dict[str, Any]:
+    """Budget Twelve Data global."""
     return {
-        "used":
-            _TwelveDataBudget.used_today(),
-
-        "remaining":
-            _TwelveDataBudget.remaining(),
-
-        "budget":
-            TWELVE_DATA_DAILY_BUDGET,
+        "daily_limit": TD_DAILY_LIMIT,
+        "used": DataRouter.twelve_data_used_count(),
+        "remaining": DataRouter.twelve_data_remaining_count(),
     }
 
 
-# ======================================================================
-# TEST LOCAL
-# ======================================================================
+def twelve_data_budget() -> Dict[str, Any]:
+    return get_twelve_data_budget()
+
+
+# ============================================================
+# TEST LOCAL FACULTATIF
+# ============================================================
 
 if __name__ == "__main__":
+
+    router = DataRouter()
+
+    print("=" * 60)
+    print("DATA ROUTER V4.2")
+    print("=" * 60)
+
     print(
-        "Module data_sources.py V4.2 chargé correctement."
+        "Twelve Data :",
+        router.get_twelve_data_budget(),
     )
 
     print(
-        "Twelve Data : "
-        f"{_TwelveDataBudget.used_today()}/"
-        f"{TWELVE_DATA_DAILY_BUDGET} "
-        "appels utilisés."
-    )
-
-    print(
-        "Twelve Data restant : "
-        f"{_TwelveDataBudget.remaining()}"
-    )
-
-    print(
-        "Statistiques routeur :"
-    )
-
-    print(
-        router_stats()
+        "Stats :",
+        router.router_stats(),
     )
