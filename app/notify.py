@@ -237,4 +237,3 @@ __all__ = [
     "send_slack",
     "send_email",
 ]
-```
