@@ -1,30 +1,13 @@
-```python
 """
-V4.2 — Univers d'actifs multi-fournisseurs.
+V4.2 — Univers d'actifs.
 
-Fournisseurs supportés :
-- Binance
-- Yahoo Finance
-- Finnhub
-- Twelve Data
-
-Principe :
-- Chaque actif peut avoir un symbole différent selon le fournisseur.
-- Le routeur V4.2 choisit ensuite dynamiquement la source la plus adaptée.
-- L'univers n'est volontairement pas limité à 40 actifs.
-- Les actifs sont regroupés par classe pour permettre un routage spécifique.
+Les identifiants sont séparés par fournisseur lorsque nécessaire.
+Le DataRouter choisit ensuite automatiquement la source la plus adaptée.
 """
 
 # ============================================================
 # CRYPTO
 # ============================================================
-# Binance est la source prioritaire pour les cryptos :
-# - marché 24/7
-# - volume réel exploitable
-# - données gratuites
-# - pas de clé API nécessaire pour les klines publiques
-#
-# Le symbole est directement compatible avec Binance.
 
 CRYPTO = [
     "BTCUSDT",
@@ -53,533 +36,420 @@ CRYPTO = [
 # ============================================================
 # FOREX
 # ============================================================
-# Ordre logique du routeur :
-# Finnhub / Twelve Data / Yahoo
-#
-# Finnhub et Twelve Data utilisent des identifiants différents
-# de Yahoo.
-#
-# Attention :
-# Le Forex n'a pas un volume centralisé comparable à celui
-# d'une action ou d'un marché crypto.
-# Le routeur V4.2 ne devra donc PAS bloquer un signal Forex
-# uniquement parce que le volume est indisponible.
 
 FOREX = [
     {
-        "twelvedata": "EUR/USD",
+        "name": "EUR/USD",
+        "twelve_data": "EUR/USD",
         "finnhub": "OANDA:EUR_USD",
         "yahoo": "EURUSD=X",
-        "display": "EUR/USD",
     },
     {
-        "twelvedata": "GBP/USD",
+        "name": "GBP/USD",
+        "twelve_data": "GBP/USD",
         "finnhub": "OANDA:GBP_USD",
         "yahoo": "GBPUSD=X",
-        "display": "GBP/USD",
     },
     {
-        "twelvedata": "USD/JPY",
+        "name": "USD/JPY",
+        "twelve_data": "USD/JPY",
         "finnhub": "OANDA:USD_JPY",
         "yahoo": "JPY=X",
-        "display": "USD/JPY",
     },
     {
-        "twelvedata": "AUD/USD",
+        "name": "AUD/USD",
+        "twelve_data": "AUD/USD",
         "finnhub": "OANDA:AUD_USD",
         "yahoo": "AUDUSD=X",
-        "display": "AUD/USD",
     },
     {
-        "twelvedata": "USD/CHF",
+        "name": "USD/CHF",
+        "twelve_data": "USD/CHF",
         "finnhub": "OANDA:USD_CHF",
         "yahoo": "CHF=X",
-        "display": "USD/CHF",
     },
     {
-        "twelvedata": "USD/CAD",
+        "name": "USD/CAD",
+        "twelve_data": "USD/CAD",
         "finnhub": "OANDA:USD_CAD",
         "yahoo": "CAD=X",
-        "display": "USD/CAD",
     },
     {
-        "twelvedata": "NZD/USD",
+        "name": "NZD/USD",
+        "twelve_data": "NZD/USD",
         "finnhub": "OANDA:NZD_USD",
         "yahoo": "NZDUSD=X",
-        "display": "NZD/USD",
     },
     {
-        "twelvedata": "EUR/GBP",
+        "name": "EUR/GBP",
+        "twelve_data": "EUR/GBP",
         "finnhub": "OANDA:EUR_GBP",
         "yahoo": "EURGBP=X",
-        "display": "EUR/GBP",
     },
     {
-        "twelvedata": "EUR/JPY",
+        "name": "EUR/JPY",
+        "twelve_data": "EUR/JPY",
         "finnhub": "OANDA:EUR_JPY",
         "yahoo": "EURJPY=X",
-        "display": "EUR/JPY",
     },
     {
-        "twelvedata": "GBP/JPY",
+        "name": "GBP/JPY",
+        "twelve_data": "GBP/JPY",
         "finnhub": "OANDA:GBP_JPY",
         "yahoo": "GBPJPY=X",
-        "display": "GBP/JPY",
     },
 ]
 
 
 # ============================================================
-# ACTIONS
+# ACTIONS US
 # ============================================================
-# Actions US principalement liquides.
-#
-# Yahoo :
-#   excellente couverture et fallback gratuit.
-#
-# Finnhub :
-#   symbole généralement identique au ticker US.
-#
-# Twelve Data :
-#   symbole généralement identique au ticker US.
-#
-# Le routeur décidera dynamiquement lequel utiliser.
 
-ACTIONS = [
-    {
-        "yahoo": "AAPL",
-        "twelvedata": "AAPL",
-        "finnhub": "AAPL",
-        "display": "Apple",
-    },
-    {
-        "yahoo": "MSFT",
-        "twelvedata": "MSFT",
-        "finnhub": "MSFT",
-        "display": "Microsoft",
-    },
-    {
-        "yahoo": "GOOGL",
-        "twelvedata": "GOOGL",
-        "finnhub": "GOOGL",
-        "display": "Alphabet",
-    },
-    {
-        "yahoo": "AMZN",
-        "twelvedata": "AMZN",
-        "finnhub": "AMZN",
-        "display": "Amazon",
-    },
-    {
-        "yahoo": "NVDA",
-        "twelvedata": "NVDA",
-        "finnhub": "NVDA",
-        "display": "Nvidia",
-    },
-    {
-        "yahoo": "META",
-        "twelvedata": "META",
-        "finnhub": "META",
-        "display": "Meta",
-    },
-    {
-        "yahoo": "TSLA",
-        "twelvedata": "TSLA",
-        "finnhub": "TSLA",
-        "display": "Tesla",
-    },
-    {
-        "yahoo": "AVGO",
-        "twelvedata": "AVGO",
-        "finnhub": "AVGO",
-        "display": "Broadcom",
-    },
-    {
-        "yahoo": "AMD",
-        "twelvedata": "AMD",
-        "finnhub": "AMD",
-        "display": "AMD",
-    },
-    {
-        "yahoo": "QCOM",
-        "twelvedata": "QCOM",
-        "finnhub": "QCOM",
-        "display": "Qualcomm",
-    },
-    {
-        "yahoo": "ORCL",
-        "twelvedata": "ORCL",
-        "finnhub": "ORCL",
-        "display": "Oracle",
-    },
-    {
-        "yahoo": "ADBE",
-        "twelvedata": "ADBE",
-        "finnhub": "ADBE",
-        "display": "Adobe",
-    },
-    {
-        "yahoo": "CRM",
-        "twelvedata": "CRM",
-        "finnhub": "CRM",
-        "display": "Salesforce",
-    },
-    {
-        "yahoo": "NFLX",
-        "twelvedata": "NFLX",
-        "finnhub": "NFLX",
-        "display": "Netflix",
-    },
-    {
-        "yahoo": "JPM",
-        "twelvedata": "JPM",
-        "finnhub": "JPM",
-        "display": "JPMorgan",
-    },
-    {
-        "yahoo": "BAC",
-        "twelvedata": "BAC",
-        "finnhub": "BAC",
-        "display": "Bank of America",
-    },
-    {
-        "yahoo": "GS",
-        "twelvedata": "GS",
-        "finnhub": "GS",
-        "display": "Goldman Sachs",
-    },
-    {
-        "yahoo": "V",
-        "twelvedata": "V",
-        "finnhub": "V",
-        "display": "Visa",
-    },
-    {
-        "yahoo": "MA",
-        "twelvedata": "MA",
-        "finnhub": "MA",
-        "display": "Mastercard",
-    },
-    {
-        "yahoo": "UNH",
-        "twelvedata": "UNH",
-        "finnhub": "UNH",
-        "display": "UnitedHealth",
-    },
-    {
-        "yahoo": "JNJ",
-        "twelvedata": "JNJ",
-        "finnhub": "JNJ",
-        "display": "Johnson & Johnson",
-    },
-    {
-        "yahoo": "PFE",
-        "twelvedata": "PFE",
-        "finnhub": "PFE",
-        "display": "Pfizer",
-    },
-    {
-        "yahoo": "XOM",
-        "twelvedata": "XOM",
-        "finnhub": "XOM",
-        "display": "Exxon Mobil",
-    },
-    {
-        "yahoo": "CVX",
-        "twelvedata": "CVX",
-        "finnhub": "CVX",
-        "display": "Chevron",
-    },
-    {
-        "yahoo": "WMT",
-        "twelvedata": "WMT",
-        "finnhub": "WMT",
-        "display": "Walmart",
-    },
-    {
-        "yahoo": "COST",
-        "twelvedata": "COST",
-        "finnhub": "COST",
-        "display": "Costco",
-    },
-    {
-        "yahoo": "PG",
-        "twelvedata": "PG",
-        "finnhub": "PG",
-        "display": "Procter & Gamble",
-    },
-    {
-        "yahoo": "KO",
-        "twelvedata": "KO",
-        "finnhub": "KO",
-        "display": "Coca-Cola",
-    },
-    {
-        "yahoo": "PEP",
-        "twelvedata": "PEP",
-        "finnhub": "PEP",
-        "display": "PepsiCo",
-    },
-    {
-        "yahoo": "HD",
-        "twelvedata": "HD",
-        "finnhub": "HD",
-        "display": "Home Depot",
-    },
-    {
-        "yahoo": "DIS",
-        "twelvedata": "DIS",
-        "finnhub": "DIS",
-        "display": "Disney",
-    },
-    {
-        "yahoo": "NKE",
-        "twelvedata": "NKE",
-        "finnhub": "NKE",
-        "display": "Nike",
-    },
-    {
-        "yahoo": "IBM",
-        "twelvedata": "IBM",
-        "finnhub": "IBM",
-        "display": "IBM",
-    },
-    {
-        "yahoo": "INTC",
-        "twelvedata": "INTC",
-        "finnhub": "INTC",
-        "display": "Intel",
-    },
-    {
-        "yahoo": "CSCO",
-        "twelvedata": "CSCO",
-        "finnhub": "CSCO",
-        "display": "Cisco",
-    },
+STOCKS = [
+    "AAPL",
+    "MSFT",
+    "GOOGL",
+    "AMZN",
+    "NVDA",
+    "META",
+    "TSLA",
+    "AVGO",
+    "AMD",
+    "QCOM",
+    "ORCL",
+    "ADBE",
+    "CRM",
+    "NFLX",
+    "JPM",
+    "BAC",
+    "GS",
+    "V",
+    "MA",
+    "UNH",
+    "JNJ",
+    "PFE",
+    "XOM",
+    "CVX",
+    "WMT",
+    "COST",
+    "PG",
+    "KO",
+    "PEP",
+    "HD",
+    "DIS",
+    "NKE",
+    "IBM",
+    "INTC",
+    "CSCO",
 ]
 
 
 # ============================================================
 # INDICES
 # ============================================================
-# Yahoo est conservé comme source principale pour les indices
-# car les symboles Yahoo sont particulièrement simples et
-# largement disponibles.
-#
-# Nous n'imposons PAS ici un faux symbole Finnhub/Twelve Data.
-# Le routeur pourra utiliser Yahoo sans gaspiller le quota
-# Twelve Data.
 
 INDICES = [
-    {
-        "yahoo": "^GSPC",
-        "display": "S&P 500",
-    },
-    {
-        "yahoo": "^IXIC",
-        "display": "Nasdaq Composite",
-    },
-    {
-        "yahoo": "^DJI",
-        "display": "Dow Jones",
-    },
-    {
-        "yahoo": "^RUT",
-        "display": "Russell 2000",
-    },
-    {
-        "yahoo": "^FCHI",
-        "display": "CAC 40",
-    },
-    {
-        "yahoo": "^GDAXI",
-        "display": "DAX",
-    },
-    {
-        "yahoo": "^FTSE",
-        "display": "FTSE 100",
-    },
-    {
-        "yahoo": "^N225",
-        "display": "Nikkei 225",
-    },
-    {
-        "yahoo": "^HSI",
-        "display": "Hang Seng",
-    },
-    {
-        "yahoo": "^STOXX50E",
-        "display": "Euro Stoxx 50",
-    },
+    "^GSPC",
+    "^IXIC",
+    "^DJI",
+    "^RUT",
+    "^FCHI",
+    "^GDAXI",
+    "^FTSE",
+    "^N225",
+    "^HSI",
+    "^STOXX50E",
 ]
 
 
 # ============================================================
-# MATIÈRES PREMIÈRES — SYMBOLISATION MULTI-SOURCES
+# MATIÈRES PREMIÈRES — MULTI-SOURCES
 # ============================================================
-# L'or et l'argent disposent d'un symbole spot dans Twelve Data.
-# Yahoo utilise principalement les futures.
-#
-# Pour le pétrole et les autres matières premières, Yahoo est
-# particulièrement pratique via les contrats futures.
-#
-# Le routeur décidera ensuite si Twelve Data est justifié.
 
 COMMODITIES = [
     {
+        "name": "Gold",
         "yahoo": "GC=F",
-        "twelvedata": "XAU/USD",
-        "display": "Or",
+        "twelve_data": "XAU/USD",
     },
     {
+        "name": "Silver",
         "yahoo": "SI=F",
-        "twelvedata": "XAG/USD",
-        "display": "Argent",
+        "twelve_data": "XAG/USD",
     },
     {
+        "name": "WTI Crude Oil",
         "yahoo": "CL=F",
-        "twelvedata": "WTI/USD",
-        "display": "Pétrole WTI",
+        "twelve_data": "WTI/USD",
     },
     {
+        "name": "Brent Crude Oil",
         "yahoo": "BZ=F",
-        "twelvedata": "BRENT/USD",
-        "display": "Pétrole Brent",
+        "twelve_data": "BRENT/USD",
     },
     {
+        "name": "Natural Gas",
         "yahoo": "NG=F",
-        "display": "Gaz naturel",
+        "twelve_data": "NATGAS/USD",
     },
     {
+        "name": "Copper",
         "yahoo": "HG=F",
-        "display": "Cuivre",
+        "twelve_data": "COPPER/USD",
     },
 ]
 
 
 # ============================================================
-# MATIÈRES PREMIÈRES YAHOO UNIQUEMENT
+# MATIÈRES PREMIÈRES — YAHOO UNIQUEMENT
 # ============================================================
-# Cette liste est conservée séparément pour permettre au routeur
-# de savoir qu'il ne doit pas gaspiller une requête Twelve Data
-# lorsqu'une autre représentation n'est pas définie.
 
-COMMODITIES_YAHOO_ONLY = [
-    {
-        "yahoo": "ZC=F",
-        "display": "Maïs",
-    },
-    {
-        "yahoo": "ZS=F",
-        "display": "Soja",
-    },
-    {
-        "yahoo": "ZW=F",
-        "display": "Blé",
-    },
-    {
-        "yahoo": "KC=F",
-        "display": "Café",
-    },
-    {
-        "yahoo": "SB=F",
-        "display": "Sucre",
-    },
+YAHOO_COMMODITIES = [
+    "ZC=F",
+    "ZS=F",
+    "ZW=F",
+    "KC=F",
+    "SB=F",
 ]
 
 
 # ============================================================
-# OUTILS UTILITAIRES
+# NORMALISATION DES ACTIFS
+# ============================================================
+
+def _asset_name(asset):
+    """
+    Retourne le nom d'affichage d'un actif.
+    """
+
+    if isinstance(asset, dict):
+        return asset.get("name", "")
+
+    return str(asset)
+
+
+def _asset_symbol(asset):
+    """
+    Retourne le symbole principal d'un actif.
+    """
+
+    if isinstance(asset, dict):
+        return (
+            asset.get("yahoo")
+            or asset.get("twelve_data")
+            or asset.get("finnhub")
+            or asset.get("symbol")
+            or asset.get("name")
+        )
+
+    return str(asset)
+
+
+# ============================================================
+# UNIVERS COMPLET
 # ============================================================
 
 def all_assets():
     """
-    Retourne l'ensemble de l'univers V4.2 sous forme de liste
-    de tuples :
+    Retourne les 86 actifs de l'univers V4.2.
 
-        (asset_type, asset_definition)
-
-    Cette fonction permet au scanner de parcourir tout l'univers
-    sans dépendre d'une limite arbitraire de 40 actifs.
+    Chaque élément contient :
+        - name
+        - symbol
+        - asset_type
+        - provider symbols lorsque disponibles
     """
 
     assets = []
 
+    # Crypto
     for symbol in CRYPTO:
-        assets.append(("crypto", symbol))
+        assets.append(
+            {
+                "name": symbol,
+                "symbol": symbol,
+                "asset_type": "crypto",
+                "binance": symbol,
+            }
+        )
 
-    for asset in FOREX:
-        assets.append(("forex", asset))
+    # Forex
+    for item in FOREX:
+        assets.append(
+            {
+                "name": item["name"],
+                "symbol": item.get("twelve_data") or item["name"],
+                "asset_type": "forex",
+                "twelve_data": item.get("twelve_data"),
+                "finnhub": item.get("finnhub"),
+                "yahoo": item.get("yahoo"),
+            }
+        )
 
-    for asset in ACTIONS:
-        assets.append(("stock", asset))
+    # Actions
+    for symbol in STOCKS:
+        assets.append(
+            {
+                "name": symbol,
+                "symbol": symbol,
+                "asset_type": "stock",
+                "finnhub": symbol,
+                "yahoo": symbol,
+                "twelve_data": symbol,
+            }
+        )
 
-    for asset in INDICES:
-        assets.append(("index", asset))
+    # Indices
+    for symbol in INDICES:
+        assets.append(
+            {
+                "name": symbol,
+                "symbol": symbol,
+                "asset_type": "index",
+                "yahoo": symbol,
+                "finnhub": symbol,
+                "twelve_data": symbol,
+            }
+        )
 
-    for asset in COMMODITIES:
-        assets.append(("commodity", asset))
+    # Commodities multi-sources
+    for item in COMMODITIES:
+        assets.append(
+            {
+                "name": item["name"],
+                "symbol": item["yahoo"],
+                "asset_type": "commodity",
+                "yahoo": item.get("yahoo"),
+                "twelve_data": item.get("twelve_data"),
+            }
+        )
 
-    for asset in COMMODITIES_YAHOO_ONLY:
-        assets.append(("commodity", asset))
+    # Commodities Yahoo uniquement
+    for symbol in YAHOO_COMMODITIES:
+        assets.append(
+            {
+                "name": symbol,
+                "symbol": symbol,
+                "asset_type": "commodity",
+                "yahoo": symbol,
+            }
+        )
 
     return assets
 
 
+# ============================================================
+# UTILITAIRES
+# ============================================================
+
 def asset_count():
-    """Retourne le nombre total d'actifs de l'univers V4.2."""
+    """
+    Nombre total d'actifs.
+    """
+
     return len(all_assets())
 
 
-def get_display_name(asset_type, asset):
+def get_display_name(asset):
     """
     Retourne le nom d'affichage d'un actif.
-
-    Pour les cryptos, le symbole Binance est utilisé.
-    Pour les autres classes, le champ 'display' est prioritaire.
     """
 
-    if isinstance(asset, str):
-        return asset
-
-    return asset.get("display") or asset.get("yahoo") or asset.get("twelvedata") or asset.get("finnhub")
+    return _asset_name(asset)
 
 
-def get_symbol(asset, provider):
+def get_symbol(asset):
     """
-    Retourne le symbole correspondant à un fournisseur.
-
-    Exemple :
-        get_symbol(forex_asset, "finnhub")
-        -> OANDA:EUR_USD
-
-    Si le fournisseur n'est pas explicitement défini,
-    retourne None.
-
-    Cela permet au routeur V4.2 de décider lui-même du fallback
-    sans inventer un symbole.
+    Retourne le symbole principal d'un actif.
     """
 
-    if isinstance(asset, str):
-        # Les cryptos sont directement utilisables par Binance.
-        return asset if provider == "binance" else None
+    return _asset_symbol(asset)
 
-    return asset.get(provider)
+
+def get_asset_type(asset):
+    """
+    Détermine le type d'actif.
+    """
+
+    if isinstance(asset, dict):
+        return asset.get("asset_type")
+
+    symbol = str(asset)
+
+    if symbol in CRYPTO:
+        return "crypto"
+
+    if symbol in STOCKS:
+        return "stock"
+
+    if symbol in INDICES:
+        return "index"
+
+    if symbol in YAHOO_COMMODITIES:
+        return "commodity"
+
+    for item in FOREX:
+        if symbol in {
+            item.get("name"),
+            item.get("twelve_data"),
+            item.get("finnhub"),
+            item.get("yahoo"),
+        }:
+            return "forex"
+
+    for item in COMMODITIES:
+        if symbol in {
+            item.get("name"),
+            item.get("yahoo"),
+            item.get("twelve_data"),
+        }:
+            return "commodity"
+
+    return "stock"
 
 
 # ============================================================
-# MÉTADONNÉES DE L'UNIVERS
+# COMPTAGES PAR CATÉGORIE
+# ============================================================
+
+def crypto_count():
+    return len(CRYPTO)
+
+
+def forex_count():
+    return len(FOREX)
+
+
+def stock_count():
+    return len(STOCKS)
+
+
+def index_count():
+    return len(INDICES)
+
+
+def commodity_count():
+    return len(COMMODITIES) + len(YAHOO_COMMODITIES)
+
+
+# ============================================================
+# INFORMATIONS UNIVERSELLES
 # ============================================================
 
 ASSET_COUNTS = {
     "crypto": len(CRYPTO),
     "forex": len(FOREX),
-    "stock": len(ACTIONS),
+    "stock": len(STOCKS),
     "index": len(INDICES),
-    "commodity": len(COMMODITIES) + len(COMMODITIES_YAHOO_ONLY),
+    "commodity": len(COMMODITIES) + len(YAHOO_COMMODITIES),
 }
 
 
-# Nombre total d'actifs à scanner.
 TOTAL_ASSETS = sum(ASSET_COUNTS.values())
-```
+
+
+if TOTAL_ASSETS != 86:
+    raise RuntimeError(
+        "Erreur dans l'univers V4.2 : "
+        f"{TOTAL_ASSETS} actifs détectés au lieu de 86."
+    )
