@@ -1,4 +1,5 @@
-"""V4.2 — Notifications Slack + Email.
+"""
+V4.2 — Notifications Slack + Email.
 
 Les erreurs de notification ne doivent jamais arrêter le scanner.
 """
@@ -10,12 +11,11 @@ import requests
 
 
 def send_slack(webhook_url, message):
-    """Envoie un message Slack sans faire échouer le scanner."""
 
     if not webhook_url:
         print(
-            "[Slack] SLACK_WEBHOOK_URL non configuré — "
-            "notification ignorée."
+            "[Slack] SLACK_WEBHOOK_URL non configuré "
+            "— notification ignorée."
         )
         return False
 
@@ -59,7 +59,6 @@ def send_email(
     subject,
     body,
 ):
-    """Envoie un email sans faire échouer le scanner."""
 
     smtp_host = (
         smtp_host.strip()
@@ -70,7 +69,9 @@ def send_email(
     smtp_host = smtp_host or "smtp.gmail.com"
 
     try:
-        smtp_port = int(smtp_port or 465)
+        smtp_port = int(
+            smtp_port or 465
+        )
     except (TypeError, ValueError):
         smtp_port = 465
 
@@ -132,14 +133,11 @@ def send_email(
         print("[Email] Message envoyé.")
         return True
 
-    except smtplib.SMTPAuthenticationError as error:
+    except smtplib.SMTPAuthenticationError:
         print(
             "[Email] Échec d'authentification SMTP. "
             "Avec Gmail, utilisez généralement "
             "un mot de passe d'application."
-        )
-        print(
-            f"[Email] Détail technique : {error}"
         )
         return False
 
