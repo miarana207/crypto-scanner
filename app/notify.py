@@ -1,154 +1,240 @@
 """
-V4.2 — Notifications Slack + Email.
+V4.2 — Notifications Slack + email.
 
-Les erreurs de notification ne doivent jamais arrêter le scanner.
+Fonctions :
+- Envoi d'alertes Slack via webhook.
+- Envoi d'emails via SMTP.
+- Support SMTP SSL (port 465).
+- Support SMTP STARTTLS (port 587).
+- Gestion robuste des erreurs.
 """
 
+from __future__ import annotations
+
+import os
 import smtplib
 from email.mime.text import MIMEText
+from typing import Optional
 
 import requests
 
 
-def send_slack(webhook_url, message):
+def send_slack(message: str) -> bool:
+    """
+    Envoie un message vers Slack via webhook.
 
-    if not webhook_url:
-        print(
-            "[Slack] SLACK_WEBHOOK_URL non configuré "
-            "— notification ignorée."
-        )
+    Retourne :
+        True  = envoi réussi
+        False = webhook absent ou erreur
+    """
+
+    url = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+
+    if not url:
+        print("[Slack] SLACK_WEBHOOK_URL absent : notification ignorée.")
         return False
 
     if not message:
-        print(
-            "[Slack] Message vide — notification ignorée."
-        )
+        print("[Slack] message vide : notification ignorée.")
         return False
 
     try:
         response = requests.post(
-            webhook_url,
-            json={"text": str(message)},
+            url,
+            json={"text": message},
             timeout=15,
         )
 
         response.raise_for_status()
 
-        print("[Slack] Message envoyé.")
+        print("[Slack] notification envoyée.")
         return True
 
-    except requests.RequestException as error:
-        print(
-            f"[Slack] Échec de l'envoi : {error}"
-        )
+    except requests.RequestException as exc:
+        print(f"[Slack] erreur : {exc}")
         return False
 
-    except Exception as error:
-        print(
-            f"[Slack] Erreur inattendue : {error}"
-        )
+    except Exception as exc:
+        print(f"[Slack] erreur inattendue : {exc}")
         return False
 
 
 def send_email(
-    smtp_host,
-    smtp_port,
-    sender,
-    password,
-    recipient,
-    subject,
-    body,
-):
+    subject: str,
+    body: str,
+) -> bool:
+    """
+    Envoie un email via SMTP.
 
-    smtp_host = (
-        smtp_host.strip()
-        if isinstance(smtp_host, str)
-        else smtp_host
-    )
+    Variables d'environnement utilisées :
+        EMAIL_SENDER
+        EMAIL_PASSWORD
+        EMAIL_RECIPIENT
+        SMTP_HOST
+        SMTP_PORT
 
-    smtp_host = smtp_host or "smtp.gmail.com"
+    Ports supportés :
+        465 = SMTP SSL
+        587 = SMTP STARTTLS
+        autre = SMTP standard
 
-    try:
-        smtp_port = int(
-            smtp_port or 465
-        )
-    except (TypeError, ValueError):
-        smtp_port = 465
+    Retourne :
+        True  = email envoyé
+        False = erreur ou configuration incomplète
+    """
 
-    missing = []
+    sender = os.getenv("EMAIL_SENDER", "").strip()
+    password = os.getenv("EMAIL_PASSWORD", "")
+    recipient = os.getenv("EMAIL_RECIPIENT", "").strip()
+
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
+    smtp_port_raw = os.getenv("SMTP_PORT", "465").strip()
+
+    # ------------------------------------------------------------------
+    # Validation de la configuration
+    # ------------------------------------------------------------------
 
     if not sender:
-        missing.append("EMAIL_SENDER")
-
-    if not password:
-        missing.append("EMAIL_PASSWORD")
-
-    if not recipient:
-        missing.append("EMAIL_RECIPIENT")
-
-    if missing:
-        print(
-            "[Email] Paramètres incomplets — "
-            "paramètre(s) manquant(s) : "
-            + ", ".join(missing)
-        )
+        print("[Email] EMAIL_SENDER absent.")
         return False
 
+    if not password:
+        print("[Email] EMAIL_PASSWORD absent.")
+        return False
+
+    if not recipient:
+        print("[Email] EMAIL_RECIPIENT absent.")
+        return False
+
+    if not smtp_host:
+        print("[Email] SMTP_HOST absent.")
+        return False
+
+    try:
+        smtp_port = int(smtp_port_raw)
+    except ValueError:
+        print(f"[Email] SMTP_PORT invalide : {smtp_port_raw}")
+        return False
+
+    # ------------------------------------------------------------------
+    # Construction du message
+    # ------------------------------------------------------------------
+
     msg = MIMEText(
-        str(body or ""),
+        body or "",
         "plain",
         "utf-8",
     )
 
-    msg["Subject"] = str(
-        subject or "Crypto Scanner V4.2"
-    )
-
+    msg["Subject"] = subject or "V4.2 Trading Scanner"
     msg["From"] = sender
     msg["To"] = recipient
 
+    # ------------------------------------------------------------------
+    # Envoi SMTP
+    # ------------------------------------------------------------------
+
     try:
-        print(
-            f"[Email] Connexion SMTP à "
-            f"{smtp_host}:{smtp_port}..."
-        )
 
-        with smtplib.SMTP_SSL(
-            smtp_host,
-            smtp_port,
-            timeout=30,
-        ) as server:
+        # --------------------------------------------------------------
+        # Port 465 : SMTP SSL
+        # --------------------------------------------------------------
 
-            server.login(
-                sender,
-                password,
-            )
+        if smtp_port == 465:
 
-            server.sendmail(
-                sender,
-                [recipient],
-                msg.as_string(),
-            )
+            with smtplib.SMTP_SSL(
+                smtp_host,
+                smtp_port,
+                timeout=20,
+            ) as smtp:
 
-        print("[Email] Message envoyé.")
+                smtp.login(
+                    sender,
+                    password,
+                )
+
+                smtp.sendmail(
+                    sender,
+                    [recipient],
+                    msg.as_string(),
+                )
+
+        # --------------------------------------------------------------
+        # Port 587 : SMTP + STARTTLS
+        # --------------------------------------------------------------
+
+        elif smtp_port == 587:
+
+            with smtplib.SMTP(
+                smtp_host,
+                smtp_port,
+                timeout=20,
+            ) as smtp:
+
+                smtp.ehlo()
+
+                smtp.starttls()
+
+                smtp.ehlo()
+
+                smtp.login(
+                    sender,
+                    password,
+                )
+
+                smtp.sendmail(
+                    sender,
+                    [recipient],
+                    msg.as_string(),
+                )
+
+        # --------------------------------------------------------------
+        # Autres ports : SMTP standard
+        # --------------------------------------------------------------
+
+        else:
+
+            with smtplib.SMTP(
+                smtp_host,
+                smtp_port,
+                timeout=20,
+            ) as smtp:
+
+                smtp.ehlo()
+
+                smtp.login(
+                    sender,
+                    password,
+                )
+
+                smtp.sendmail(
+                    sender,
+                    [recipient],
+                    msg.as_string(),
+                )
+
+        print("[Email] notification envoyée.")
         return True
 
-    except smtplib.SMTPAuthenticationError:
-        print(
-            "[Email] Échec d'authentification SMTP. "
-            "Avec Gmail, utilisez généralement "
-            "un mot de passe d'application."
-        )
+    except smtplib.SMTPAuthenticationError as exc:
+        print(f"[Email] authentification SMTP échouée : {exc}")
         return False
 
-    except smtplib.SMTPException as error:
-        print(
-            f"[Email] Erreur SMTP : {error}"
-        )
+    except smtplib.SMTPException as exc:
+        print(f"[Email] erreur SMTP : {exc}")
         return False
 
-    except Exception as error:
-        print(
-            f"[Email] Échec de l'envoi : {error}"
-        )
+    except OSError as exc:
+        print(f"[Email] erreur réseau/connexion : {exc}")
         return False
+
+    except Exception as exc:
+        print(f"[Email] erreur inattendue : {exc}")
+        return False
+
+
+__all__ = [
+    "send_slack",
+    "send_email",
+]
+```
