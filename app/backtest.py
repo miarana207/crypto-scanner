@@ -1,16 +1,19 @@
 """
-V4.1 — Moteur technique et backtest.
+V4.1.1 — Moteur technique et backtest.
 
-Améliorations V4.1 :
-    - RSI de type Wilder
+Corrections V4.1.1 :
+    - Normalisation systématique des timestamps en datetime64[ns, UTC]
+    - Compatible Pandas 3.x / merge_asof
+    - RSI Wilder
     - ATR(14)
-    - tendance 1H sans look-ahead
-    - score progressif
-    - gestion du volume indisponible
-    - breakout basé sur ATR
+    - Tendance 1H sans look-ahead
+    - Score progressif
+    - Gestion du volume indisponible
+    - Breakout basé sur ATR
     - Entry / SL / TP1 / TP2
     - Risk/Reward
-    - backtest avec simulation des sorties
+    - Backtest avec simulation des sorties
+    - Slippage non compté deux fois
 """
 
 import os
@@ -62,10 +65,7 @@ ATR_PERIOD = 14
 VOLUME_LOOKBACK = 20
 BREAKOUT_LOOKBACK = 20
 
-# Breakout minimum = 0.20 ATR au-dessus du niveau.
 BREAKOUT_ATR_MULT = 0.20
-
-# Niveau auquel le breakout reçoit la totalité des points.
 BREAKOUT_FULL_ATR = 0.50
 
 
@@ -94,7 +94,59 @@ DEFAULT_SLIPPAGE = 0.0002
 # OUTILS
 # ======================================================================
 
-def safe_float(value, default=float("nan")):
+def normalize_timestamp_series(series):
+    """
+    Normalise une série temporelle en datetime64[ns, UTC].
+
+    Pandas 3.x conserve parfois la résolution native du timestamp
+    provenant de la source : s / ms / us / ns.
+
+    merge_asof exige des types temporels compatibles.
+    """
+
+    result = pd.to_datetime(
+        series,
+        utc=True,
+        errors="coerce",
+    )
+
+    try:
+        result = result.dt.as_unit("ns")
+    except AttributeError:
+        # Compatibilité avec d'éventuelles versions Pandas plus anciennes.
+        result = pd.to_datetime(
+            result,
+            utc=True,
+            errors="coerce",
+        )
+
+    return result
+
+
+def normalize_timestamp(value):
+    """
+    Normalise un timestamp scalaire en Timestamp UTC ns.
+    """
+
+    result = pd.to_datetime(
+        value,
+        utc=True,
+        errors="coerce",
+    )
+
+    if pd.isna(result):
+        return result
+
+    try:
+        return result.as_unit("ns")
+    except AttributeError:
+        return result
+
+
+def safe_float(
+    value,
+    default=float("nan"),
+):
     try:
         value = float(value)
 
@@ -107,11 +159,18 @@ def safe_float(value, default=float("nan")):
         return default
 
 
-def clamp(value, minimum, maximum):
+def clamp(
+    value,
+    minimum,
+    maximum,
+):
     try:
         return max(
             minimum,
-            min(maximum, float(value)),
+            min(
+                maximum,
+                float(value),
+            ),
         )
     except Exception:
         return minimum
@@ -137,7 +196,10 @@ def klines(
     params = {
         "symbol": symbol,
         "interval": interval,
-        "limit": min(int(limit), 1000),
+        "limit": min(
+            int(limit),
+            1000,
+        ),
     }
 
     response = requests.get(
@@ -175,16 +237,20 @@ def klines(
         columns=columns,
     )
 
-    df["open_time"] = pd.to_datetime(
-        df["open_time"],
-        unit="ms",
-        utc=True,
+    df["open_time"] = normalize_timestamp_series(
+        pd.to_datetime(
+            df["open_time"],
+            unit="ms",
+            utc=True,
+        )
     )
 
-    df["close_time"] = pd.to_datetime(
-        df["close_time"],
-        unit="ms",
-        utc=True,
+    df["close_time"] = normalize_timestamp_series(
+        pd.to_datetime(
+            df["close_time"],
+            unit="ms",
+            utc=True,
+        )
     )
 
     for col in [
@@ -209,15 +275,23 @@ def klines(
         ]
     )
 
-    now = pd.Timestamp.now(tz="UTC")
+    now = normalize_timestamp(
+        pd.Timestamp.now(
+            tz="UTC"
+        )
+    )
 
     df = df[
         df["close_time"] < now
     ].copy()
 
     df = (
-        df.sort_values("open_time")
-        .reset_index(drop=True)
+        df.sort_values(
+            "open_time"
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
     return (
@@ -231,8 +305,12 @@ def klines(
                 "volume",
             ]
         ]
-        .tail(int(limit))
-        .reset_index(drop=True)
+        .tail(
+            int(limit)
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
 
@@ -240,15 +318,23 @@ def klines(
 # RSI WILDER
 # ======================================================================
 
-def calculate_rsi(series, period=14):
+def calculate_rsi(
+    series,
+    period=14,
+):
     """
     RSI utilisant le lissage exponentiel de Wilder.
     """
 
     delta = series.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
 
     avg_gain = gain.ewm(
         alpha=1 / period,
@@ -265,25 +351,40 @@ def calculate_rsi(series, period=14):
     rs = (
         avg_gain
         /
-        avg_loss.replace(0, float("nan"))
+        avg_loss.replace(
+            0,
+            float("nan"),
+        )
     )
 
-    rsi = 100 - (
-        100 / (1 + rs)
+    rsi = (
+        100
+        -
+        (
+            100
+            /
+            (1 + rs)
+        )
     )
 
     rsi = rsi.mask(
-        (avg_loss == 0) & (avg_gain > 0),
+        (avg_loss == 0)
+        &
+        (avg_gain > 0),
         100,
     )
 
     rsi = rsi.mask(
-        (avg_gain == 0) & (avg_loss > 0),
+        (avg_gain == 0)
+        &
+        (avg_loss > 0),
         0,
     )
 
     rsi = rsi.mask(
-        (avg_gain == 0) & (avg_loss == 0),
+        (avg_gain == 0)
+        &
+        (avg_loss == 0),
         50,
     )
 
@@ -302,21 +403,27 @@ def calculate_atr(
     ATR de Wilder.
     """
 
-    previous_close = df["close"].shift(1)
+    previous_close = (
+        df["close"]
+        .shift(1)
+    )
 
     tr1 = (
         df["high"]
-        - df["low"]
+        -
+        df["low"]
     )
 
     tr2 = (
         df["high"]
-        - previous_close
+        -
+        previous_close
     ).abs()
 
     tr3 = (
         df["low"]
-        - previous_close
+        -
+        previous_close
     ).abs()
 
     true_range = pd.concat(
@@ -326,7 +433,9 @@ def calculate_atr(
             tr3,
         ],
         axis=1,
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     atr = true_range.ewm(
         alpha=1 / period,
@@ -343,21 +452,24 @@ def calculate_atr(
 
 def indicators(df):
     """
-    Calcule les indicateurs V4.1.
+    Calcule les indicateurs V4.1.1.
 
-    Important :
-    la tendance 1H utilise uniquement la dernière heure
-    COMPLÈTEMENT clôturée.
+    La tendance 1H utilise uniquement la dernière heure
+    complètement clôturée.
 
-    Cela évite le look-ahead bias.
+    Aucun look-ahead.
     """
 
     d = df.copy()
 
-    d["open_time"] = pd.to_datetime(
-        d["open_time"],
-        utc=True,
-        errors="coerce",
+    # ------------------------------------------------------------------
+    # NORMALISATION TEMPORELLE
+    # ------------------------------------------------------------------
+
+    d["open_time"] = (
+        normalize_timestamp_series(
+            d["open_time"]
+        )
     )
 
     for col in [
@@ -367,6 +479,9 @@ def indicators(df):
         "close",
         "volume",
     ]:
+        if col not in d.columns:
+            d[col] = float("nan")
+
         d[col] = pd.to_numeric(
             d[col],
             errors="coerce",
@@ -382,17 +497,23 @@ def indicators(df):
                 "close",
             ]
         )
-        .sort_values("open_time")
+        .sort_values(
+            "open_time"
+        )
         .drop_duplicates(
-            subset=["open_time"],
+            subset=[
+                "open_time"
+            ],
             keep="last",
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # EMA
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     d["ema20"] = (
         d["close"]
@@ -412,27 +533,27 @@ def indicators(df):
         .mean()
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # RSI
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     d["rsi"] = calculate_rsi(
         d["close"],
         RSI_PERIOD,
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # ATR
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     d["atr"] = calculate_atr(
         d,
         ATR_PERIOD,
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # VOLUME
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     previous_volume_mean = (
         d["volume"]
@@ -454,18 +575,22 @@ def indicators(df):
     )
 
     d["volume_available"] = (
-        d["volume"]
-        .notna()
+        d["volume"].notna()
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # TENDANCE 1H — SANS LOOK-AHEAD
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     hourly = (
-        d.set_index("open_time")
-        [["close"]]
-        .resample("1h")
+        d.set_index(
+            "open_time"
+        )[
+            ["close"]
+        ]
+        .resample(
+            "1h"
+        )
         .last()
         .dropna()
     )
@@ -493,15 +618,31 @@ def indicators(df):
         hourly["trend1h"] = 0
 
         long_condition = (
-            (hourly["close"] > hourly["ema20_1h"])
+            (
+                hourly["close"]
+                >
+                hourly["ema20_1h"]
+            )
             &
-            (hourly["ema20_1h"] > hourly["ema50_1h"])
+            (
+                hourly["ema20_1h"]
+                >
+                hourly["ema50_1h"]
+            )
         )
 
         short_condition = (
-            (hourly["close"] < hourly["ema20_1h"])
+            (
+                hourly["close"]
+                <
+                hourly["ema20_1h"]
+            )
             &
-            (hourly["ema20_1h"] < hourly["ema50_1h"])
+            (
+                hourly["ema20_1h"]
+                <
+                hourly["ema50_1h"]
+            )
         )
 
         hourly.loc[
@@ -515,16 +656,15 @@ def indicators(df):
         ] = -1
 
         # --------------------------------------------------------------
-        # IMPORTANT :
-        # une heure ne devient utilisable qu'après sa clôture.
-        #
-        # Le signal de l'heure H est donc affecté aux bougies
-        # de l'heure H+1.
+        # Une heure H devient disponible au début de H+1.
         # --------------------------------------------------------------
 
         hourly["available_from"] = (
             hourly.index
-            + pd.Timedelta(hours=1)
+            +
+            pd.Timedelta(
+                hours=1
+            )
         )
 
         trend_map = (
@@ -536,15 +676,62 @@ def indicators(df):
             ]
             .rename(
                 columns={
-                    "available_from": "open_time"
+                    "available_from":
+                        "open_time"
                 }
             )
-            .reset_index(drop=True)
+            .reset_index(
+                drop=True
+            )
         )
 
+        # --------------------------------------------------------------
+        # NORMALISATION CRITIQUE POUR PANDAS 3.x
+        # --------------------------------------------------------------
+
+        left = (
+            d.sort_values(
+                "open_time"
+            )
+            .copy()
+        )
+
+        right = (
+            trend_map.sort_values(
+                "open_time"
+            )
+            .copy()
+        )
+
+        left["open_time"] = (
+            normalize_timestamp_series(
+                left["open_time"]
+            )
+        )
+
+        right["open_time"] = (
+            normalize_timestamp_series(
+                right["open_time"]
+            )
+        )
+
+        # Vérification explicite.
+        if (
+            str(left["open_time"].dtype)
+            !=
+            str(right["open_time"].dtype)
+        ):
+            raise TypeError(
+                "Incompatibilité temporelle avant "
+                f"merge_asof : "
+                f"{left['open_time'].dtype} "
+                f"vs "
+                f"{right['open_time'].dtype}"
+            )
+
         d = pd.merge_asof(
-            d.sort_values("open_time"),
-            trend_map.sort_values("open_time"),
+            left,
+            right,
             on="open_time",
             direction="backward",
         )
@@ -563,7 +750,7 @@ def indicators(df):
 
 
 # ======================================================================
-# SCORE PROGRESSIF
+# SCORE
 # ======================================================================
 
 def _ema_points(
@@ -590,27 +777,51 @@ def _ema_points(
     if direction == "LONG":
 
         if not (
-            close > ema20 > ema50
+            close
+            >
+            ema20
+            >
+            ema50
         ):
             return 0.0
 
         strength = (
-            (close - ema20)
+            (
+                close
+                -
+                ema20
+            )
             +
-            (ema20 - ema50)
+            (
+                ema20
+                -
+                ema50
+            )
         ) / atr
 
     else:
 
         if not (
-            close < ema20 < ema50
+            close
+            <
+            ema20
+            <
+            ema50
         ):
             return 0.0
 
         strength = (
-            (ema20 - close)
+            (
+                ema20
+                -
+                close
+            )
             +
-            (ema50 - ema20)
+            (
+                ema50
+                -
+                ema20
+            )
         ) / atr
 
     normalized = clamp(
@@ -621,7 +832,8 @@ def _ema_points(
 
     return (
         SCORE_WEIGHTS["ema"]
-        * normalized
+        *
+        normalized
     )
 
 
@@ -656,7 +868,8 @@ def _rsi_points(
 
     return (
         SCORE_WEIGHTS["rsi"]
-        * normalized
+        *
+        normalized
     )
 
 
@@ -673,21 +886,31 @@ def _volume_points(
         return 0.0
 
     if direction == "LONG":
+
         if trend1h < 0:
             return 0.0
+
     else:
+
         if trend1h > 0:
             return 0.0
 
     normalized = clamp(
-        (float(relvol) - 1.0) / 1.5,
+        (
+            float(relvol)
+            -
+            1.0
+        )
+        /
+        1.5,
         0,
         1,
     )
 
     return (
         SCORE_WEIGHTS["volume"]
-        * normalized
+        *
+        normalized
     )
 
 
@@ -705,7 +928,11 @@ def _breakout_points(
         float("nan"),
     )
 
-    if pd.isna(close) or pd.isna(atr):
+    if (
+        pd.isna(close)
+        or
+        pd.isna(atr)
+    ):
         return 0.0
 
     if atr <= 0:
@@ -721,7 +948,11 @@ def _breakout_points(
         if pd.isna(level):
             return 0.0
 
-        distance = close - level
+        distance = (
+            close
+            -
+            level
+        )
 
     else:
 
@@ -733,14 +964,32 @@ def _breakout_points(
         if pd.isna(level):
             return 0.0
 
-        distance = level - close
+        distance = (
+            level
+            -
+            close
+        )
 
-    if distance <= 0:
+    # --------------------------------------------------------------
+    # Avant 0.20 ATR : aucun point.
+    # --------------------------------------------------------------
+
+    minimum_distance = (
+        atr
+        *
+        BREAKOUT_ATR_MULT
+    )
+
+    if distance < minimum_distance:
         return 0.0
 
     normalized = clamp(
-        distance / (
-            atr * BREAKOUT_FULL_ATR
+        distance
+        /
+        (
+            atr
+            *
+            BREAKOUT_FULL_ATR
         ),
         0,
         1,
@@ -748,7 +997,8 @@ def _breakout_points(
 
     return (
         SCORE_WEIGHTS["breakout"]
-        * normalized
+        *
+        normalized
     )
 
 
@@ -759,11 +1009,8 @@ def score(
     """
     Score LONG et SHORT.
 
-    Si le volume n'est pas disponible :
-        le volume n'est pas considéré comme 0 point définitif.
-
-    Le score des autres composantes est alors normalisé
-    afin de conserver une échelle finale de 0 à 100.
+    Si le volume est indisponible, les autres composantes
+    sont renormalisées sur une base de 100.
     """
 
     close = row.get(
@@ -824,9 +1071,9 @@ def score(
         )
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # TREND
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     trend_long = (
         SCORE_WEIGHTS["trend"]
@@ -840,9 +1087,9 @@ def score(
         else 0.0
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # EMA
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     ema_long = _ema_points(
         close,
@@ -860,9 +1107,9 @@ def score(
         "SHORT",
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # RSI
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     rsi_long = _rsi_points(
         rsi,
@@ -874,9 +1121,9 @@ def score(
         "SHORT",
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # VOLUME
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     volume_long = _volume_points(
         relvol,
@@ -892,50 +1139,60 @@ def score(
         volume_available,
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # BREAKOUT
-    # ==================================================================
+    # ------------------------------------------------------------------
 
-    breakout_long_pts = _breakout_points(
-        row,
-        "LONG",
+    breakout_long_pts = (
+        _breakout_points(
+            row,
+            "LONG",
+        )
     )
 
-    breakout_short_pts = _breakout_points(
-        row,
-        "SHORT",
+    breakout_short_pts = (
+        _breakout_points(
+            row,
+            "SHORT",
+        )
     )
 
-    # ==================================================================
-    # TOTAL BRUT
-    # ==================================================================
+    # ------------------------------------------------------------------
+    # TOTAL
+    # ------------------------------------------------------------------
 
     long_raw = (
         trend_long
-        + ema_long
-        + rsi_long
-        + volume_long
-        + breakout_long_pts
+        +
+        ema_long
+        +
+        rsi_long
+        +
+        volume_long
+        +
+        breakout_long_pts
     )
 
     short_raw = (
         trend_short
-        + ema_short
-        + rsi_short
-        + volume_short
-        + breakout_short_pts
+        +
+        ema_short
+        +
+        rsi_short
+        +
+        volume_short
+        +
+        breakout_short_pts
     )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # NORMALISATION SI VOLUME ABSENT
-    # ==================================================================
+    # ------------------------------------------------------------------
 
     if volume_available:
 
         long_score = long_raw
         short_score = short_raw
-
-        effective_max = SCORE_MAX
 
     else:
 
@@ -945,46 +1202,56 @@ def score(
             SCORE_WEIGHTS["volume"]
         )
 
-        if available_max > 0:
+        factor = (
+            SCORE_MAX
+            /
+            available_max
+        )
 
-            factor = (
-                SCORE_MAX
-                / available_max
-            )
+        long_score = (
+            long_raw
+            *
+            factor
+        )
 
-            long_score = (
-                long_raw
-                * factor
-            )
-
-            short_score = (
-                short_raw
-                * factor
-            )
-
-        else:
-
-            long_score = 0.0
-            short_score = 0.0
-
-        effective_max = SCORE_MAX
+        short_score = (
+            short_raw
+            *
+            factor
+        )
 
     details = {
         "long": {
-            "trend": float(trend_long),
-            "ema": float(ema_long),
-            "rsi": float(rsi_long),
-            "volume": float(volume_long),
+            "trend": float(
+                trend_long
+            ),
+            "ema": float(
+                ema_long
+            ),
+            "rsi": float(
+                rsi_long
+            ),
+            "volume": float(
+                volume_long
+            ),
             "breakout": float(
                 breakout_long_pts
             ),
         },
 
         "short": {
-            "trend": float(trend_short),
-            "ema": float(ema_short),
-            "rsi": float(rsi_short),
-            "volume": float(volume_short),
+            "trend": float(
+                trend_short
+            ),
+            "ema": float(
+                ema_short
+            ),
+            "rsi": float(
+                rsi_short
+            ),
+            "volume": float(
+                volume_short
+            ),
             "breakout": float(
                 breakout_short_pts
             ),
@@ -993,19 +1260,24 @@ def score(
         "volume_ok": (
             bool(
                 pd.notna(relvol)
-                and float(relvol) >= 1.5
+                and
+                float(relvol) >= 1.5
             )
             if volume_available
             else False
         ),
 
-        "volume_available": volume_available,
+        "volume_available":
+            volume_available,
 
-        "breakout_long": breakout_long,
+        "breakout_long":
+            breakout_long,
 
-        "breakout_short": breakout_short,
+        "breakout_short":
+            breakout_short,
 
-        "effective_max": effective_max,
+        "effective_max":
+            SCORE_MAX,
     }
 
     if return_details:
@@ -1054,8 +1326,10 @@ def calculate_trade_levels(
 
     if (
         pd.isna(close)
-        or pd.isna(atr)
-        or atr <= 0
+        or
+        pd.isna(atr)
+        or
+        atr <= 0
     ):
         return {
             "entry": float("nan"),
@@ -1071,39 +1345,56 @@ def calculate_trade_levels(
 
     risk = (
         float(atr)
-        * SL_ATR_MULT
+        *
+        SL_ATR_MULT
     )
 
     if direction == "LONG":
 
         stop_loss = (
-            entry - risk
+            entry
+            -
+            risk
         )
 
         take_profit_1 = (
             entry
-            + float(atr) * TP1_ATR_MULT
+            +
+            float(atr)
+            *
+            TP1_ATR_MULT
         )
 
         take_profit_2 = (
             entry
-            + float(atr) * TP2_ATR_MULT
+            +
+            float(atr)
+            *
+            TP2_ATR_MULT
         )
 
     elif direction == "SHORT":
 
         stop_loss = (
-            entry + risk
+            entry
+            +
+            risk
         )
 
         take_profit_1 = (
             entry
-            - float(atr) * TP1_ATR_MULT
+            -
+            float(atr)
+            *
+            TP1_ATR_MULT
         )
 
         take_profit_2 = (
             entry
-            - float(atr) * TP2_ATR_MULT
+            -
+            float(atr)
+            *
+            TP2_ATR_MULT
         )
 
     else:
@@ -1120,23 +1411,31 @@ def calculate_trade_levels(
 
     rr_tp1 = (
         abs(
-            take_profit_1 - entry
+            take_profit_1
+            -
+            entry
         )
-        / risk
+        /
+        risk
     )
 
     rr_tp2 = (
         abs(
-            take_profit_2 - entry
+            take_profit_2
+            -
+            entry
         )
-        / risk
+        /
+        risk
     )
 
     return {
         "entry": entry,
         "stop_loss": stop_loss,
-        "take_profit_1": take_profit_1,
-        "take_profit_2": take_profit_2,
+        "take_profit_1":
+            take_profit_1,
+        "take_profit_2":
+            take_profit_2,
         "risk": risk,
         "rr_tp1": rr_tp1,
         "rr_tp2": rr_tp2,
@@ -1156,25 +1455,35 @@ def signal_quality(
 ):
     if (
         score_value >= 80
-        and breakout_ok
-        and (
+        and
+        breakout_ok
+        and
+        (
             volume_ok
-            or not volume_available
+            or
+            not volume_available
         )
-        and pd.notna(rr_tp2)
-        and rr_tp2 >= 2.0
+        and
+        pd.notna(rr_tp2)
+        and
+        rr_tp2 >= 2.0
     ):
         return "A"
 
     if (
         score_value >= 75
-        and breakout_ok
-        and (
+        and
+        breakout_ok
+        and
+        (
             volume_ok
-            or not volume_available
+            or
+            not volume_available
         )
-        and pd.notna(rr_tp2)
-        and rr_tp2 >= MIN_RR
+        and
+        pd.notna(rr_tp2)
+        and
+        rr_tp2 >= MIN_RR
     ):
         return "B"
 
@@ -1185,7 +1494,7 @@ def signal_quality(
 
 
 # ======================================================================
-# BACKTEST V4.1
+# BACKTEST V4.1.1
 # ======================================================================
 
 def run(
@@ -1196,7 +1505,7 @@ def run(
     slippage=DEFAULT_SLIPPAGE,
 ):
     """
-    Backtest V4.1.
+    Backtest V4.1.1.
 
     Une entrée est déclenchée sur la bougie suivant le signal.
 
@@ -1237,7 +1546,9 @@ def run(
         (
             d["prev_high"]
             +
-            d["atr"] * BREAKOUT_ATR_MULT
+            d["atr"]
+            *
+            BREAKOUT_ATR_MULT
         )
     )
 
@@ -1247,7 +1558,9 @@ def run(
         (
             d["prev_low"]
             -
-            d["atr"] * BREAKOUT_ATR_MULT
+            d["atr"]
+            *
+            BREAKOUT_ATR_MULT
         )
     )
 
@@ -1277,17 +1590,21 @@ def run(
 
             best_score = long_score
 
-            breakout_ok = details[
-                "breakout_long"
-            ]
+            breakout_ok = bool(
+                details[
+                    "breakout_long"
+                ]
+            )
 
         elif direction == "SHORT":
 
             best_score = short_score
 
-            breakout_ok = details[
-                "breakout_short"
-            ]
+            breakout_ok = bool(
+                details[
+                    "breakout_short"
+                ]
+            )
 
         else:
 
@@ -1304,13 +1621,16 @@ def run(
 
         trigger_volume_ok = (
             volume_ok
-            or not volume_available
+            or
+            not volume_available
         )
 
         if not (
             best_score >= threshold
-            and breakout_ok
-            and trigger_volume_ok
+            and
+            breakout_ok
+            and
+            trigger_volume_ok
         ):
             i += 1
             continue
@@ -1327,7 +1647,11 @@ def run(
             i += 1
             continue
 
-        if levels["rr_tp2"] < MIN_RR:
+        if (
+            levels["rr_tp2"]
+            <
+            MIN_RR
+        ):
             i += 1
             continue
 
@@ -1345,26 +1669,34 @@ def run(
         )
 
         # --------------------------------------------------------------
-        # Slippage
+        # Slippage appliqué UNE SEULE FOIS sur l'entrée.
         # --------------------------------------------------------------
 
         if direction == "LONG":
 
             actual_entry = (
                 entry
-                * (1 + slippage)
+                *
+                (
+                    1
+                    +
+                    slippage
+                )
             )
 
             stop_loss = (
                 actual_entry
-                - levels["risk"]
+                -
+                levels["risk"]
             )
 
             take_profit = (
                 actual_entry
-                + (
+                +
+                (
                     levels["risk"]
-                    * levels["rr_tp2"]
+                    *
+                    levels["rr_tp2"]
                 )
             )
 
@@ -1372,19 +1704,27 @@ def run(
 
             actual_entry = (
                 entry
-                * (1 - slippage)
+                *
+                (
+                    1
+                    -
+                    slippage
+                )
             )
 
             stop_loss = (
                 actual_entry
-                + levels["risk"]
+                +
+                levels["risk"]
             )
 
             take_profit = (
                 actual_entry
-                - (
+                -
+                (
                     levels["risk"]
-                    * levels["rr_tp2"]
+                    *
+                    levels["rr_tp2"]
                 )
             )
 
@@ -1396,7 +1736,8 @@ def run(
         end_index = min(
             len(d),
             entry_index
-            + max_holding_bars,
+            +
+            max_holding_bars,
         )
 
         for j in range(
@@ -1419,56 +1760,81 @@ def run(
             if direction == "LONG":
 
                 stop_hit = (
-                    low <= stop_loss
+                    low
+                    <=
+                    stop_loss
                 )
 
                 tp_hit = (
-                    high >= take_profit
+                    high
+                    >=
+                    take_profit
                 )
 
                 if stop_hit:
 
-                    exit_price = stop_loss
+                    exit_price = (
+                        stop_loss
+                    )
+
                     exit_reason = "SL"
 
                 elif tp_hit:
 
-                    exit_price = take_profit
+                    exit_price = (
+                        take_profit
+                    )
+
                     exit_reason = "TP2"
 
             else:
 
                 stop_hit = (
-                    high >= stop_loss
+                    high
+                    >=
+                    stop_loss
                 )
 
                 tp_hit = (
-                    low <= take_profit
+                    low
+                    <=
+                    take_profit
                 )
 
                 if stop_hit:
 
-                    exit_price = stop_loss
+                    exit_price = (
+                        stop_loss
+                    )
+
                     exit_reason = "SL"
 
                 elif tp_hit:
 
-                    exit_price = take_profit
+                    exit_price = (
+                        take_profit
+                    )
+
                     exit_reason = "TP2"
 
             if exit_price is not None:
 
-                exit_time = candle[
-                    "open_time"
-                ]
+                exit_time = (
+                    candle[
+                        "open_time"
+                    ]
+                )
 
                 break
 
         if exit_price is None:
 
-            last_index = end_index - 1
+            last_index = (
+                end_index - 1
+            )
 
             if last_index < entry_index:
+
                 i += 1
                 continue
 
@@ -1477,12 +1843,16 @@ def run(
             ]
 
             exit_price = float(
-                last_candle["close"]
+                last_candle[
+                    "close"
+                ]
             )
 
-            exit_time = last_candle[
-                "open_time"
-            ]
+            exit_time = (
+                last_candle[
+                    "open_time"
+                ]
+            )
 
             exit_reason = "TIME"
 
@@ -1494,104 +1864,141 @@ def run(
 
             gross_return = (
                 exit_price
-                - actual_entry
+                -
+                actual_entry
             ) / actual_entry
 
         else:
 
             gross_return = (
                 actual_entry
-                - exit_price
+                -
+                exit_price
             ) / actual_entry
 
+        # --------------------------------------------------------------
+        # Les frais sont appliqués ici.
+        # Le slippage est déjà intégré à actual_entry.
+        # --------------------------------------------------------------
+
         total_cost = (
-            fee_rate * 2
-            + slippage
+            fee_rate
+            *
+            2
         )
 
         net_return = (
             gross_return
-            - total_cost
+            -
+            total_cost
         )
 
-        r_multiple = (
-            net_return
+        risk_fraction = (
+            levels["risk"]
             /
-            (
-                levels["risk"]
-                / actual_entry
-            )
+            actual_entry
         )
+
+        if risk_fraction > 0:
+
+            r_multiple = (
+                net_return
+                /
+                risk_fraction
+            )
+
+        else:
+
+            r_multiple = float(
+                "nan"
+            )
 
         trades.append(
             {
-                "signal_time": signal_row[
-                    "open_time"
-                ],
+                "signal_time":
+                    signal_row[
+                        "open_time"
+                    ],
 
-                "entry_time": entry_row[
-                    "open_time"
-                ],
+                "entry_time":
+                    entry_row[
+                        "open_time"
+                    ],
 
-                "exit_time": exit_time,
+                "exit_time":
+                    exit_time,
 
-                "direction": direction,
+                "direction":
+                    direction,
 
-                "score": float(
-                    best_score
-                ),
+                "score":
+                    float(
+                        best_score
+                    ),
 
-                "entry": float(
-                    actual_entry
-                ),
+                "entry":
+                    float(
+                        actual_entry
+                    ),
 
-                "stop_loss": float(
-                    stop_loss
-                ),
+                "stop_loss":
+                    float(
+                        stop_loss
+                    ),
 
-                "take_profit": float(
-                    take_profit
-                ),
+                "take_profit":
+                    float(
+                        take_profit
+                    ),
 
-                "exit_price": float(
-                    exit_price
-                ),
+                "exit_price":
+                    float(
+                        exit_price
+                    ),
 
-                "exit_reason": exit_reason,
+                "exit_reason":
+                    exit_reason,
 
-                "bars_held": bars_held,
+                "bars_held":
+                    bars_held,
 
-                "gross_return": float(
-                    gross_return
-                ),
+                "gross_return":
+                    float(
+                        gross_return
+                    ),
 
-                "net_return": float(
-                    net_return
-                ),
+                "net_return":
+                    float(
+                        net_return
+                    ),
 
-                "r_multiple": float(
-                    r_multiple
-                ),
+                "r_multiple":
+                    float(
+                        r_multiple
+                    ),
 
-                "relvol": safe_float(
-                    signal_row.get(
-                        "relvol"
-                    )
-                ),
+                "relvol":
+                    safe_float(
+                        signal_row.get(
+                            "relvol"
+                        )
+                    ),
 
-                "atr": safe_float(
-                    signal_row.get(
-                        "atr"
-                    )
-                ),
+                "atr":
+                    safe_float(
+                        signal_row.get(
+                            "atr"
+                        )
+                    ),
             }
         )
 
-        # Évite de créer plusieurs positions
-        # simultanées sur les mêmes bougies.
+        # Évite plusieurs positions simultanées.
         i = max(
             i + 1,
-            entry_index + bars_held,
+            entry_index
+            +
+            bars_held,
         )
 
     return pd.DataFrame(
@@ -1600,13 +2007,17 @@ def run(
 
 
 # ======================================================================
-# STATISTIQUES BACKTEST
+# STATISTIQUES
 # ======================================================================
 
 def backtest_statistics(
     trades,
 ):
-    if trades is None or trades.empty:
+    if (
+        trades is None
+        or
+        trades.empty
+    ):
 
         return {
             "trades": 0,
@@ -1630,7 +2041,8 @@ def backtest_statistics(
         len(wins)
         /
         len(trades)
-        * 100
+        *
+        100
     )
 
     gross_profit = wins[
@@ -1653,49 +2065,50 @@ def backtest_statistics(
 
     else:
 
-        profit_factor = float("inf")
+        profit_factor = float(
+            "inf"
+        )
 
     return {
-        "trades": int(
-            len(trades)
-        ),
+        "trades":
+            int(len(trades)),
 
-        "wins": int(
-            len(wins)
-        ),
+        "wins":
+            int(len(wins)),
 
-        "losses": int(
-            len(losses)
-        ),
+        "losses":
+            int(len(losses)),
 
-        "win_rate": float(
-            win_rate
-        ),
+        "win_rate":
+            float(win_rate),
 
-        "net_return": float(
-            trades[
-                "net_return"
-            ].sum()
-        ),
+        "net_return":
+            float(
+                trades[
+                    "net_return"
+                ].sum()
+            ),
 
-        "profit_factor": float(
-            profit_factor
-        ),
+        "profit_factor":
+            float(
+                profit_factor
+            ),
 
-        "expectancy": float(
-            trades[
-                "net_return"
-            ].mean()
-        ),
+        "expectancy":
+            float(
+                trades[
+                    "net_return"
+                ].mean()
+            ),
     }
 
 
 # ======================================================================
-# TEST MODULE
+# TEST
 # ======================================================================
 
 if __name__ == "__main__":
 
     print(
-        "Module backtest.py V4.1 chargé correctement."
+        "Module backtest.py V4.1.1 chargé correctement."
     )
