@@ -1,35 +1,13 @@
 """
-V4.1 — Scanner technique.
+V4.1.1 — Scanner technique.
 
-Sortie principale :
-
-    symbol
-    close
-    score_long
-    score_short
-    direction
-    best_score
-    status
-
-    entry
-    stop_loss
-    take_profit_1
-    take_profit_2
-
-    rr_tp1
-    rr_tp2
-    risk
-
-    quality
-
-    ATR
-    RSI
-    RelVol
-    trend1h
-
-    volume_available
-    volume_ok
-    breakout_ok
+Améliorations :
+    - Normalisation temporelle compatible Pandas 3.x
+    - Gestion explicite des erreurs
+    - Distinction données insuffisantes / erreur
+    - Conservation du provider utilisé
+    - Résultats exploitables même en scan partiel
+    - Breakout ATR cohérent avec le score
 """
 
 import math
@@ -56,6 +34,8 @@ from backtest import (
 DEFAULT_THRESHOLD = 75
 
 VOLUME_THRESHOLD = 1.5
+
+MIN_CANDLES = 120
 
 
 # ======================================================================
@@ -89,6 +69,42 @@ def format_relvol(
     return f"{float(value):.2f}"
 
 
+def empty_result_columns():
+    return [
+        "symbol",
+        "provider",
+        "close",
+        "score_long",
+        "score_short",
+        "direction",
+        "best_score",
+        "status",
+        "quality",
+        "missing",
+        "trend_pts",
+        "ema_pts",
+        "rsi_pts",
+        "volume_pts",
+        "breakout_pts",
+        "entry",
+        "stop_loss",
+        "take_profit_1",
+        "take_profit_2",
+        "risk",
+        "rr_tp1",
+        "rr_tp2",
+        "atr",
+        "rsi",
+        "relvol",
+        "trend1h",
+        "breakout_ok",
+        "volume_ok",
+        "volume_available",
+        "last_candle",
+        "age_minutes",
+    ]
+
+
 # ======================================================================
 # SCAN
 # ======================================================================
@@ -104,17 +120,40 @@ def scan(
     provider_name="unknown",
     fallback_provider_name=None,
 ):
+    """
+    Analyse les actifs fournis.
+
+    Les erreurs individuelles ne bloquent pas le scan global.
+
+    Les statistiques de couverture sont imprimées :
+        demandés
+        analysés
+        erreurs
+        données insuffisantes
+    """
+
     results = []
+
+    requested_count = len(
+        symbols
+    )
+
+    analyzed_count = 0
+    error_count = 0
+    insufficient_count = 0
 
     for symbol in symbols:
 
         df = None
-        used_provider = provider_name
+
+        used_provider = (
+            provider_name
+        )
 
         try:
 
             # ==========================================================
-            # DONNÉES — SOURCE PRINCIPALE
+            # SOURCE PRINCIPALE
             # ==========================================================
 
             try:
@@ -134,12 +173,10 @@ def scan(
                     f"{primary_error}"
                 )
 
-                # ------------------------------------------------------
-                # FALLBACK
-                # ------------------------------------------------------
-
-                if fallback_fetcher is None:
-
+                if (
+                    fallback_fetcher
+                    is None
+                ):
                     raise
 
                 print(
@@ -156,17 +193,26 @@ def scan(
 
                 used_provider = (
                     fallback_provider_name
-                    or "fallback"
+                    or
+                    "fallback"
                 )
 
             # ==========================================================
             # VALIDATION
             # ==========================================================
 
-            if df is None or df.empty:
+            if (
+                df is None
+                or
+                df.empty
+            ):
+
+                insufficient_count += 1
 
                 print(
-                    f"{symbol}: aucune donnée"
+                    f"{symbol}: "
+                    f"DONNÉES INSUFFISANTES "
+                    f"(aucune donnée)"
                 )
 
                 continue
@@ -190,9 +236,12 @@ def scan(
 
             if missing_columns:
 
+                insufficient_count += 1
+
                 print(
-                    f"{symbol}: colonnes "
-                    f"absentes "
+                    f"{symbol}: "
+                    f"DONNÉES INSUFFISANTES — "
+                    f"colonnes absentes "
                     f"{missing_columns}"
                 )
 
@@ -209,6 +258,17 @@ def scan(
                     errors="coerce",
                 )
             )
+
+            try:
+
+                df["open_time"] = (
+                    df["open_time"]
+                    .dt
+                    .as_unit("ns")
+                )
+
+            except AttributeError:
+                pass
 
             for col in [
                 "open",
@@ -233,24 +293,33 @@ def scan(
                         "close",
                     ]
                 )
-                .sort_values("open_time")
+                .sort_values(
+                    "open_time"
+                )
                 .drop_duplicates(
-                    subset=["open_time"],
+                    subset=[
+                        "open_time"
+                    ],
                     keep="last",
                 )
-                .reset_index(drop=True)
+                .reset_index(
+                    drop=True
+                )
             )
 
             # ==========================================================
             # MINIMUM DE DONNÉES
             # ==========================================================
 
-            if len(df) < 120:
+            if len(df) < MIN_CANDLES:
+
+                insufficient_count += 1
 
                 print(
-                    f"{symbol}: données "
-                    f"insuffisantes "
-                    f"({len(df)} bougies)"
+                    f"{symbol}: "
+                    f"DONNÉES INSUFFISANTES "
+                    f"({len(df)} bougies, "
+                    f"minimum {MIN_CANDLES})"
                 )
 
                 continue
@@ -262,6 +331,19 @@ def scan(
             d = indicators(
                 df
             )
+
+            if len(d) < MIN_CANDLES:
+
+                insufficient_count += 1
+
+                print(
+                    f"{symbol}: "
+                    f"DONNÉES INSUFFISANTES "
+                    f"après calcul des indicateurs "
+                    f"({len(d)} bougies)"
+                )
+
+                continue
 
             # ==========================================================
             # BREAKOUT ATR
@@ -294,7 +376,8 @@ def scan(
                     d["prev_high"]
                     +
                     d["atr"]
-                    * BREAKOUT_ATR_MULT
+                    *
+                    BREAKOUT_ATR_MULT
                 )
             )
 
@@ -305,12 +388,13 @@ def scan(
                     d["prev_low"]
                     -
                     d["atr"]
-                    * BREAKOUT_ATR_MULT
+                    *
+                    BREAKOUT_ATR_MULT
                 )
             )
 
             # ==========================================================
-            # DERNIÈRE BOUGIE CLÔTURÉE
+            # DERNIÈRE BOUGIE
             # ==========================================================
 
             last = d.iloc[-1]
@@ -339,7 +423,7 @@ def scan(
             )
 
             # ==========================================================
-            # CONDITIONS DU CÔTÉ RETENU
+            # CÔTÉ RETENU
             # ==========================================================
 
             if direction == "LONG":
@@ -396,11 +480,12 @@ def scan(
 
             volume_trigger_ok = (
                 volume_ok
-                or not volume_available
+                or
+                not volume_available
             )
 
             # ==========================================================
-            # NIVEAUX DE TRADE
+            # NIVEAUX
             # ==========================================================
 
             levels = calculate_trade_levels(
@@ -427,12 +512,17 @@ def scan(
 
             if (
                 best_score >= threshold
-                and breakout_ok
-                and volume_trigger_ok
-                and pd.notna(
+                and
+                breakout_ok
+                and
+                volume_trigger_ok
+                and
+                pd.notna(
                     levels["rr_tp2"]
                 )
-                and levels["rr_tp2"] >= MIN_RR
+                and
+                levels["rr_tp2"]
+                >= MIN_RR
             ):
 
                 status = "SIGNAL FORT"
@@ -465,7 +555,8 @@ def scan(
 
             if (
                 volume_available
-                and not volume_ok
+                and
+                not volume_ok
             ):
 
                 missing.append(
@@ -476,24 +567,23 @@ def scan(
                 pd.isna(
                     levels["rr_tp2"]
                 )
-                or levels["rr_tp2"] < MIN_RR
+                or
+                levels["rr_tp2"]
+                < MIN_RR
             ):
 
                 missing.append(
                     "R:R"
                 )
 
-            if missing:
-
-                missing_text = (
-                    " + ".join(
-                        missing
-                    )
+            missing_text = (
+                " + ".join(
+                    missing
                 )
-
-            else:
-
-                missing_text = "aucune"
+                if missing
+                else
+                "aucune"
+            )
 
             # ==========================================================
             # FRAÎCHEUR
@@ -507,13 +597,22 @@ def scan(
                 tz="UTC"
             )
 
+            try:
+                now = now.as_unit(
+                    "ns"
+                )
+            except AttributeError:
+                pass
+
             age_minutes = (
                 (
                     now
-                    - last_candle
+                    -
+                    last_candle
                 )
                 .total_seconds()
-                / 60
+                /
+                60
             )
 
             # ==========================================================
@@ -522,154 +621,196 @@ def scan(
 
             results.append(
                 {
-                    "symbol": symbol,
+                    "symbol":
+                        symbol,
 
-                    "provider": used_provider,
+                    "provider":
+                        used_provider,
 
-                    "close": safe_float(
-                        last["close"]
-                    ),
+                    "close":
+                        safe_float(
+                            last["close"]
+                        ),
 
-                    "score_long": float(
-                        score_long
-                    ),
+                    "score_long":
+                        float(
+                            score_long
+                        ),
 
-                    "score_short": float(
-                        score_short
-                    ),
+                    "score_short":
+                        float(
+                            score_short
+                        ),
 
-                    "direction": direction,
+                    "direction":
+                        direction,
 
-                    "best_score": float(
-                        best_score
-                    ),
+                    "best_score":
+                        float(
+                            best_score
+                        ),
 
-                    "status": status,
+                    "status":
+                        status,
 
-                    "quality": quality,
+                    "quality":
+                        quality,
 
-                    "missing": missing_text,
+                    "missing":
+                        missing_text,
 
-                    # --------------------------------------------------
-                    # POINTS
-                    # --------------------------------------------------
+                    "trend_pts":
+                        float(
+                            selected[
+                                "trend"
+                            ]
+                        ),
 
-                    "trend_pts": float(
-                        selected["trend"]
-                    ),
+                    "ema_pts":
+                        float(
+                            selected[
+                                "ema"
+                            ]
+                        ),
 
-                    "ema_pts": float(
-                        selected["ema"]
-                    ),
+                    "rsi_pts":
+                        float(
+                            selected[
+                                "rsi"
+                            ]
+                        ),
 
-                    "rsi_pts": float(
-                        selected["rsi"]
-                    ),
+                    "volume_pts":
+                        float(
+                            selected[
+                                "volume"
+                            ]
+                        ),
 
-                    "volume_pts": float(
-                        selected["volume"]
-                    ),
+                    "breakout_pts":
+                        float(
+                            selected[
+                                "breakout"
+                            ]
+                        ),
 
-                    "breakout_pts": float(
-                        selected["breakout"]
-                    ),
+                    "entry":
+                        safe_float(
+                            levels[
+                                "entry"
+                            ]
+                        ),
 
-                    # --------------------------------------------------
-                    # TRADE
-                    # --------------------------------------------------
+                    "stop_loss":
+                        safe_float(
+                            levels[
+                                "stop_loss"
+                            ]
+                        ),
 
-                    "entry": safe_float(
-                        levels["entry"]
-                    ),
+                    "take_profit_1":
+                        safe_float(
+                            levels[
+                                "take_profit_1"
+                            ]
+                        ),
 
-                    "stop_loss": safe_float(
-                        levels["stop_loss"]
-                    ),
+                    "take_profit_2":
+                        safe_float(
+                            levels[
+                                "take_profit_2"
+                            ]
+                        ),
 
-                    "take_profit_1": safe_float(
-                        levels["take_profit_1"]
-                    ),
+                    "risk":
+                        safe_float(
+                            levels[
+                                "risk"
+                            ]
+                        ),
 
-                    "take_profit_2": safe_float(
-                        levels["take_profit_2"]
-                    ),
+                    "rr_tp1":
+                        safe_float(
+                            levels[
+                                "rr_tp1"
+                            ]
+                        ),
 
-                    "risk": safe_float(
-                        levels["risk"]
-                    ),
+                    "rr_tp2":
+                        safe_float(
+                            levels[
+                                "rr_tp2"
+                            ]
+                        ),
 
-                    "rr_tp1": safe_float(
-                        levels["rr_tp1"]
-                    ),
+                    "atr":
+                        safe_float(
+                            last.get(
+                                "atr",
+                                float("nan"),
+                            )
+                        ),
 
-                    "rr_tp2": safe_float(
-                        levels["rr_tp2"]
-                    ),
+                    "rsi":
+                        safe_float(
+                            last.get(
+                                "rsi",
+                                float("nan"),
+                            )
+                        ),
 
-                    # --------------------------------------------------
-                    # INDICATEURS
-                    # --------------------------------------------------
+                    "relvol":
+                        safe_float(
+                            last.get(
+                                "relvol",
+                                float("nan"),
+                            )
+                        ),
 
-                    "atr": safe_float(
-                        last.get(
-                            "atr",
-                            float("nan"),
-                        )
-                    ),
+                    "trend1h":
+                        int(
+                            last.get(
+                                "trend1h",
+                                0,
+                            )
+                        ),
 
-                    "rsi": safe_float(
-                        last.get(
-                            "rsi",
-                            float("nan"),
-                        )
-                    ),
+                    "breakout_ok":
+                        bool(
+                            breakout_ok
+                        ),
 
-                    "relvol": safe_float(
-                        last.get(
-                            "relvol",
-                            float("nan"),
-                        )
-                    ),
+                    "volume_ok":
+                        bool(
+                            volume_ok
+                        ),
 
-                    "trend1h": int(
-                        last.get(
-                            "trend1h",
-                            0,
-                        )
-                    ),
+                    "volume_available":
+                        bool(
+                            volume_available
+                        ),
 
-                    # --------------------------------------------------
-                    # TRIGGERS
-                    # --------------------------------------------------
+                    "last_candle":
+                        last_candle,
 
-                    "breakout_ok": bool(
-                        breakout_ok
-                    ),
-
-                    "volume_ok": bool(
-                        volume_ok
-                    ),
-
-                    "volume_available": bool(
-                        volume_available
-                    ),
-
-                    # --------------------------------------------------
-                    # DONNÉES
-                    # --------------------------------------------------
-
-                    "last_candle": last_candle,
-
-                    "age_minutes": float(
-                        age_minutes
-                    ),
+                    "age_minutes":
+                        float(
+                            age_minutes
+                        ),
                 }
             )
 
+            analyzed_count += 1
+
         except Exception as exc:
 
+            error_count += 1
+
             print(
-                f"{symbol}: ERREUR : {exc}"
+                f"{symbol}: "
+                f"ERREUR : "
+                f"{type(exc).__name__}: "
+                f"{exc}"
             )
 
         if pause:
@@ -678,48 +819,38 @@ def scan(
                 pause
             )
 
+    # ==================================================================
+    # COUVERTURE
+    # ==================================================================
+
+    print(
+        f"Couverture {provider_name}: "
+        f"{analyzed_count}/{requested_count} analysés | "
+        f"{insufficient_count} insuffisant(s) | "
+        f"{error_count} erreur(s)"
+    )
+
+    # ==================================================================
+    # RESULTAT VIDE
+    # ==================================================================
+
     if not results:
 
         return pd.DataFrame(
-            columns=[
-                "symbol",
-                "provider",
-                "close",
-                "score_long",
-                "score_short",
-                "direction",
-                "best_score",
-                "status",
-                "quality",
-                "missing",
-                "trend_pts",
-                "ema_pts",
-                "rsi_pts",
-                "volume_pts",
-                "breakout_pts",
-                "entry",
-                "stop_loss",
-                "take_profit_1",
-                "take_profit_2",
-                "risk",
-                "rr_tp1",
-                "rr_tp2",
-                "atr",
-                "rsi",
-                "relvol",
-                "trend1h",
-                "breakout_ok",
-                "volume_ok",
-                "volume_available",
-                "last_candle",
-                "age_minutes",
-            ]
+            columns=
+                empty_result_columns()
         )
 
+    # ==================================================================
+    # RESULTAT FINAL
+    # ==================================================================
+
+    result_df = pd.DataFrame(
+        results
+    )
+
     return (
-        pd.DataFrame(
-            results
-        )
+        result_df
         .sort_values(
             [
                 "status",
@@ -732,5 +863,7 @@ def scan(
                 True,
             ],
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
