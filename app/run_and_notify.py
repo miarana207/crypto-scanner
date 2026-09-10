@@ -2,18 +2,13 @@
 V4.2 — Scanner multi-actifs + notifications.
 
 Architecture :
-    - Crypto       : Binance prioritaire
-    - Actions      : Finnhub → Yahoo → Twelve Data
-    - Forex        : Finnhub → Yahoo → Twelve Data
-    - Indices      : Yahoo → Finnhub → Twelve Data
-    - Commodities  : Yahoo → Finnhub → Twelve Data
-    - Twelve Data  : fallback intelligent + quota journalier
+    Crypto       : Binance → Finnhub → Yahoo → Twelve Data
+    Actions      : Finnhub → Yahoo → Twelve Data
+    Forex        : Finnhub → Yahoo → Twelve Data
+    Indices      : Yahoo → Finnhub → Twelve Data
+    Commodities  : Yahoo → Finnhub → Twelve Data
 
-Notifications :
-    - Email : chaque scan
-    - Slack : uniquement si SIGNAL FORT
-
-Score maximum = 100
+Le mapping fournisseur est fourni par assets.py.
 """
 
 import argparse
@@ -46,12 +41,9 @@ from assets import (
     INDICES,
     COMMODITIES,
     COMMODITIES_YAHOO_ONLY,
+    get_symbol_map,
 )
 
-
-# ======================================================================
-# CONFIGURATION
-# ======================================================================
 
 PAUSE_BY_ASSET_TYPE = {
     "crypto": 0.20,
@@ -61,169 +53,6 @@ PAUSE_BY_ASSET_TYPE = {
     "commodity": 0.20,
 }
 
-
-# ======================================================================
-# SYMBOLS
-# ======================================================================
-
-def resolve_symbols(
-    entries,
-    key=None,
-):
-    """
-    Transforme une liste de chaînes/dictionnaires
-    en liste de symboles.
-    """
-
-    result = []
-
-    for entry in entries:
-
-        if isinstance(
-            entry,
-            dict,
-        ):
-
-            if key:
-
-                value = entry.get(
-                    key
-                )
-
-            else:
-
-                value = (
-                    entry.get("symbol")
-                    or entry.get("yahoo")
-                    or entry.get("twelvedata")
-                    or entry.get("finnhub")
-                )
-
-            if value:
-                result.append(value)
-
-        else:
-
-            result.append(entry)
-
-    return result
-
-
-def entry_map(
-    entry,
-    canonical,
-):
-    """
-    Transforme une entrée assets.py en mapping
-    utilisable par DataRouter.
-    """
-
-    if not isinstance(
-        entry,
-        dict,
-    ):
-        return {
-            canonical: {
-                "binance": entry,
-                "yahoo": entry,
-                "finnhub": entry,
-                "twelvedata": entry,
-                "twelve_data": entry,
-            }
-        }
-
-    mapping = {}
-
-    for key in [
-        "binance",
-        "yahoo",
-        "finnhub",
-        "twelvedata",
-        "twelve_data",
-    ]:
-
-        value = entry.get(key)
-
-        if value:
-            mapping[key] = value
-
-    return {
-        canonical: mapping
-    }
-
-
-# ======================================================================
-# GROUPES
-# ======================================================================
-
-def asset_groups():
-
-    groups = []
-
-    groups.append(
-        {
-            "name": "Crypto",
-            "asset_type": "crypto",
-            "interval": "5m",
-            "entries": CRYPTO,
-        }
-    )
-
-    groups.append(
-        {
-            "name": "Forex",
-            "asset_type": "forex",
-            "interval": "15m",
-            "entries": FOREX,
-        }
-    )
-
-    groups.append(
-        {
-            "name": "Actions",
-            "asset_type": "stock",
-            "interval": "15m",
-            "entries": ACTIONS,
-        }
-    )
-
-    groups.append(
-        {
-            "name": "Indices",
-            "asset_type": "index",
-            "interval": "15m",
-            "entries": INDICES,
-        }
-    )
-
-    if COMMODITIES:
-
-        groups.append(
-            {
-                "name": "Matières premières",
-                "asset_type": "commodity",
-                "interval": "15m",
-                "entries": COMMODITIES,
-            }
-        )
-
-    if COMMODITIES_YAHOO_ONLY:
-
-        groups.append(
-            {
-                "name": "Matières premières Yahoo",
-                "asset_type": "commodity",
-                "interval": "15m",
-                "entries": COMMODITIES_YAHOO_ONLY,
-            }
-        )
-
-    return groups
-
-
-# ======================================================================
-# FETCH ROUTER
-# ======================================================================
 
 def router_fetcher(
     router,
@@ -242,11 +71,9 @@ def router_fetcher(
         }
     )
 
-    mapping = (
-        symbol_maps.get(
-            symbol,
-            {},
-        )
+    mapping = symbol_maps.get(
+        symbol,
+        get_symbol_map(symbol),
     )
 
     return router.fetch(
@@ -260,9 +87,57 @@ def router_fetcher(
     )
 
 
-# ======================================================================
-# SCAN GLOBAL
-# ======================================================================
+def asset_groups():
+
+    groups = [
+        {
+            "name": "Crypto",
+            "asset_type": "crypto",
+            "interval": "5m",
+            "entries": CRYPTO,
+        },
+        {
+            "name": "Forex",
+            "asset_type": "forex",
+            "interval": "15m",
+            "entries": FOREX,
+        },
+        {
+            "name": "Actions",
+            "asset_type": "stock",
+            "interval": "15m",
+            "entries": ACTIONS,
+        },
+        {
+            "name": "Indices",
+            "asset_type": "index",
+            "interval": "15m",
+            "entries": INDICES,
+        },
+    ]
+
+    if COMMODITIES:
+        groups.append(
+            {
+                "name": "Matières premières",
+                "asset_type": "commodity",
+                "interval": "15m",
+                "entries": COMMODITIES,
+            }
+        )
+
+    if COMMODITIES_YAHOO_ONLY:
+        groups.append(
+            {
+                "name": "Matières premières Yahoo",
+                "asset_type": "commodity",
+                "interval": "15m",
+                "entries": COMMODITIES_YAHOO_ONLY,
+            }
+        )
+
+    return groups
+
 
 def scan_all(
     threshold=75,
@@ -273,51 +148,27 @@ def scan_all(
     router = DataRouter()
 
     all_results = {}
-
     coverage = []
 
-    groups = asset_groups()
-
-    for group in groups:
+    for group in asset_groups():
 
         name = group["name"]
-
-        asset_type = group[
-            "asset_type"
-        ]
-
-        interval = group[
-            "interval"
-        ]
-
-        entries = group[
-            "entries"
-        ]
+        asset_type = group["asset_type"]
+        interval = group["interval"]
+        entries = group["entries"]
 
         canonical_symbols = []
-
         symbol_maps = {}
 
         for entry in entries:
 
-            if isinstance(
-                entry,
-                dict,
-            ):
+            if isinstance(entry, dict):
 
                 canonical = (
-                    entry.get(
-                        "symbol"
-                    )
-                    or entry.get(
-                        "display"
-                    )
-                    or entry.get(
-                        "yahoo"
-                    )
-                    or entry.get(
-                        "twelvedata"
-                    )
+                    entry.get("symbol")
+                    or entry.get("display")
+                    or entry.get("yahoo")
+                    or entry.get("twelvedata")
                 )
 
                 if not canonical:
@@ -327,30 +178,21 @@ def scan_all(
                     canonical
                 )
 
-                symbol_maps[
-                    canonical
-                ] = entry
+                symbol_maps[canonical] = entry
 
             else:
 
-                canonical = str(
-                    entry
-                )
+                canonical = str(entry)
 
                 canonical_symbols.append(
                     canonical
                 )
 
-                symbol_maps[
-                    canonical
-                ] = {
-                    "symbol": canonical,
-                    "binance": canonical,
-                    "yahoo": canonical,
-                    "finnhub": canonical,
-                    "twelvedata": canonical,
-                    "twelve_data": canonical,
-                }
+                # IMPORTANT :
+                # utiliser le mapping officiel de assets.py
+                symbol_maps[canonical] = (
+                    get_symbol_map(canonical)
+                )
 
         requested = len(
             canonical_symbols
@@ -363,20 +205,15 @@ def scan_all(
         print(
             f"\n{'=' * 70}"
         )
-
         print(
-            f"{name} — "
-            f"{requested} actifs"
+            f"{name} — {requested} actifs"
         )
-
         print(
             f"Intervalle : {interval}"
         )
-
         print(
             f"Type : {asset_type}"
         )
-
         print(
             f"{'=' * 70}"
         )
@@ -385,16 +222,19 @@ def scan_all(
 
             try:
 
-                fetcher = lambda s, interval=interval, limit=limit: (
-                    router_fetcher(
+                def fetcher(
+                    s,
+                    interval_value=interval,
+                    limit_value=limit,
+                ):
+                    return router_fetcher(
                         router,
                         s,
-                        interval,
-                        limit,
+                        interval_value,
+                        limit_value,
                         asset_type,
                         symbol_maps,
                     )
-                )
 
                 result = scan(
                     [symbol],
@@ -404,18 +244,18 @@ def scan_all(
                     threshold=threshold,
                     pause=0.0,
                     provider_name="router",
+                    asset_type=asset_type,
                 )
 
-                if result is not None and not result.empty:
+                if (
+                    result is not None
+                    and not result.empty
+                ):
 
-                    all_results[
-                        symbol
-                    ] = result
-
+                    all_results[symbol] = result
                     analyzed += 1
 
                 else:
-
                     insufficient += 1
 
             except DataSourceError as exc:
@@ -423,8 +263,7 @@ def scan_all(
                 errors += 1
 
                 print(
-                    f"[{symbol}] "
-                    f"erreur source router: "
+                    f"[{symbol}] erreur source : "
                     f"{exc}"
                 )
 
@@ -433,8 +272,7 @@ def scan_all(
                 errors += 1
 
                 print(
-                    f"[{symbol}] "
-                    f"erreur scan: "
+                    f"[{symbol}] erreur scan : "
                     f"{exc}"
                 )
 
@@ -444,10 +282,7 @@ def scan_all(
             )
 
             if pause > 0:
-
-                time.sleep(
-                    pause
-                )
+                time.sleep(pause)
 
         coverage.append(
             {
@@ -461,26 +296,17 @@ def scan_all(
 
         print(
             f"{name}: "
-            f"{analyzed}/{requested} analysés | "
-            f"erreurs={errors} | "
-            f"insuffisants={insufficient}"
+            f"{analyzed}/{requested} analysés "
+            f"| erreurs={errors} "
+            f"| insuffisants={insufficient}"
         )
 
     router._coverage = coverage
 
-    return (
-        all_results,
-        router,
-    )
+    return all_results, router
 
 
-# ======================================================================
-# SIGNALS
-# ======================================================================
-
-def count_signals(
-    all_results,
-):
+def count_signals(all_results):
 
     total = 0
 
@@ -502,25 +328,13 @@ def count_signals(
     return total
 
 
-def has_signal(
-    all_results,
-):
-
-    return (
-        count_signals(
-            all_results
-        )
-        > 0
-    )
+def has_signal(all_results):
+    return count_signals(
+        all_results
+    ) > 0
 
 
-# ======================================================================
-# COUVERTURE
-# ======================================================================
-
-def coverage_summary(
-    router,
-):
+def coverage_summary(router):
 
     coverage = getattr(
         router,
@@ -542,21 +356,10 @@ def coverage_summary(
 
     for item in coverage:
 
-        requested = item[
-            "requested"
-        ]
-
-        analyzed = item[
-            "analyzed"
-        ]
-
-        errors = item[
-            "errors"
-        ]
-
-        insufficient = item[
-            "insufficient"
-        ]
+        requested = item["requested"]
+        analyzed = item["analyzed"]
+        errors = item["errors"]
+        insufficient = item["insufficient"]
 
         total_requested += requested
         total_analyzed += analyzed
@@ -570,10 +373,7 @@ def coverage_summary(
             f"| insuffisants={insufficient}"
         )
 
-    lines.append(
-        ""
-    )
-
+    lines.append("")
     lines.append(
         f"TOTAL : "
         f"{total_analyzed}/{total_requested} analysés "
@@ -581,40 +381,12 @@ def coverage_summary(
         f"| insuffisants={total_insufficient}"
     )
 
-    return "\n".join(
-        lines
-    )
+    return "\n".join(lines)
 
 
-# ======================================================================
-# ROUTER SUMMARY
-# ======================================================================
+def router_summary(router):
 
-def router_summary(
-    router,
-):
-
-    # --------------------------------------------------------------
-    # IMPORTANT :
-    # router.stats est une MÉTHODE.
-    # Il faut donc appeler router.stats().
-    # --------------------------------------------------------------
-
-    stats_method = getattr(
-        router,
-        "stats",
-        None,
-    )
-
-    if callable(
-        stats_method
-    ):
-
-        stats = stats_method()
-
-    else:
-
-        stats = {}
+    stats = router.stats()
 
     provider_calls = stats.get(
         "provider_calls",
@@ -640,177 +412,75 @@ def router_summary(
         "🧠 ROUTEUR V4.2"
     ]
 
-    providers = [
+    for provider in [
         "binance",
         "finnhub",
         "yahoo",
         "twelve_data",
-    ]
-
-    for provider in providers:
-
-        calls = int(
-            provider_calls.get(
-                provider,
-                0,
-            )
-        )
-
-        successes = int(
-            provider_successes.get(
-                provider,
-                0,
-            )
-        )
-
-        failures = int(
-            provider_failures.get(
-                provider,
-                0,
-            )
-        )
+    ]:
 
         lines.append(
             f"{provider:<13} "
-            f"appels={calls} "
-            f"| succès={successes} "
-            f"| échecs={failures}"
+            f"appels={provider_calls.get(provider, 0)} "
+            f"| succès={provider_successes.get(provider, 0)} "
+            f"| échecs={provider_failures.get(provider, 0)}"
         )
 
-    lines.append(
-        ""
+    lines.extend(
+        [
+            "",
+            "📦 VOLUME",
+            f"confirmé : {volume_status.get(VOLUME_CONFIRMED, 0)}",
+            f"partiel : {volume_status.get(VOLUME_PARTIAL, 0)}",
+            f"indisponible : {volume_status.get(VOLUME_UNAVAILABLE, 0)}",
+            f"invalide : {volume_status.get(VOLUME_INVALID, 0)}",
+            "",
+            f"Requêtes routeur : {stats.get('calls', 0)}",
+            f"Succès : {stats.get('successes', 0)}",
+            f"Échecs : {stats.get('failures', 0)}",
+            f"Cache hits : {stats.get('cache_hits', 0)}",
+        ]
     )
-
-    lines.append(
-        "📦 VOLUME"
-    )
-
-    lines.append(
-        f"confirmé : "
-        f"{volume_status.get(VOLUME_CONFIRMED, 0)}"
-    )
-
-    lines.append(
-        f"partiel : "
-        f"{volume_status.get(VOLUME_PARTIAL, 0)}"
-    )
-
-    lines.append(
-        f"indisponible : "
-        f"{volume_status.get(VOLUME_UNAVAILABLE, 0)}"
-    )
-
-    lines.append(
-        f"invalide : "
-        f"{volume_status.get(VOLUME_INVALID, 0)}"
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        f"Requêtes routeur : "
-        f"{stats.get('calls', 0)}"
-    )
-
-    lines.append(
-        f"Succès : "
-        f"{stats.get('successes', 0)}"
-    )
-
-    lines.append(
-        f"Échecs : "
-        f"{stats.get('failures', 0)}"
-    )
-
-    lines.append(
-        f"Cache hits : "
-        f"{stats.get('cache_hits', 0)}"
-    )
-
-    # --------------------------------------------------------------
-    # TWELVE DATA
-    # --------------------------------------------------------------
 
     budget = stats.get(
         "twelve_data",
-        None,
+        {},
     )
 
-    if not isinstance(
-        budget,
-        dict,
-    ):
+    lines.extend(
+        [
+            "",
+            "💳 TWELVE DATA",
+            f"utilisé : "
+            f"{budget.get('used', 0)}/"
+            f"{budget.get('daily_limit', 0)}",
+            f"restant : "
+            f"{budget.get('remaining', 0)}",
+        ]
+    )
 
-        getter = getattr(
-            router,
-            "get_twelve_data_budget",
-            None,
+    cooldowns = stats.get(
+        "provider_cooldowns",
+        {},
+    )
+
+    if cooldowns:
+
+        lines.append("")
+        lines.append(
+            "⏸️ CIRCUIT BREAKERS"
         )
 
-        if callable(getter):
+        for provider, seconds in cooldowns.items():
 
-            budget = getter()
+            if seconds > 0:
+                lines.append(
+                    f"{provider} : "
+                    f"{seconds}s restantes"
+                )
 
-        else:
+    return "\n".join(lines)
 
-            budget = {
-                "daily_limit": 0,
-                "used": 0,
-                "remaining": 0,
-            }
-
-    td_limit = int(
-        budget.get(
-            "daily_limit",
-            0,
-        )
-    )
-
-    td_used = int(
-        budget.get(
-            "used",
-            0,
-        )
-    )
-
-    td_remaining = int(
-        budget.get(
-            "remaining",
-            max(
-                0,
-                td_limit - td_used,
-            ),
-        )
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        "💳 TWELVE DATA"
-    )
-
-    lines.append(
-        f"utilisé : "
-        f"{td_used}/{td_limit}"
-    )
-
-    lines.append(
-        f"restant : "
-        f"{td_remaining}"
-    )
-
-    return "\n".join(
-        lines
-    )
-
-
-# ======================================================================
-# FRESHNESS
-# ======================================================================
 
 def freshness_summary(
     all_results,
@@ -830,45 +500,30 @@ def freshness_summary(
 
     for name, df in all_results.items():
 
-        if (
-            df is None
-            or df.empty
-        ):
+        if df is None or df.empty:
             continue
 
-        if (
-            "last_candle"
-            not in df.columns
-        ):
+        if "last_candle" not in df.columns:
             continue
 
         most_recent = df[
             "last_candle"
         ].max()
 
-        if pd.isna(
-            most_recent
-        ):
+        if pd.isna(most_recent):
             continue
 
-        if isinstance(
-            most_recent,
-            pd.Timestamp,
-        ):
+        most_recent = pd.Timestamp(
+            most_recent
+        )
 
-            if most_recent.tzinfo is None:
-
-                most_recent = (
-                    most_recent.tz_localize(
-                        "UTC"
-                    )
-                )
-
+        if most_recent.tzinfo is None:
+            most_recent = (
+                most_recent.tz_localize("UTC")
+            )
         else:
-
-            most_recent = pd.Timestamp(
-                most_recent,
-                tz="UTC",
+            most_recent = (
+                most_recent.tz_convert("UTC")
             )
 
         age_min = (
@@ -876,11 +531,12 @@ def freshness_summary(
             - most_recent.to_pydatetime()
         ).total_seconds() / 60
 
-        flag = (
-            " ⚠️ possible donnée figée"
-            if age_min > 90
-            else ""
-        )
+        if age_min < 0:
+            flag = " ❌ TIMESTAMP FUTUR"
+        elif age_min > 90:
+            flag = " ⚠️ possible donnée figée"
+        else:
+            flag = ""
 
         lines.append(
             f"{name}: "
@@ -889,18 +545,10 @@ def freshness_summary(
             f"{flag}"
         )
 
-    return "\n".join(
-        lines
-    )
+    return "\n".join(lines)
 
 
-# ======================================================================
-# SIGNALS FORTS
-# ======================================================================
-
-def strong_signals_summary(
-    all_results,
-):
+def strong_signals_summary(all_results):
 
     lines = [
         "🔥 SIGNALS FORTS"
@@ -943,24 +591,61 @@ def strong_signals_summary(
                 "N/A",
             )
 
-            score_long = float(
+            score_value = float(
                 row.get(
-                    "score_long",
-                    0,
+                    "score",
+                    max(
+                        row.get(
+                            "score_long",
+                            0,
+                        ),
+                        row.get(
+                            "score_short",
+                            0,
+                        ),
+                    ),
                 )
             )
 
-            score_short = float(
-                row.get(
-                    "score_short",
-                    0,
-                )
+            lines.append(
+                f"🔥 {symbol} "
+                f"{direction} — "
+                f"{score_value:.0f}/100"
             )
 
-            best_score = max(
-                score_long,
-                score_short,
+            lines.append(
+                "➡️ ENTRÉE IMMÉDIATE"
             )
+
+            entry = row.get(
+                "entry",
+                float("nan"),
+            )
+
+            stop = row.get(
+                "stop_loss",
+                float("nan"),
+            )
+
+            tp1 = row.get(
+                "take_profit_1",
+                float("nan"),
+            )
+
+            if pd.notna(entry):
+                lines.append(
+                    f"Entrée : {entry:.6g}"
+                )
+
+            if pd.notna(stop):
+                lines.append(
+                    f"Stop : {stop:.6g}"
+                )
+
+            if pd.notna(tp1):
+                lines.append(
+                    f"TP1 : {tp1:.6g}"
+                )
 
             breakout = row.get(
                 "breakout_pts",
@@ -972,89 +657,25 @@ def strong_signals_summary(
                 float("nan"),
             )
 
-            entry = row.get(
-                "entry",
-                float("nan"),
-            )
-
-            stop_loss = row.get(
-                "stop_loss",
-                float("nan"),
-            )
-
-            take_profit = row.get(
-                "take_profit_1",
-                float("nan"),
-            )
-
-            lines.append(
-                f"🔥 {symbol} "
-                f"{direction} — "
-                f"{best_score:.0f}/100"
-            )
-
-            lines.append(
-                "➡️ ENTRÉE IMMÉDIATE"
-            )
-
-            if pd.notna(
-                entry
-            ):
-
+            if pd.notna(breakout):
                 lines.append(
-                    f"Entrée : {entry:.6g}"
+                    f"Breakout : {breakout:+.0f}/25"
                 )
 
-            if pd.notna(
-                stop_loss
-            ):
-
+            if pd.notna(volume):
                 lines.append(
-                    f"Stop : {stop_loss:.6g}"
+                    f"Volume : {volume:+.0f}/15"
                 )
 
-            if pd.notna(
-                take_profit
-            ):
-
-                lines.append(
-                    f"TP1 : {take_profit:.6g}"
-                )
-
-            if pd.notna(
-                breakout
-            ):
-
-                lines.append(
-                    f"Breakout : "
-                    f"{breakout:+.0f}/20"
-                )
-
-            if pd.notna(
-                volume
-            ):
-
-                lines.append(
-                    f"Volume : "
-                    f"{volume:+.0f}/15"
-                )
-
-    lines.append(
-        ""
+    lines.extend(
+        [
+            "",
+            f"Total SIGNAL FORT : {total}",
+        ]
     )
 
-    lines.append(
-        f"Total SIGNAL FORT : {total}"
-    )
+    return "\n".join(lines)
 
-    return "\n".join(
-        lines
-    )
-
-
-# ======================================================================
-# WATCHLIST
-# ======================================================================
 
 def watchlist_summary(
     all_results,
@@ -1068,40 +689,17 @@ def watchlist_summary(
         if (
             df is None
             or df.empty
+            or "status" not in df.columns
         ):
-            continue
-
-        if "status" not in df.columns:
             continue
 
         for _, row in df.iterrows():
 
-            status = row.get(
+            if row.get(
                 "status",
                 "",
-            )
-
-            if status == "SIGNAL FORT":
+            ) == "SIGNAL FORT":
                 continue
-
-            score_long = float(
-                row.get(
-                    "score_long",
-                    0,
-                )
-            )
-
-            score_short = float(
-                row.get(
-                    "score_short",
-                    0,
-                )
-            )
-
-            best_score = max(
-                score_long,
-                score_short,
-            )
 
             candidates.append(
                 {
@@ -1114,8 +712,16 @@ def watchlist_summary(
                         "direction",
                         "N/A",
                     ),
-                    "score": best_score,
-                    "status": status,
+                    "score": float(
+                        row.get(
+                            "score",
+                            0,
+                        )
+                    ),
+                    "status": row.get(
+                        "status",
+                        "",
+                    ),
                 }
             )
 
@@ -1125,10 +731,7 @@ def watchlist_summary(
     )
 
     selected = candidates[
-        :max(
-            int(top),
-            0,
-        )
+        :max(int(top), 0)
     ]
 
     lines = [
@@ -1136,17 +739,12 @@ def watchlist_summary(
     ]
 
     if not selected:
-
         lines.append(
             "Aucun actif à surveiller."
         )
-
-        return "\n".join(
-            lines
-        )
+        return "\n".join(lines)
 
     for item in selected:
-
         lines.append(
             f"{item['symbol']} "
             f"{item['direction']} "
@@ -1154,14 +752,8 @@ def watchlist_summary(
             f"— {item['status']}"
         )
 
-    return "\n".join(
-        lines
-    )
+    return "\n".join(lines)
 
-
-# ======================================================================
-# MESSAGE COMPLET
-# ======================================================================
 
 def format_full_message(
     all_results,
@@ -1178,99 +770,43 @@ def format_full_message(
         )
     )
 
-    lines = []
-
-    lines.append(
-        "📊 SCAN MULTI-ACTIFS V4.2"
-    )
-
-    lines.append(
+    lines = [
+        "📊 SCAN MULTI-ACTIFS V4.2",
         now.strftime(
             "%Y-%m-%d %H:%M UTC"
-        )
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
+        ),
+        "",
         f"Seuil stratégique : "
-        f"{threshold:.0f}/100"
-    )
-
-    lines.append(
+        f"{threshold:.0f}/100",
         f"Actifs analysés : "
-        f"{len(all_results)}"
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        coverage_summary(
-            router
-        )
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        router_summary(
-            router
-        )
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
+        f"{len(all_results)}",
+        "",
+        coverage_summary(router),
+        "",
+        router_summary(router),
+        "",
         strong_signals_summary(
             all_results
-        )
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
+        ),
+        "",
         watchlist_summary(
             all_results,
             top=top,
-        )
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
+        ),
+        "",
         freshness_summary(
             all_results,
             now=now,
-        )
-    )
+        ),
+    ]
 
-    return "\n".join(
-        lines
-    )
+    return "\n".join(lines)
 
-
-# ======================================================================
-# MAIN
-# ======================================================================
 
 def main():
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Scanner multi-actifs V4.2"
-        )
+        description="Scanner multi-actifs V4.2"
     )
 
     parser.add_argument(
@@ -1304,23 +840,14 @@ def main():
     )
 
     print(
-        f"Limite données : "
-        f"{args.limit}"
+        f"Limite données : {args.limit}"
     )
-
-    # --------------------------------------------------------------
-    # SCAN
-    # --------------------------------------------------------------
 
     all_results, router = scan_all(
         threshold=args.threshold,
         limit=args.limit,
         top=args.top,
     )
-
-    # --------------------------------------------------------------
-    # MESSAGE
-    # --------------------------------------------------------------
 
     message = format_full_message(
         all_results,
@@ -1334,26 +861,13 @@ def main():
         "\n" + message
     )
 
-    # --------------------------------------------------------------
-    # SIGNAL FORT ?
-    # --------------------------------------------------------------
-
-    signal_exists = has_signal(
-        all_results
-    )
-
     signal_count = count_signals(
         all_results
     )
 
-    # --------------------------------------------------------------
-    # EMAIL : TOUJOURS
-    # --------------------------------------------------------------
-
     email_subject = (
         f"Scan V4.2 — "
-        f"{signal_count} "
-        f"signal(s) fort(s) — "
+        f"{signal_count} signal(s) fort(s) — "
         f"{now.strftime('%Y-%m-%d %H:%M')} UTC"
     )
 
@@ -1366,38 +880,25 @@ def main():
             "SMTP_PORT",
             "465",
         ),
-        os.getenv(
-            "EMAIL_SENDER",
-        ),
-        os.getenv(
-            "EMAIL_PASSWORD",
-        ),
-        os.getenv(
-            "EMAIL_RECIPIENT",
-        ),
+        os.getenv("EMAIL_SENDER"),
+        os.getenv("EMAIL_PASSWORD"),
+        os.getenv("EMAIL_RECIPIENT"),
         email_subject,
         message,
     )
 
-    # --------------------------------------------------------------
-    # SLACK : UNIQUEMENT SIGNAL FORT
-    # --------------------------------------------------------------
-
-    if signal_exists:
+    if signal_count > 0:
 
         slack_url = os.getenv(
             "SLACK_WEBHOOK_URL"
         )
 
         if slack_url:
-
             send_slack(
                 slack_url,
                 message,
             )
-
         else:
-
             print(
                 "[Slack] "
                 "SLACK_WEBHOOK_URL absent."
@@ -1410,10 +911,6 @@ def main():
             "— Slack non envoyé."
         )
 
-
-# ======================================================================
-# EXECUTION
-# ======================================================================
 
 if __name__ == "__main__":
     main()
