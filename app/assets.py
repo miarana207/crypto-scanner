@@ -2,11 +2,18 @@
 V4.2 — Univers d'actifs.
 
 Les identifiants sont séparés par fournisseur lorsque nécessaire.
-Le DataRouter choisit ensuite automatiquement la source la plus adaptée.
+Le routeur V4.2 choisit ensuite automatiquement la source la plus adaptée.
+
+Objectifs :
+- univers large multi-actifs
+- séparation claire par type
+- compatibilité avec run_and_notify.py
+- symboles spécifiques par fournisseur
 """
 
 # ============================================================
 # CRYPTO
+# Binance Spot — 24/7
 # ============================================================
 
 CRYPTO = [
@@ -38,66 +45,16 @@ CRYPTO = [
 # ============================================================
 
 FOREX = [
-    {
-        "name": "EUR/USD",
-        "twelve_data": "EUR/USD",
-        "finnhub": "OANDA:EUR_USD",
-        "yahoo": "EURUSD=X",
-    },
-    {
-        "name": "GBP/USD",
-        "twelve_data": "GBP/USD",
-        "finnhub": "OANDA:GBP_USD",
-        "yahoo": "GBPUSD=X",
-    },
-    {
-        "name": "USD/JPY",
-        "twelve_data": "USD/JPY",
-        "finnhub": "OANDA:USD_JPY",
-        "yahoo": "JPY=X",
-    },
-    {
-        "name": "AUD/USD",
-        "twelve_data": "AUD/USD",
-        "finnhub": "OANDA:AUD_USD",
-        "yahoo": "AUDUSD=X",
-    },
-    {
-        "name": "USD/CHF",
-        "twelve_data": "USD/CHF",
-        "finnhub": "OANDA:USD_CHF",
-        "yahoo": "CHF=X",
-    },
-    {
-        "name": "USD/CAD",
-        "twelve_data": "USD/CAD",
-        "finnhub": "OANDA:USD_CAD",
-        "yahoo": "CAD=X",
-    },
-    {
-        "name": "NZD/USD",
-        "twelve_data": "NZD/USD",
-        "finnhub": "OANDA:NZD_USD",
-        "yahoo": "NZDUSD=X",
-    },
-    {
-        "name": "EUR/GBP",
-        "twelve_data": "EUR/GBP",
-        "finnhub": "OANDA:EUR_GBP",
-        "yahoo": "EURGBP=X",
-    },
-    {
-        "name": "EUR/JPY",
-        "twelve_data": "EUR/JPY",
-        "finnhub": "OANDA:EUR_JPY",
-        "yahoo": "EURJPY=X",
-    },
-    {
-        "name": "GBP/JPY",
-        "twelve_data": "GBP/JPY",
-        "finnhub": "OANDA:GBP_JPY",
-        "yahoo": "GBPJPY=X",
-    },
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "AUD/USD",
+    "USD/CHF",
+    "USD/CAD",
+    "NZD/USD",
+    "EUR/GBP",
+    "EUR/JPY",
+    "GBP/JPY",
 ]
 
 
@@ -143,6 +100,9 @@ STOCKS = [
     "CSCO",
 ]
 
+# Compatibilité avec run_and_notify.py
+ACTIONS = STOCKS
+
 
 # ============================================================
 # INDICES
@@ -163,86 +123,135 @@ INDICES = [
 
 
 # ============================================================
-# MATIÈRES PREMIÈRES — MULTI-SOURCES
+# MATIÈRES PREMIÈRES MULTI-SOURCES
+#
+# Yahoo / Twelve Data / Finnhub lorsque disponible
 # ============================================================
 
 COMMODITIES = [
-    {
-        "name": "Gold",
-        "yahoo": "GC=F",
-        "twelve_data": "XAU/USD",
-    },
-    {
-        "name": "Silver",
-        "yahoo": "SI=F",
-        "twelve_data": "XAG/USD",
-    },
-    {
-        "name": "WTI Crude Oil",
-        "yahoo": "CL=F",
-        "twelve_data": "WTI/USD",
-    },
-    {
-        "name": "Brent Crude Oil",
-        "yahoo": "BZ=F",
-        "twelve_data": "BRENT/USD",
-    },
-    {
-        "name": "Natural Gas",
-        "yahoo": "NG=F",
-        "twelve_data": "NATGAS/USD",
-    },
-    {
-        "name": "Copper",
-        "yahoo": "HG=F",
-        "twelve_data": "COPPER/USD",
-    },
+    "GC=F",       # Gold
+    "SI=F",       # Silver
+    "CL=F",       # WTI Crude Oil
+    "BZ=F",       # Brent Crude Oil
+    "NG=F",       # Natural Gas
+    "HG=F",       # Copper
 ]
 
 
 # ============================================================
-# MATIÈRES PREMIÈRES — YAHOO UNIQUEMENT
+# MATIÈRES PREMIÈRES YAHOO UNIQUEMENT
 # ============================================================
 
 YAHOO_COMMODITIES = [
-    "ZC=F",
-    "ZS=F",
-    "ZW=F",
-    "KC=F",
-    "SB=F",
+    "ZC=F",       # Corn
+    "ZS=F",       # Soybeans
+    "ZW=F",       # Wheat
+    "KC=F",       # Coffee
+    "SB=F",       # Sugar
 ]
 
 
 # ============================================================
-# NORMALISATION DES ACTIFS
+# MAPPING FOREX PAR FOURNISSEUR
 # ============================================================
 
-def _asset_name(asset):
-    """
-    Retourne le nom d'affichage d'un actif.
-    """
+FOREX_SYMBOLS = {
+    "EUR/USD": {
+        "twelvedata": "EUR/USD",
+        "finnhub": "OANDA:EUR_USD",
+        "yahoo": "EURUSD=X",
+    },
+    "GBP/USD": {
+        "twelvedata": "GBP/USD",
+        "finnhub": "OANDA:GBP_USD",
+        "yahoo": "GBPUSD=X",
+    },
+    "USD/JPY": {
+        "twelvedata": "USD/JPY",
+        "finnhub": "OANDA:USD_JPY",
+        "yahoo": "JPY=X",
+    },
+    "AUD/USD": {
+        "twelvedata": "AUD/USD",
+        "finnhub": "OANDA:AUD_USD",
+        "yahoo": "AUDUSD=X",
+    },
+    "USD/CHF": {
+        "twelvedata": "USD/CHF",
+        "finnhub": "OANDA:USD_CHF",
+        "yahoo": "CHF=X",
+    },
+    "USD/CAD": {
+        "twelvedata": "USD/CAD",
+        "finnhub": "OANDA:USD_CAD",
+        "yahoo": "CAD=X",
+    },
+    "NZD/USD": {
+        "twelvedata": "NZD/USD",
+        "finnhub": "OANDA:NZD_USD",
+        "yahoo": "NZDUSD=X",
+    },
+    "EUR/GBP": {
+        "twelvedata": "EUR/GBP",
+        "finnhub": "OANDA:EUR_GBP",
+        "yahoo": "EURGBP=X",
+    },
+    "EUR/JPY": {
+        "twelvedata": "EUR/JPY",
+        "finnhub": "OANDA:EUR_JPY",
+        "yahoo": "EURJPY=X",
+    },
+    "GBP/JPY": {
+        "twelvedata": "GBP/JPY",
+        "finnhub": "OANDA:GBP_JPY",
+        "yahoo": "GBPJPY=X",
+    },
+}
 
-    if isinstance(asset, dict):
-        return asset.get("name", "")
 
-    return str(asset)
+# ============================================================
+# MAPPING MATIÈRES PREMIÈRES
+# ============================================================
 
-
-def _asset_symbol(asset):
-    """
-    Retourne le symbole principal d'un actif.
-    """
-
-    if isinstance(asset, dict):
-        return (
-            asset.get("yahoo")
-            or asset.get("twelve_data")
-            or asset.get("finnhub")
-            or asset.get("symbol")
-            or asset.get("name")
-        )
-
-    return str(asset)
+COMMODITY_SYMBOLS = {
+    "GC=F": {
+        "yahoo": "GC=F",
+        "twelvedata": "XAU/USD",
+    },
+    "SI=F": {
+        "yahoo": "SI=F",
+        "twelvedata": "XAG/USD",
+    },
+    "CL=F": {
+        "yahoo": "CL=F",
+        "twelvedata": "WTI/USD",
+    },
+    "BZ=F": {
+        "yahoo": "BZ=F",
+        "twelvedata": "BRENT/USD",
+    },
+    "NG=F": {
+        "yahoo": "NG=F",
+    },
+    "HG=F": {
+        "yahoo": "HG=F",
+    },
+    "ZC=F": {
+        "yahoo": "ZC=F",
+    },
+    "ZS=F": {
+        "yahoo": "ZS=F",
+    },
+    "ZW=F": {
+        "yahoo": "ZW=F",
+    },
+    "KC=F": {
+        "yahoo": "KC=F",
+    },
+    "SB=F": {
+        "yahoo": "SB=F",
+    },
+}
 
 
 # ============================================================
@@ -251,161 +260,27 @@ def _asset_symbol(asset):
 
 def all_assets():
     """
-    Retourne les 86 actifs de l'univers V4.2.
-
-    Chaque élément contient :
-        - name
-        - symbol
-        - asset_type
-        - provider symbols lorsque disponibles
+    Retourne tous les actifs du scanner V4.2.
     """
-
-    assets = []
-
-    # Crypto
-    for symbol in CRYPTO:
-        assets.append(
-            {
-                "name": symbol,
-                "symbol": symbol,
-                "asset_type": "crypto",
-                "binance": symbol,
-            }
-        )
-
-    # Forex
-    for item in FOREX:
-        assets.append(
-            {
-                "name": item["name"],
-                "symbol": item.get("twelve_data") or item["name"],
-                "asset_type": "forex",
-                "twelve_data": item.get("twelve_data"),
-                "finnhub": item.get("finnhub"),
-                "yahoo": item.get("yahoo"),
-            }
-        )
-
-    # Actions
-    for symbol in STOCKS:
-        assets.append(
-            {
-                "name": symbol,
-                "symbol": symbol,
-                "asset_type": "stock",
-                "finnhub": symbol,
-                "yahoo": symbol,
-                "twelve_data": symbol,
-            }
-        )
-
-    # Indices
-    for symbol in INDICES:
-        assets.append(
-            {
-                "name": symbol,
-                "symbol": symbol,
-                "asset_type": "index",
-                "yahoo": symbol,
-                "finnhub": symbol,
-                "twelve_data": symbol,
-            }
-        )
-
-    # Commodities multi-sources
-    for item in COMMODITIES:
-        assets.append(
-            {
-                "name": item["name"],
-                "symbol": item["yahoo"],
-                "asset_type": "commodity",
-                "yahoo": item.get("yahoo"),
-                "twelve_data": item.get("twelve_data"),
-            }
-        )
-
-    # Commodities Yahoo uniquement
-    for symbol in YAHOO_COMMODITIES:
-        assets.append(
-            {
-                "name": symbol,
-                "symbol": symbol,
-                "asset_type": "commodity",
-                "yahoo": symbol,
-            }
-        )
-
-    return assets
+    return (
+        CRYPTO
+        + FOREX
+        + STOCKS
+        + INDICES
+        + COMMODITIES
+        + YAHOO_COMMODITIES
+    )
 
 
 # ============================================================
-# UTILITAIRES
+# NOMBRE TOTAL D'ACTIFS
 # ============================================================
 
 def asset_count():
     """
-    Nombre total d'actifs.
+    Nombre total d'actifs disponibles.
     """
-
     return len(all_assets())
-
-
-def get_display_name(asset):
-    """
-    Retourne le nom d'affichage d'un actif.
-    """
-
-    return _asset_name(asset)
-
-
-def get_symbol(asset):
-    """
-    Retourne le symbole principal d'un actif.
-    """
-
-    return _asset_symbol(asset)
-
-
-def get_asset_type(asset):
-    """
-    Détermine le type d'actif.
-    """
-
-    if isinstance(asset, dict):
-        return asset.get("asset_type")
-
-    symbol = str(asset)
-
-    if symbol in CRYPTO:
-        return "crypto"
-
-    if symbol in STOCKS:
-        return "stock"
-
-    if symbol in INDICES:
-        return "index"
-
-    if symbol in YAHOO_COMMODITIES:
-        return "commodity"
-
-    for item in FOREX:
-        if symbol in {
-            item.get("name"),
-            item.get("twelve_data"),
-            item.get("finnhub"),
-            item.get("yahoo"),
-        }:
-            return "forex"
-
-    for item in COMMODITIES:
-        if symbol in {
-            item.get("name"),
-            item.get("yahoo"),
-            item.get("twelve_data"),
-        }:
-            return "commodity"
-
-    return "stock"
 
 
 # ============================================================
@@ -424,6 +299,10 @@ def stock_count():
     return len(STOCKS)
 
 
+def action_count():
+    return len(ACTIONS)
+
+
 def index_count():
     return len(INDICES)
 
@@ -433,23 +312,248 @@ def commodity_count():
 
 
 # ============================================================
-# INFORMATIONS UNIVERSELLES
+# TYPE D'ACTIF
+# ============================================================
+
+def get_asset_type(symbol):
+    """
+    Retourne le type d'actif correspondant au symbole.
+    """
+
+    if symbol in CRYPTO:
+        return "crypto"
+
+    if symbol in FOREX:
+        return "forex"
+
+    if symbol in STOCKS:
+        return "stock"
+
+    if symbol in INDICES:
+        return "index"
+
+    if symbol in COMMODITIES or symbol in YAHOO_COMMODITIES:
+        return "commodity"
+
+    return "unknown"
+
+
+# ============================================================
+# NOM D'AFFICHAGE
+# ============================================================
+
+DISPLAY_NAMES = {
+    "BTCUSDT": "Bitcoin",
+    "ETHUSDT": "Ethereum",
+    "SOLUSDT": "Solana",
+    "BNBUSDT": "BNB",
+    "XRPUSDT": "XRP",
+    "ADAUSDT": "Cardano",
+    "DOGEUSDT": "Dogecoin",
+    "AVAXUSDT": "Avalanche",
+    "LINKUSDT": "Chainlink",
+    "DOTUSDT": "Polkadot",
+    "TRXUSDT": "TRON",
+    "LTCUSDT": "Litecoin",
+    "BCHUSDT": "Bitcoin Cash",
+    "ATOMUSDT": "Cosmos",
+    "UNIUSDT": "Uniswap",
+    "ETCUSDT": "Ethereum Classic",
+    "XLMUSDT": "Stellar",
+    "NEARUSDT": "NEAR Protocol",
+    "APTUSDT": "Aptos",
+    "FILUSDT": "Filecoin",
+
+    "EUR/USD": "EUR/USD",
+    "GBP/USD": "GBP/USD",
+    "USD/JPY": "USD/JPY",
+    "AUD/USD": "AUD/USD",
+    "USD/CHF": "USD/CHF",
+    "USD/CAD": "USD/CAD",
+    "NZD/USD": "NZD/USD",
+    "EUR/GBP": "EUR/GBP",
+    "EUR/JPY": "EUR/JPY",
+    "GBP/JPY": "GBP/JPY",
+
+    "^GSPC": "S&P 500",
+    "^IXIC": "Nasdaq Composite",
+    "^DJI": "Dow Jones",
+    "^RUT": "Russell 2000",
+    "^FCHI": "CAC 40",
+    "^GDAXI": "DAX",
+    "^FTSE": "FTSE 100",
+    "^N225": "Nikkei 225",
+    "^HSI": "Hang Seng",
+    "^STOXX50E": "Euro Stoxx 50",
+
+    "GC=F": "Gold",
+    "SI=F": "Silver",
+    "CL=F": "WTI Crude Oil",
+    "BZ=F": "Brent Crude Oil",
+    "NG=F": "Natural Gas",
+    "HG=F": "Copper",
+    "ZC=F": "Corn",
+    "ZS=F": "Soybeans",
+    "ZW=F": "Wheat",
+    "KC=F": "Coffee",
+    "SB=F": "Sugar",
+}
+
+
+def get_display_name(symbol):
+    """
+    Retourne le nom lisible de l'actif.
+    """
+    return DISPLAY_NAMES.get(symbol, symbol)
+
+
+# ============================================================
+# SYMBOL GENERIQUE
+# ============================================================
+
+def get_symbol(symbol):
+    """
+    Retourne le symbole canonique utilisé par le scanner.
+    """
+    return symbol
+
+
+# ============================================================
+# SYMBOL FOURNISSEUR
+# ============================================================
+
+def get_provider_symbol(symbol, provider):
+    """
+    Retourne le symbole adapté au fournisseur demandé.
+
+    provider :
+        - binance
+        - finnhub
+        - yahoo
+        - twelvedata
+    """
+
+    provider = str(provider).lower().strip()
+
+    # --------------------------------------------------------
+    # CRYPTO
+    # --------------------------------------------------------
+
+    if symbol in CRYPTO:
+        return symbol
+
+    # --------------------------------------------------------
+    # FOREX
+    # --------------------------------------------------------
+
+    if symbol in FOREX_SYMBOLS:
+        mapping = FOREX_SYMBOLS[symbol]
+
+        if provider in mapping:
+            return mapping[provider]
+
+        return symbol
+
+    # --------------------------------------------------------
+    # COMMODITIES
+    # --------------------------------------------------------
+
+    if symbol in COMMODITY_SYMBOLS:
+        mapping = COMMODITY_SYMBOLS[symbol]
+
+        if provider in mapping:
+            return mapping[provider]
+
+        return symbol
+
+    # --------------------------------------------------------
+    # ACTIONS / INDICES
+    # --------------------------------------------------------
+
+    return symbol
+
+
+# ============================================================
+# MAPPING POUR LE ROUTEUR
+# ============================================================
+
+def get_symbol_map(symbol):
+    """
+    Retourne l'ensemble des symboles disponibles pour un actif.
+    """
+
+    asset_type = get_asset_type(symbol)
+
+    if asset_type == "forex":
+        return FOREX_SYMBOLS.get(symbol, {})
+
+    if asset_type == "commodity":
+        return COMMODITY_SYMBOLS.get(symbol, {})
+
+    return {
+        "binance": symbol,
+        "finnhub": symbol,
+        "yahoo": symbol,
+        "twelvedata": symbol,
+    }
+
+
+# ============================================================
+# GROUPES D'ACTIFS
+# ============================================================
+
+ASSET_GROUPS = {
+    "crypto": CRYPTO,
+    "forex": FOREX,
+    "stocks": STOCKS,
+    "actions": ACTIONS,
+    "indices": INDICES,
+    "commodities": COMMODITIES,
+    "yahoo_commodities": YAHOO_COMMODITIES,
+}
+
+
+# ============================================================
+# MÉTADONNÉES
 # ============================================================
 
 ASSET_COUNTS = {
     "crypto": len(CRYPTO),
     "forex": len(FOREX),
-    "stock": len(STOCKS),
-    "index": len(INDICES),
-    "commodity": len(COMMODITIES) + len(YAHOO_COMMODITIES),
+    "stocks": len(STOCKS),
+    "actions": len(ACTIONS),
+    "indices": len(INDICES),
+    "commodities": len(COMMODITIES),
+    "yahoo_commodities": len(YAHOO_COMMODITIES),
+    "total": len(all_assets()),
 }
 
 
-TOTAL_ASSETS = sum(ASSET_COUNTS.values())
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_assets():
+    """
+    Vérifie que l'univers d'actifs ne contient pas de doublons.
+    """
+
+    assets = all_assets()
+
+    duplicates = {
+        symbol
+        for symbol in assets
+        if assets.count(symbol) > 1
+    }
+
+    if duplicates:
+        raise ValueError(
+            "Doublons détectés dans l'univers d'actifs : "
+            + ", ".join(sorted(duplicates))
+        )
+
+    return True
 
 
-if TOTAL_ASSETS != 86:
-    raise RuntimeError(
-        "Erreur dans l'univers V4.2 : "
-        f"{TOTAL_ASSETS} actifs détectés au lieu de 86."
-    )
+# Validation au chargement du module
+validate_assets()
