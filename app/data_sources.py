@@ -1,22 +1,25 @@
 """
-V4.2 — Data Router multi-sources.
+V4.2.1 — Data Router multi-sources.
 
 Sources :
 - Binance       : crypto 24/7
-- Finnhub       : actions / forex / indices selon disponibilité
-- Yahoo Finance : couverture large
-- Twelve Data   : complément + quota gratuit journalier
+- Yahoo Finance : source principale large et gratuite
+- Twelve Data   : complément / fallback avec quota journalier
+- Finnhub       : conservé uniquement pour compatibilité, mais
+                  retiré du routage OHLCV principal
 
 Principes :
 - routage par type d'actif
 - mapping fournisseur explicite
 - fallback automatique
+- priorité à la qualité et à la fraîcheur
 - circuit breakers différenciés
 - limitation des appels Twelve Data
 - timestamps normalisés en datetime64[ns, UTC]
 - rejet des vraies données futures
+- suppression des bougies incomplètes
 - gestion robuste des volumes
-- conversion automatique des intervalles selon le fournisseur
+- conversion automatique des intervalles
 """
 
 from __future__ import annotations
@@ -58,7 +61,6 @@ HTTP_TIMEOUT = int(
     os.getenv("DATA_HTTP_TIMEOUT", "20")
 )
 
-# Circuit breakers.
 COOLDOWN_403 = int(
     os.getenv("PROVIDER_COOLDOWN_403", "900")
 )
@@ -78,6 +80,19 @@ FUTURE_TOLERANCE_MINUTES = float(
     )
 )
 
+# Fraîcheur maximale considérée comme acceptable.
+#
+# Important :
+# on ne rejette pas systématiquement les données anciennes,
+# car un marché fermé peut parfaitement avoir une dernière
+# bougie vieille de plusieurs heures.
+MAX_INTRADAY_AGE_MINUTES = float(
+    os.getenv(
+        "MAX_INTRADAY_AGE_MINUTES",
+        "180",
+    )
+)
+
 
 class DataSourceError(RuntimeError):
     """Erreur de récupération ou de validation d'une source."""
@@ -93,14 +108,12 @@ def _now_utc() -> pd.Timestamp:
 
 def _normalize_datetime(values: Any) -> pd.Series:
     """
-    Normalise toutes les dates en :
+    Normalise toutes les dates vers :
 
         datetime64[ns, UTC]
 
-    Cette normalisation est importante avec Pandas 3.x car
-    certaines sources peuvent produire des résolutions différentes
-    (ms / us / ns), ce qui peut provoquer des erreurs dans
-    merge_asof().
+    Indispensable avec Pandas 3.x afin d'éviter les conflits
+    de résolution temporelle lors des merge_asof().
     """
 
     s = pd.to_datetime(
@@ -144,15 +157,15 @@ def _empty_frame() -> pd.DataFrame:
 
 def _normalize_internal_interval(interval: str) -> str:
     """
-    Convertit les différentes écritures acceptées par V4.2
-    vers une représentation interne stable.
+    Représentation interne V4.2.1 :
 
-    Exemples :
-        5min  -> 5min
-        5m    -> 5min
-        15m   -> 15min
-        1h    -> 1h
-        1d    -> 1d
+        1min
+        5min
+        15min
+        30min
+        1h
+        4h
+        1d
     """
 
     value = str(interval).strip().lower()
@@ -192,28 +205,14 @@ def _provider_interval(
     interval: str,
 ) -> str:
     """
-    Convertit l'intervalle interne V4.2 vers le format attendu
-    par chaque fournisseur.
-
-    Interne V4.2 :
-        1min / 5min / 15min / 30min / 1h / 4h / 1d
-
-    Binance :
-        1m / 5m / 15m / 30m / 1h / 4h / 1d
-
-    Yahoo :
-        1m / 5m / 15m / 30m / 1h / 1d
-
-    Finnhub :
-        1 / 5 / 15 / 30 / 60 / D
-
-    Twelve Data :
-        1min / 5min / 15min / 30min / 1h / 4h / 1day
+    Conversion de l'intervalle interne vers le format
+    attendu par le fournisseur.
     """
 
     internal = _normalize_internal_interval(interval)
 
     if provider == "binance":
+
         mapping = {
             "1min": "1m",
             "5min": "5m",
@@ -225,6 +224,7 @@ def _provider_interval(
         }
 
     elif provider == "yahoo":
+
         mapping = {
             "1min": "1m",
             "5min": "5m",
@@ -234,14 +234,13 @@ def _provider_interval(
             "1d": "1d",
         }
 
-        # Yahoo Finance ne fournit pas directement 4h dans
-        # l'endpoint chart.
         if internal == "4h":
             raise DataSourceError(
                 "yahoo: intervalle 4h non supporté"
             )
 
     elif provider == "finnhub":
+
         mapping = {
             "1min": "1",
             "5min": "5",
@@ -257,6 +256,7 @@ def _provider_interval(
             )
 
     elif provider == "twelve_data":
+
         mapping = {
             "1min": "1min",
             "5min": "5min",
@@ -268,6 +268,7 @@ def _provider_interval(
         }
 
     else:
+
         raise DataSourceError(
             f"Provider inconnu : {provider}"
         )
@@ -327,9 +328,9 @@ class DataRouter:
 
         self.cache_ttl = 20.0
 
-    # --------------------------------------------------------
-    # Circuit breaker
-    # --------------------------------------------------------
+    # ========================================================
+    # CIRCUIT BREAKER
+    # ========================================================
 
     def _provider_available(
         self,
@@ -342,6 +343,7 @@ class DataRouter:
         )
 
         if time.time() < until:
+
             self.stats[provider][
                 "circuit_breaker"
             ] += 1
@@ -370,9 +372,9 @@ class DataRouter:
             f"pendant {seconds}s : {reason}"
         )
 
-    # --------------------------------------------------------
-    # Rate limiting Twelve Data
-    # --------------------------------------------------------
+    # ========================================================
+    # RATE LIMIT TWELVE DATA
+    # ========================================================
 
     def _rate_limit(
         self,
@@ -388,15 +390,16 @@ class DataRouter:
         )
 
         if elapsed < TD_MIN_REQUEST_INTERVAL:
+
             time.sleep(
                 TD_MIN_REQUEST_INTERVAL - elapsed
             )
 
         self._last_request_at[provider] = time.time()
 
-    # --------------------------------------------------------
+    # ========================================================
     # HTTP
-    # --------------------------------------------------------
+    # ========================================================
 
     def _request_json(
         self,
@@ -427,7 +430,7 @@ class DataRouter:
                     "User-Agent": (
                         "Mozilla/5.0 "
                         "(compatible; "
-                        "V4.2-MultiAsset-Scanner/1.0)"
+                        "V4.2.1-MultiAsset-Scanner/1.0)"
                     )
                 },
             )
@@ -448,10 +451,6 @@ class DataRouter:
 
         status = response.status_code
 
-        # ----------------------------------------------------
-        # 403
-        # ----------------------------------------------------
-
         if status == 403:
 
             self.stats[provider]["failures"] += 1
@@ -465,10 +464,6 @@ class DataRouter:
             raise DataSourceError(
                 f"{provider} HTTP 403"
             )
-
-        # ----------------------------------------------------
-        # 429
-        # ----------------------------------------------------
 
         if status == 429:
 
@@ -484,10 +479,6 @@ class DataRouter:
                 f"{provider} HTTP 429"
             )
 
-        # ----------------------------------------------------
-        # Autres erreurs HTTP
-        # ----------------------------------------------------
-
         if status >= 400:
 
             self.stats[provider]["failures"] += 1
@@ -495,9 +486,11 @@ class DataRouter:
             detail = ""
 
             try:
+
                 text = response.text.strip()
 
                 if text:
+
                     detail = (
                         f" | réponse={text[:180]}"
                     )
@@ -509,10 +502,6 @@ class DataRouter:
                 f"{provider} HTTP {status}"
                 f"{detail}"
             )
-
-        # ----------------------------------------------------
-        # JSON
-        # ----------------------------------------------------
 
         try:
 
@@ -561,24 +550,28 @@ class DataRouter:
                 "time",
                 "open_time",
             }:
+
                 rename[col] = "open_time"
 
             elif c in {
                 "open",
                 "o",
             }:
+
                 rename[col] = "open"
 
             elif c in {
                 "high",
                 "h",
             }:
+
                 rename[col] = "high"
 
             elif c in {
                 "low",
                 "l",
             }:
+
                 rename[col] = "low"
 
             elif c in {
@@ -586,17 +579,17 @@ class DataRouter:
                 "c",
                 "price",
             }:
+
                 rename[col] = "close"
 
             elif c in {
                 "volume",
                 "v",
             }:
+
                 rename[col] = "volume"
 
-        df = df.rename(
-            columns=rename
-        )
+        df = df.rename(columns=rename)
 
         required = [
             "open_time",
@@ -620,6 +613,7 @@ class DataRouter:
             )
 
         if "volume" not in df.columns:
+
             df["volume"] = pd.NA
 
         df["open_time"] = _normalize_datetime(
@@ -689,9 +683,11 @@ class DataRouter:
         )
 
         if s.notna().sum() == 0:
+
             return VOLUME_UNAVAILABLE
 
         if (s.dropna() < 0).any():
+
             return VOLUME_INVALID
 
         coverage = float(
@@ -699,9 +695,11 @@ class DataRouter:
         )
 
         if coverage >= 0.80:
+
             return VOLUME_CONFIRMED
 
         if coverage > 0:
+
             return VOLUME_PARTIAL
 
         return VOLUME_UNAVAILABLE
@@ -848,6 +846,15 @@ class DataRouter:
             volume_status
         )
 
+        coverage = float(
+            pd.to_numeric(
+                df["volume"],
+                errors="coerce",
+            ).notna().mean()
+        )
+
+        df.attrs["volume_coverage"] = coverage
+
         if not df.empty:
 
             age = (
@@ -913,7 +920,10 @@ class DataRouter:
 
         for row in data:
 
-            if not isinstance(row, (list, tuple)):
+            if not isinstance(
+                row,
+                (list, tuple),
+            ):
                 continue
 
             if len(row) < 6:
@@ -1108,6 +1118,13 @@ class DataRouter:
     # ========================================================
     # FINNHUB
     # ========================================================
+    #
+    # Conservé pour compatibilité avec d'anciens appels.
+    #
+    # V4.2.1 NE l'utilise plus dans le routage principal,
+    # car /stock/candle retourne HTTP 403 avec l'accès gratuit
+    # actuellement utilisé.
+    # ========================================================
 
     def _fetch_finnhub(
         self,
@@ -1164,9 +1181,6 @@ class DataRouter:
 
         else:
 
-            # Pour les intraday, on garde une fenêtre
-            # suffisamment large pour obtenir au moins
-            # 120 bougies lorsque le marché est ouvert.
             seconds = (
                 900
                 * max(
@@ -1204,6 +1218,7 @@ class DataRouter:
             )
 
             if message:
+
                 raise DataSourceError(
                     f"finnhub: {message}"
                 )
@@ -1318,9 +1333,8 @@ class DataRouter:
             "format": "JSON",
         }
 
-        # On comptabilise l'appel avant l'envoi.
-        # Cela évite de dépasser artificiellement le quota
-        # en cas de réponse HTTP 429 ou autre erreur.
+        # Comptabilisé avant l'envoi afin de ne pas
+        # dépasser artificiellement le quota.
         self._twelve_data_used += 1
 
         payload = self._request_json(
@@ -1357,7 +1371,10 @@ class DataRouter:
 
         for row in values:
 
-            if not isinstance(row, dict):
+            if not isinstance(
+                row,
+                dict,
+            ):
                 continue
 
             if "datetime" not in row:
@@ -1410,18 +1427,6 @@ class DataRouter:
         provider: str,
         symbol_map: Optional[Dict[str, Any]],
     ) -> Optional[str]:
-        """
-        Résout le symbole selon la map fournie.
-
-        Important :
-        si une map explicite existe pour l'actif et que le
-        fournisseur n'y figure pas, on NE transmet PAS le symbole
-        canonique au hasard.
-
-        Cela évite par exemple d'envoyer :
-            EUR/USD
-        directement à Yahoo ou Binance.
-        """
 
         if not symbol_map:
             return canonical
@@ -1479,6 +1484,10 @@ class DataRouter:
             asset_type
         ).lower()
 
+        # ----------------------------------------------------
+        # CRYPTO
+        # ----------------------------------------------------
+
         if asset_type == "crypto":
 
             return [
@@ -1487,42 +1496,53 @@ class DataRouter:
                 "twelve_data",
             ]
 
+        # ----------------------------------------------------
+        # ACTIONS
+        # ----------------------------------------------------
+
         if asset_type == "stock":
 
             return [
-                "finnhub",
                 "yahoo",
                 "twelve_data",
             ]
+
+        # ----------------------------------------------------
+        # FOREX
+        # ----------------------------------------------------
 
         if asset_type == "forex":
 
             return [
-                "finnhub",
-                "twelve_data",
                 "yahoo",
+                "twelve_data",
             ]
+
+        # ----------------------------------------------------
+        # INDICES
+        # ----------------------------------------------------
 
         if asset_type == "index":
 
             return [
                 "yahoo",
                 "twelve_data",
-                "finnhub",
             ]
+
+        # ----------------------------------------------------
+        # MATIÈRES PREMIÈRES
+        # ----------------------------------------------------
 
         if asset_type == "commodity":
 
             return [
                 "yahoo",
                 "twelve_data",
-                "finnhub",
             ]
 
         return [
             "yahoo",
             "twelve_data",
-            "finnhub",
         ]
 
     # ========================================================
@@ -1541,6 +1561,10 @@ class DataRouter:
 
         score = 100.0
 
+        # ----------------------------------------------------
+        # VOLUME
+        # ----------------------------------------------------
+
         volume_status = self._volume_status(
             df["volume"]
         )
@@ -1548,16 +1572,36 @@ class DataRouter:
         if require_volume:
 
             if volume_status == VOLUME_CONFIRMED:
+
                 score += 10
 
             elif volume_status == VOLUME_PARTIAL:
+
                 score -= 15
 
+            elif volume_status == VOLUME_INVALID:
+
+                score -= 50
+
             else:
+
                 score -= 30
 
+        # ----------------------------------------------------
+        # NOMBRE DE BOUGIES
+        # ----------------------------------------------------
+
         if len(df) < 120:
+
             score -= 30
+
+        elif len(df) < 180:
+
+            score -= 5
+
+        # ----------------------------------------------------
+        # FRAÎCHEUR
+        # ----------------------------------------------------
 
         age = df.attrs.get(
             "age_minutes"
@@ -1566,21 +1610,101 @@ class DataRouter:
         if age is not None:
 
             if age < 0:
+
                 score -= 100
 
-            elif age > 180:
+            elif age <= 30:
+
+                score += 5
+
+            elif age <= 90:
+
+                score += 0
+
+            elif age <= 180:
+
+                score -= 10
+
+            elif age <= 360:
+
                 score -= 20
 
-            elif age > 90:
-                score -= 10
+            else:
+
+                score -= 30
+
+        # ----------------------------------------------------
+        # PROVIDER PREFERENCE
+        # ----------------------------------------------------
+        #
+        # Binance est la source native des cryptos.
+        #
+        # Yahoo reste prioritaire pour les actifs traditionnels
+        # afin de préserver Twelve Data.
+        #
+
+        if provider == "binance":
+
+            score += 5
+
+        elif provider == "yahoo":
+
+            score += 2
+
+        elif provider == "twelve_data":
+
+            score += 0
 
         return max(
             0.0,
             min(
-                110.0,
+                120.0,
                 score,
             ),
         )
+
+    # ========================================================
+    # VALIDATION QUALITATIVE
+    # ========================================================
+
+    def _is_acceptable(
+        self,
+        df: pd.DataFrame,
+        require_volume: bool,
+    ) -> bool:
+
+        if df.empty:
+            return False
+
+        if len(df) < 120:
+            return False
+
+        age = df.attrs.get(
+            "age_minutes"
+        )
+
+        if age is not None:
+
+            # Une donnée future ne doit jamais être acceptée.
+            if age < 0:
+                return False
+
+        if require_volume:
+
+            volume_status = (
+                self._volume_status(
+                    df["volume"]
+                )
+            )
+
+            if volume_status in {
+                VOLUME_INVALID,
+                VOLUME_UNAVAILABLE,
+            }:
+
+                return False
+
+        return True
 
     # ========================================================
     # FETCH PRINCIPAL
@@ -1621,6 +1745,7 @@ class DataRouter:
             if symbol is None:
 
                 self.stats[provider]["skips"] += 1
+
                 continue
 
             if not self._provider_available(
@@ -1628,6 +1753,7 @@ class DataRouter:
             ):
 
                 self.stats[provider]["skips"] += 1
+
                 continue
 
             candidates.append(
@@ -1644,9 +1770,13 @@ class DataRouter:
                 f"aucun provider disponible"
             )
 
-        # ----------------------------------------------------
-        # Tentative fournisseur par fournisseur
-        # ----------------------------------------------------
+        # ====================================================
+        # PHASE 1
+        # Chercher une source immédiatement acceptable.
+        #
+        # Cette phase évite de consommer Twelve Data lorsque
+        # Yahoo/Binance fournit déjà une donnée exploitable.
+        # ====================================================
 
         for provider, symbol in candidates:
 
@@ -1676,13 +1806,14 @@ class DataRouter:
                         cached_df.attrs.copy()
                     )
 
-                    return result
+                    if self._is_acceptable(
+                        result,
+                        require_volume,
+                    ):
+
+                        return result
 
             try:
-
-                # --------------------------------------------
-                # FETCH
-                # --------------------------------------------
 
                 if provider == "binance":
 
@@ -1722,18 +1853,10 @@ class DataRouter:
                         f"Provider inconnu: {provider}"
                     )
 
-                # --------------------------------------------
-                # VALIDATION TEMPORELLE
-                # --------------------------------------------
-
                 df = self._validate_timestamps(
                     df,
                     provider,
                 )
-
-                # --------------------------------------------
-                # SUPPRESSION DERNIÈRE BOUGIE
-                # --------------------------------------------
 
                 df = self._drop_incomplete_last_candle(
                     df,
@@ -1747,20 +1870,12 @@ class DataRouter:
                         f"aucune bougie exploitable"
                     )
 
-                # --------------------------------------------
-                # MÉTADONNÉES
-                # --------------------------------------------
-
                 df = self._attach_metadata(
                     df,
                     provider,
                     symbol,
                     internal_interval,
                 )
-
-                # --------------------------------------------
-                # QUALITY SCORE
-                # --------------------------------------------
 
                 quality = self._quality_score(
                     df,
@@ -1772,16 +1887,44 @@ class DataRouter:
                     quality
                 )
 
-                # --------------------------------------------
-                # CACHE
-                # --------------------------------------------
-
                 self.cache[cache_key] = (
                     time.time(),
                     df.copy(),
                 )
 
-                return df
+                # --------------------------------------------
+                # Source immédiatement acceptable
+                # --------------------------------------------
+
+                if self._is_acceptable(
+                    df,
+                    require_volume,
+                ):
+
+                    return df
+
+                # --------------------------------------------
+                # Source utilisable mais qualité insuffisante
+                # --------------------------------------------
+
+                age = df.attrs.get(
+                    "age_minutes"
+                )
+
+                volume_status = (
+                    df.attrs.get(
+                        "volume_status"
+                    )
+                )
+
+                errors.append(
+                    f"{provider} ({symbol}) : "
+                    f"qualité insuffisante "
+                    f"(bougies={len(df)}, "
+                    f"âge={age}, "
+                    f"volume={volume_status}, "
+                    f"score={quality:.1f})"
+                )
 
             except Exception as exc:
 
@@ -1789,6 +1932,85 @@ class DataRouter:
                     f"{provider} "
                     f"({symbol}) : {exc}"
                 )
+
+        # ====================================================
+        # PHASE 2
+        # Si aucun provider n'a produit une source parfaite,
+        # utiliser la meilleure source disponible.
+        #
+        # Cela évite de déclarer inutilement un actif
+        # "insuffisant" alors que le marché est simplement fermé.
+        # ====================================================
+
+        best_df: Optional[pd.DataFrame] = None
+        best_quality = -1.0
+
+        for provider, symbol in candidates:
+
+            cache_key = (
+                f"{provider}|"
+                f"{symbol}|"
+                f"{internal_interval}|"
+                f"{limit}"
+            )
+
+            cached = self.cache.get(
+                cache_key
+            )
+
+            if not cached:
+                continue
+
+            timestamp, cached_df = cached
+
+            if (
+                time.time() - timestamp
+                >= self.cache_ttl
+            ):
+                continue
+
+            candidate_df = cached_df.copy()
+
+            candidate_df.attrs = (
+                cached_df.attrs.copy()
+            )
+
+            quality = float(
+                candidate_df.attrs.get(
+                    "quality_score",
+                    0.0,
+                )
+            )
+
+            if quality > best_quality:
+
+                best_quality = quality
+                best_df = candidate_df
+
+        if best_df is not None:
+
+            # Pour un actif nécessitant impérativement
+            # le volume, une source sans volume ne doit jamais
+            # être retournée comme donnée valide.
+            if require_volume:
+
+                status = (
+                    best_df.attrs.get(
+                        "volume_status"
+                    )
+                )
+
+                if status in {
+                    VOLUME_INVALID,
+                    VOLUME_UNAVAILABLE,
+                }:
+
+                    raise DataSourceError(
+                        f"{canonical}: "
+                        + " | ".join(errors)
+                    )
+
+            return best_df
 
         raise DataSourceError(
             f"{canonical}: "
