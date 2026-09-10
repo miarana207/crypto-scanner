@@ -29,19 +29,31 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r app/requirements.txt
 
-      - name: Validate Twelve Data secret
+      - name: Validate API secrets
         env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
         run: |
+          if [ -z "$FINNHUB_API_KEY" ]; then
+            echo "::error::Le secret FINNHUB_API_KEY est absent ou vide."
+            echo "Ajoutez-le dans Settings > Secrets and variables > Actions > New repository secret."
+            exit 1
+          fi
+
           if [ -z "$TWELVE_DATA_API_KEY" ]; then
             echo "::error::Le secret TWELVE_DATA_API_KEY est absent ou vide."
             echo "Ajoutez-le dans Settings > Secrets and variables > Actions > New repository secret."
             exit 1
           fi
 
+          echo "Finnhub API key: OK"
+          echo "Twelve Data API key: OK"
+
       - name: Run V4
         env:
           BINANCE_DATA_URL: https://data-api.binance.vision
+
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
 
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
 
