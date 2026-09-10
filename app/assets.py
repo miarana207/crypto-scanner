@@ -1,19 +1,18 @@
 """
 V4.2 — Univers d'actifs.
 
-Les identifiants sont séparés par fournisseur lorsque nécessaire.
-Le routeur V4.2 choisit ensuite automatiquement la source la plus adaptée.
+Univers multi-actifs utilisé par le routeur intelligent V4.2.
 
 Objectifs :
-- univers large multi-actifs
-- séparation claire par type
+- large couverture multi-actifs
+- séparation par catégorie
+- symboles compatibles avec plusieurs fournisseurs
 - compatibilité avec run_and_notify.py
-- symboles spécifiques par fournisseur
+- compatibilité avec DataRouter V4.2
 """
 
 # ============================================================
 # CRYPTO
-# Binance Spot — 24/7
 # ============================================================
 
 CRYPTO = [
@@ -59,7 +58,7 @@ FOREX = [
 
 
 # ============================================================
-# ACTIONS US
+# ACTIONS
 # ============================================================
 
 STOCKS = [
@@ -100,7 +99,7 @@ STOCKS = [
     "CSCO",
 ]
 
-# Compatibilité avec run_and_notify.py
+# Alias utilisé par run_and_notify.py
 ACTIONS = STOCKS
 
 
@@ -125,14 +124,14 @@ INDICES = [
 # ============================================================
 # MATIÈRES PREMIÈRES MULTI-SOURCES
 #
-# Yahoo / Twelve Data / Finnhub lorsque disponible
+# Yahoo + Twelve Data lorsque disponible
 # ============================================================
 
 COMMODITIES = [
     "GC=F",       # Gold
     "SI=F",       # Silver
-    "CL=F",       # WTI Crude Oil
-    "BZ=F",       # Brent Crude Oil
+    "CL=F",       # WTI
+    "BZ=F",       # Brent
     "NG=F",       # Natural Gas
     "HG=F",       # Copper
 ]
@@ -142,13 +141,16 @@ COMMODITIES = [
 # MATIÈRES PREMIÈRES YAHOO UNIQUEMENT
 # ============================================================
 
-YAHOO_COMMODITIES = [
+COMMODITIES_YAHOO_ONLY = [
     "ZC=F",       # Corn
     "ZS=F",       # Soybeans
     "ZW=F",       # Wheat
     "KC=F",       # Coffee
     "SB=F",       # Sugar
 ]
+
+# Alias de compatibilité
+YAHOO_COMMODITIES = COMMODITIES_YAHOO_ONLY
 
 
 # ============================================================
@@ -161,46 +163,55 @@ FOREX_SYMBOLS = {
         "finnhub": "OANDA:EUR_USD",
         "yahoo": "EURUSD=X",
     },
+
     "GBP/USD": {
         "twelvedata": "GBP/USD",
         "finnhub": "OANDA:GBP_USD",
         "yahoo": "GBPUSD=X",
     },
+
     "USD/JPY": {
         "twelvedata": "USD/JPY",
         "finnhub": "OANDA:USD_JPY",
         "yahoo": "JPY=X",
     },
+
     "AUD/USD": {
         "twelvedata": "AUD/USD",
         "finnhub": "OANDA:AUD_USD",
         "yahoo": "AUDUSD=X",
     },
+
     "USD/CHF": {
         "twelvedata": "USD/CHF",
         "finnhub": "OANDA:USD_CHF",
         "yahoo": "CHF=X",
     },
+
     "USD/CAD": {
         "twelvedata": "USD/CAD",
         "finnhub": "OANDA:USD_CAD",
         "yahoo": "CAD=X",
     },
+
     "NZD/USD": {
         "twelvedata": "NZD/USD",
         "finnhub": "OANDA:NZD_USD",
         "yahoo": "NZDUSD=X",
     },
+
     "EUR/GBP": {
         "twelvedata": "EUR/GBP",
         "finnhub": "OANDA:EUR_GBP",
         "yahoo": "EURGBP=X",
     },
+
     "EUR/JPY": {
         "twelvedata": "EUR/JPY",
         "finnhub": "OANDA:EUR_JPY",
         "yahoo": "EURJPY=X",
     },
+
     "GBP/JPY": {
         "twelvedata": "GBP/JPY",
         "finnhub": "OANDA:GBP_JPY",
@@ -218,36 +229,46 @@ COMMODITY_SYMBOLS = {
         "yahoo": "GC=F",
         "twelvedata": "XAU/USD",
     },
+
     "SI=F": {
         "yahoo": "SI=F",
         "twelvedata": "XAG/USD",
     },
+
     "CL=F": {
         "yahoo": "CL=F",
         "twelvedata": "WTI/USD",
     },
+
     "BZ=F": {
         "yahoo": "BZ=F",
         "twelvedata": "BRENT/USD",
     },
+
     "NG=F": {
         "yahoo": "NG=F",
     },
+
     "HG=F": {
         "yahoo": "HG=F",
     },
+
     "ZC=F": {
         "yahoo": "ZC=F",
     },
+
     "ZS=F": {
         "yahoo": "ZS=F",
     },
+
     "ZW=F": {
         "yahoo": "ZW=F",
     },
+
     "KC=F": {
         "yahoo": "KC=F",
     },
+
     "SB=F": {
         "yahoo": "SB=F",
     },
@@ -262,13 +283,14 @@ def all_assets():
     """
     Retourne tous les actifs du scanner V4.2.
     """
+
     return (
         CRYPTO
         + FOREX
         + STOCKS
         + INDICES
         + COMMODITIES
-        + YAHOO_COMMODITIES
+        + COMMODITIES_YAHOO_ONLY
     )
 
 
@@ -278,13 +300,14 @@ def all_assets():
 
 def asset_count():
     """
-    Nombre total d'actifs disponibles.
+    Nombre total d'actifs.
     """
+
     return len(all_assets())
 
 
 # ============================================================
-# COMPTAGES PAR CATÉGORIE
+# COMPTAGES
 # ============================================================
 
 def crypto_count():
@@ -308,7 +331,7 @@ def index_count():
 
 
 def commodity_count():
-    return len(COMMODITIES) + len(YAHOO_COMMODITIES)
+    return len(COMMODITIES) + len(COMMODITIES_YAHOO_ONLY)
 
 
 # ============================================================
@@ -317,7 +340,7 @@ def commodity_count():
 
 def get_asset_type(symbol):
     """
-    Retourne le type d'actif correspondant au symbole.
+    Retourne le type d'actif.
     """
 
     if symbol in CRYPTO:
@@ -332,17 +355,21 @@ def get_asset_type(symbol):
     if symbol in INDICES:
         return "index"
 
-    if symbol in COMMODITIES or symbol in YAHOO_COMMODITIES:
+    if symbol in COMMODITIES:
+        return "commodity"
+
+    if symbol in COMMODITIES_YAHOO_ONLY:
         return "commodity"
 
     return "unknown"
 
 
 # ============================================================
-# NOM D'AFFICHAGE
+# NOMS D'AFFICHAGE
 # ============================================================
 
 DISPLAY_NAMES = {
+    # Crypto
     "BTCUSDT": "Bitcoin",
     "ETHUSDT": "Ethereum",
     "SOLUSDT": "Solana",
@@ -364,6 +391,7 @@ DISPLAY_NAMES = {
     "APTUSDT": "Aptos",
     "FILUSDT": "Filecoin",
 
+    # Forex
     "EUR/USD": "EUR/USD",
     "GBP/USD": "GBP/USD",
     "USD/JPY": "USD/JPY",
@@ -375,6 +403,7 @@ DISPLAY_NAMES = {
     "EUR/JPY": "EUR/JPY",
     "GBP/JPY": "GBP/JPY",
 
+    # Indices
     "^GSPC": "S&P 500",
     "^IXIC": "Nasdaq Composite",
     "^DJI": "Dow Jones",
@@ -386,6 +415,7 @@ DISPLAY_NAMES = {
     "^HSI": "Hang Seng",
     "^STOXX50E": "Euro Stoxx 50",
 
+    # Commodities
     "GC=F": "Gold",
     "SI=F": "Silver",
     "CL=F": "WTI Crude Oil",
@@ -404,48 +434,34 @@ def get_display_name(symbol):
     """
     Retourne le nom lisible de l'actif.
     """
+
     return DISPLAY_NAMES.get(symbol, symbol)
 
 
 # ============================================================
-# SYMBOL GENERIQUE
+# SYMBOLE CANONIQUE
 # ============================================================
 
 def get_symbol(symbol):
     """
-    Retourne le symbole canonique utilisé par le scanner.
+    Retourne le symbole canonique.
     """
+
     return symbol
 
 
 # ============================================================
-# SYMBOL FOURNISSEUR
+# SYMBOLE POUR UN FOURNISSEUR
 # ============================================================
 
 def get_provider_symbol(symbol, provider):
     """
-    Retourne le symbole adapté au fournisseur demandé.
-
-    provider :
-        - binance
-        - finnhub
-        - yahoo
-        - twelvedata
+    Retourne le symbole adapté au fournisseur.
     """
 
     provider = str(provider).lower().strip()
 
-    # --------------------------------------------------------
-    # CRYPTO
-    # --------------------------------------------------------
-
-    if symbol in CRYPTO:
-        return symbol
-
-    # --------------------------------------------------------
-    # FOREX
-    # --------------------------------------------------------
-
+    # Forex
     if symbol in FOREX_SYMBOLS:
         mapping = FOREX_SYMBOLS[symbol]
 
@@ -454,10 +470,7 @@ def get_provider_symbol(symbol, provider):
 
         return symbol
 
-    # --------------------------------------------------------
-    # COMMODITIES
-    # --------------------------------------------------------
-
+    # Matières premières
     if symbol in COMMODITY_SYMBOLS:
         mapping = COMMODITY_SYMBOLS[symbol]
 
@@ -466,20 +479,17 @@ def get_provider_symbol(symbol, provider):
 
         return symbol
 
-    # --------------------------------------------------------
-    # ACTIONS / INDICES
-    # --------------------------------------------------------
-
+    # Actions, indices, crypto
     return symbol
 
 
 # ============================================================
-# MAPPING POUR LE ROUTEUR
+# MAPPING COMPLET POUR LE ROUTEUR
 # ============================================================
 
 def get_symbol_map(symbol):
     """
-    Retourne l'ensemble des symboles disponibles pour un actif.
+    Retourne les symboles disponibles par fournisseur.
     """
 
     asset_type = get_asset_type(symbol)
@@ -509,12 +519,12 @@ ASSET_GROUPS = {
     "actions": ACTIONS,
     "indices": INDICES,
     "commodities": COMMODITIES,
-    "yahoo_commodities": YAHOO_COMMODITIES,
+    "commodities_yahoo_only": COMMODITIES_YAHOO_ONLY,
 }
 
 
 # ============================================================
-# MÉTADONNÉES
+# COMPTAGES STATIQUES
 # ============================================================
 
 ASSET_COUNTS = {
@@ -524,7 +534,7 @@ ASSET_COUNTS = {
     "actions": len(ACTIONS),
     "indices": len(INDICES),
     "commodities": len(COMMODITIES),
-    "yahoo_commodities": len(YAHOO_COMMODITIES),
+    "commodities_yahoo_only": len(COMMODITIES_YAHOO_ONLY),
     "total": len(all_assets()),
 }
 
@@ -535,7 +545,7 @@ ASSET_COUNTS = {
 
 def validate_assets():
     """
-    Vérifie que l'univers d'actifs ne contient pas de doublons.
+    Vérifie l'absence de doublons dans l'univers.
     """
 
     assets = all_assets()
@@ -555,5 +565,8 @@ def validate_assets():
     return True
 
 
-# Validation au chargement du module
+# ============================================================
+# VALIDATION AU CHARGEMENT
+# ============================================================
+
 validate_assets()
