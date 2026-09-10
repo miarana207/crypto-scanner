@@ -1,127 +1,1160 @@
-```python
 """
-V4.2 — Sources de données + routeur intelligent multi-fournisseurs.
+V4.2 — Routeur intelligent multi-sources.
 
-Fournisseurs :
-- Binance
-- Yahoo Finance
-- Finnhub
-- Twelve Data
+Sources :
+    Binance
+        Crypto — source principale et unique.
 
-Architecture V4.2 :
-- OHLC valide obligatoire.
-- Les bougies en formation sont exclues.
-- Le volume manquant reste NaN/NA.
-- Le volume n'est jamais transformé artificiellement en 0.
-- Le routeur choisit dynamiquement la source.
-- Le routeur tient compte de la fraîcheur, du volume, du nombre
-  de bougies et du type d'actif.
-- Twelve Data est protégé par un budget journalier.
-- Les appels identiques sont mis en cache pendant le run.
-- Les intervalles 4h sont correctement agrégés à partir du 1h
-  lorsque le fournisseur ne fournit pas directement du 4h.
-- Les métadonnées de routage sont conservées dans df.attrs.
+    Finnhub
+        Actions — priorité élevée.
+        Forex — tentative lorsque disponible.
+        Volume actions conservé lorsqu'il est fourni.
+
+    Yahoo Finance
+        Actions
+        Indices
+        Futures / matières premières
+        Forex de secours.
+
+    Twelve Data
+        Source de secours intelligente.
+        Budget quotidien partagé : 800 appels maximum.
+
+Principes V4.2 :
+    - aucune dépendance à un ordre de fournisseurs rigide ;
+    - choix dynamique selon catégorie, disponibilité, fraîcheur et volume ;
+    - fallback automatique ;
+    - cache des requêtes identiques pendant le processus ;
+    - volume absent = NaN, jamais 0 ;
+    - couverture volume >= 80 % pour considérer le volume exploitable ;
+    - agrégation correcte des bougies 1H -> 4H ;
+    - exclusion systématique des bougies incomplètes ;
+    - pas de retries inutiles sur Twelve Data ;
+    - compteur Twelve Data partagé entre toutes les instances ;
+    - diagnostic du fournisseur réellement utilisé.
 """
 
 import os
-import time
+import threading
 from datetime import datetime, timezone
-from threading import Lock
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+from backtest import klines as klines_binance
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 load_dotenv()
+
+
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
 
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
-YAHOO_BASE = "https://query1.finance.yahoo.com/v8/finance/chart/"
-TWELVE_DATA_BASE = "https://api.twelvedata.com/time_series"
-FINNHUB_BASE = "https://finnhub.io/api/v1/stock/candle"
-
-BINANCE_BASE = os.getenv(
-    "BINANCE_DATA_URL",
-    "https://data-api.binance.vision",
+YAHOO_BASE = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/"
 )
 
-REQUEST_TIMEOUT = int(
-    os.getenv("DATA_REQUEST_TIMEOUT", "30")
+TWELVE_DATA_BASE = (
+    "https://api.twelvedata.com/time_series"
 )
 
-CACHE_TTL = int(
-    os.getenv("DATA_CACHE_TTL", "45")
+FINNHUB_CANDLE_BASE = (
+    "https://finnhub.io/api/v1/stock/candle"
 )
 
-# Budget quotidien configurable.
-# La valeur par défaut correspond à une utilisation maximale
-# volontairement prudente du quota Twelve Data configuré.
-TWELVEDATA_DAILY_BUDGET = int(
-    os.getenv("TWELVEDATA_DAILY_BUDGET", "800")
+REQUEST_TIMEOUT = 30
+
+# Volume considéré comme réellement exploitable
+VOLUME_MIN_COVERAGE = float(
+    os.getenv("VOLUME_MIN_COVERAGE", "0.80")
+)
+
+# Budget Twelve Data demandé pour V4.2
+TWELVE_DATA_DAILY_BUDGET = int(
+    os.getenv("TWELVE_DATA_DAILY_BUDGET", "800")
 )
 
 
-# ============================================================
-# FORMAT STANDARD
-# ============================================================
+# ======================================================================
+# SESSION HTTP
+# ======================================================================
 
-STANDARD_COLUMNS = [
-    "open_time",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-]
+_SESSION = requests.Session()
 
-
-# ============================================================
-# STATUT DU VOLUME
-# ============================================================
-
-VOLUME_CONFIRMED = "VOLUME_CONFIRMED"
-VOLUME_UNAVAILABLE = "VOLUME_UNAVAILABLE"
-VOLUME_INVALID = "VOLUME_INVALID"
+_SESSION.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(compatible; crypto-scanner-v4.2/1.0)"
+        )
+    }
+)
 
 
-# ============================================================
-# INTERVALLES
-# ============================================================
+# ======================================================================
+# CACHE
+# ======================================================================
 
-_INTERVAL_SECONDS = {
-    "1m": 60,
-    "5m": 5 * 60,
-    "15m": 15 * 60,
-    "30m": 30 * 60,
-    "1h": 60 * 60,
-    "4h": 4 * 60 * 60,
-    "1d": 24 * 60 * 60,
-    "1w": 7 * 24 * 60 * 60,
+_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_key(
+    provider,
+    symbol,
+    interval,
+    limit,
+    asset_type,
+):
+    return (
+        str(provider).lower(),
+        str(symbol),
+        str(interval).lower(),
+        int(limit),
+        str(asset_type).lower(),
+    )
+
+
+def _cache_get(key):
+    with _CACHE_LOCK:
+        value = _CACHE.get(key)
+
+        if value is None:
+            return None
+
+        return value.copy(deep=True)
+
+
+def _cache_set(key, df):
+    with _CACHE_LOCK:
+        _CACHE[key] = df.copy(deep=True)
+
+
+def clear_cache():
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+# ======================================================================
+# COMPTEURS ROUTEUR
+# ======================================================================
+
+_ROUTER_STATS = {
+    "requests": 0,
+    "success": 0,
+    "errors": 0,
+    "cache_hits": 0,
+    "binance": 0,
+    "finnhub": 0,
+    "yahoo": 0,
+    "twelvedata": 0,
+    "fallbacks": 0,
+}
+
+_STATS_LOCK = threading.Lock()
+
+
+def _stats_increment(key, amount=1):
+    with _STATS_LOCK:
+        _ROUTER_STATS[key] = (
+            _ROUTER_STATS.get(key, 0)
+            + amount
+        )
+
+
+def router_stats():
+    with _STATS_LOCK:
+        stats = dict(_ROUTER_STATS)
+
+    stats.update(
+        {
+            "twelvedata_used":
+                DataRouter.twelvedata_used(),
+            "twelvedata_remaining":
+                DataRouter.twelvedata_remaining(),
+            "twelvedata_budget":
+                TWELVE_DATA_DAILY_BUDGET,
+        }
+    )
+
+    return stats
+
+
+# ======================================================================
+# BUDGET TWELVE DATA
+# ======================================================================
+
+class _TwelveDataBudget:
+    """
+    Compteur partagé au niveau du processus.
+
+    Toutes les instances de DataRouter utilisent le même compteur.
+    """
+
+    used = 0
+    day = None
+    lock = threading.Lock()
+
+    @classmethod
+    def _reset_if_needed(cls):
+        today = datetime.now(
+            timezone.utc
+        ).date()
+
+        if cls.day != today:
+            cls.day = today
+            cls.used = 0
+
+    @classmethod
+    def reserve(cls):
+        with cls.lock:
+            cls._reset_if_needed()
+
+            if cls.used >= TWELVE_DATA_DAILY_BUDGET:
+                return False
+
+            cls.used += 1
+            return True
+
+    @classmethod
+    def used_today(cls):
+        with cls.lock:
+            cls._reset_if_needed()
+            return cls.used
+
+    @classmethod
+    def remaining(cls):
+        with cls.lock:
+            cls._reset_if_needed()
+            return max(
+                0,
+                TWELVE_DATA_DAILY_BUDGET - cls.used
+            )
+
+
+# ======================================================================
+# UTILITAIRES
+# ======================================================================
+
+def interval_to_seconds(interval):
+    """
+    Convertit un intervalle en secondes.
+    """
+
+    value = str(
+        interval
+    ).strip().lower()
+
+    if value.endswith("m"):
+        return int(
+            value[:-1]
+        ) * 60
+
+    if value.endswith("h"):
+        return int(
+            value[:-1]
+        ) * 3600
+
+    if value.endswith("d"):
+        return int(
+            value[:-1]
+        ) * 86400
+
+    if value.endswith("w"):
+        return int(
+            value[:-1]
+        ) * 604800
+
+    return 60
+
+
+def normalize_interval(interval):
+    return str(
+        interval
+    ).strip().lower()
+
+
+def empty_ohlcv():
+    df = pd.DataFrame(
+        columns=[
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+    )
+
+    return df
+
+
+def ensure_ohlcv(df):
+    """
+    Normalise systématiquement la structure de sortie.
+    """
+
+    if df is None:
+        return empty_ohlcv()
+
+    d = df.copy()
+
+    required = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+
+    for column in required:
+        if column not in d.columns:
+            d[column] = float("nan")
+
+    d["open_time"] = pd.to_datetime(
+        d["open_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]:
+        d[column] = pd.to_numeric(
+            d[column],
+            errors="coerce",
+        )
+
+    d = d.dropna(
+        subset=[
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+    )
+
+    d = (
+        d.sort_values("open_time")
+        .drop_duplicates(
+            subset=["open_time"],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+
+    return d[
+        required
+    ]
+
+
+def volume_coverage(df):
+    """
+    Pourcentage de bougies disposant d'un volume exploitable.
+    """
+
+    if df is None or df.empty:
+        return 0.0
+
+    if "volume" not in df.columns:
+        return 0.0
+
+    volume = pd.to_numeric(
+        df["volume"],
+        errors="coerce",
+    )
+
+    return float(
+        volume.notna().mean()
+    )
+
+
+def volume_status(df):
+    """
+    Statut explicite du volume.
+    """
+
+    coverage = volume_coverage(df)
+
+    if coverage >= VOLUME_MIN_COVERAGE:
+        return "VOLUME_CONFIRMED"
+
+    if coverage > 0:
+        return "VOLUME_PARTIAL"
+
+    return "VOLUME_UNAVAILABLE"
+
+
+def attach_metadata(
+    df,
+    provider,
+    provider_symbol=None,
+    asset_type=None,
+):
+    """
+    Ajoute les informations du routeur dans DataFrame.attrs.
+    """
+
+    d = ensure_ohlcv(df)
+
+    status = volume_status(d)
+
+    d.attrs["provider"] = provider
+
+    d.attrs["provider_symbol"] = (
+        provider_symbol
+        if provider_symbol is not None
+        else ""
+    )
+
+    d.attrs["asset_type"] = (
+        asset_type
+        if asset_type is not None
+        else ""
+    )
+
+    d.attrs["volume_coverage"] = (
+        volume_coverage(d)
+    )
+
+    d.attrs["volume_status"] = status
+
+    d.attrs["volume_available"] = (
+        status == "VOLUME_CONFIRMED"
+    )
+
+    return d
+
+
+def keep_completed_candles(
+    df,
+    interval,
+):
+    """
+    Exclut les bougies encore en formation.
+
+    On utilise l'heure d'ouverture + durée de l'intervalle.
+    """
+
+    if df is None or df.empty:
+        return df
+
+    d = ensure_ohlcv(df)
+
+    if d.empty:
+        return d
+
+    seconds = interval_to_seconds(
+        interval
+    )
+
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
+
+    completed = (
+        (
+            now - d["open_time"]
+        ).dt.total_seconds()
+        >= seconds
+    )
+
+    d = (
+        d.loc[completed]
+        .copy()
+        .reset_index(drop=True)
+    )
+
+    return d
+
+
+def _completed_limit(
+    limit,
+    interval,
+):
+    """
+    Quantité brute à demander pour obtenir suffisamment
+    de bougies après exclusion des bougies incomplètes.
+
+    Pour 4H via agrégation 1H, on demande environ 4x.
+    """
+
+    limit = max(
+        1,
+        int(limit)
+    )
+
+    if normalize_interval(interval) == "4h":
+        return min(
+            5000,
+            limit * 4 + 20,
+        )
+
+    return min(
+        5000,
+        limit + 10,
+    )
+
+
+# ======================================================================
+# AGRÉGATION
+# ======================================================================
+
+def aggregate_ohlcv(
+    df,
+    target_interval,
+):
+    """
+    Agrège des bougies inférieures vers l'intervalle cible.
+
+    Exemple :
+        1H -> 4H
+
+    Règle volume :
+        le volume agrégé n'est conservé que si TOUS les composants
+        disposent d'un volume réel.
+
+        Sinon :
+            NaN
+
+    On ne fabrique jamais un volume partiel.
+    """
+
+    if df is None or df.empty:
+        return empty_ohlcv()
+
+    d = ensure_ohlcv(df)
+
+    if d.empty:
+        return d
+
+    target = normalize_interval(
+        target_interval
+    )
+
+    if target == "4h":
+        rule = "4h"
+    elif target == "2h":
+        rule = "2h"
+    elif target == "1h":
+        return d
+    else:
+        raise ValueError(
+            f"Intervalle d'agrégation non supporté : "
+            f"{target_interval}"
+        )
+
+    x = d.set_index(
+        "open_time"
+    )
+
+    grouped = x[
+        [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+    ].resample(
+        rule,
+        label="left",
+        closed="left",
+    )
+
+    result = grouped.agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+        }
+    )
+
+    volume_sum = grouped[
+        "volume"
+    ].sum(
+        min_count=1
+    )
+
+    volume_count = grouped[
+        "volume"
+    ].count()
+
+    expected_seconds = (
+        interval_to_seconds("1h")
+    )
+
+    expected_children = (
+        interval_to_seconds(target)
+        // expected_seconds
+    )
+
+    result["volume"] = volume_sum.where(
+        volume_count == expected_children
+    )
+
+    result = (
+        result.dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        )
+        .reset_index()
+    )
+
+    result = keep_completed_candles(
+        result,
+        target,
+    )
+
+    return ensure_ohlcv(
+        result
+    )
+
+
+# ======================================================================
+# YAHOO FINANCE
+# ======================================================================
+
+_YAHOO_CONFIG = {
+    "1m": {
+        "range": "7d",
+        "interval": "1m",
+    },
+    "5m": {
+        "range": "60d",
+        "interval": "5m",
+    },
+    "15m": {
+        "range": "60d",
+        "interval": "15m",
+    },
+    "30m": {
+        "range": "60d",
+        "interval": "30m",
+    },
+    "1h": {
+        "range": "730d",
+        "interval": "1h",
+    },
+    "1d": {
+        "range": "10y",
+        "interval": "1d",
+    },
 }
 
 
-# Yahoo Finance.
-#
-# Pour 4h, Yahoo est interrogé en 1h puis les bougies sont
-# agrégées localement.
-_YF_CONFIG = {
-    "1m": ("7d", "1m"),
-    "5m": ("60d", "5m"),
-    "15m": ("60d", "15m"),
-    "30m": ("60d", "30m"),
-    "1h": ("730d", "1h"),
-    "4h": ("730d", "1h"),
-    "1d": ("10y", "1d"),
+def _yahoo_raw(
+    symbol,
+    interval,
+    limit,
+):
+    """
+    Téléchargement brut Yahoo.
+    """
+
+    requested_interval = normalize_interval(
+        interval
+    )
+
+    # Yahoo ne reçoit pas 4H directement :
+    # on demande du 1H puis on agrège.
+    yahoo_interval = (
+        "1h"
+        if requested_interval == "4h"
+        else requested_interval
+    )
+
+    config = _YAHOO_CONFIG.get(
+        yahoo_interval,
+        {
+            "range": "60d",
+            "interval": yahoo_interval,
+        },
+    )
+
+    url = (
+        YAHOO_BASE
+        + requests.utils.quote(
+            str(symbol),
+            safe="",
+        )
+    )
+
+    params = {
+        "range": config["range"],
+        "interval": config["interval"],
+        "includePrePost": "false",
+        "events": "div,splits",
+    }
+
+    response = _SESSION.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            f"Yahoo HTTP 429 pour {symbol}"
+        )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    chart = payload.get(
+        "chart",
+        {},
+    )
+
+    results = chart.get(
+        "result"
+    )
+
+    if not results:
+        error = chart.get(
+            "error"
+        )
+
+        raise RuntimeError(
+            f"Yahoo : aucune donnée pour "
+            f"{symbol} : {error}"
+        )
+
+    result = results[0]
+
+    timestamps = result.get(
+        "timestamp",
+        [],
+    )
+
+    quote_list = (
+        result
+        .get("indicators", {})
+        .get("quote", [])
+    )
+
+    if not timestamps or not quote_list:
+        return empty_ohlcv()
+
+    quote = quote_list[0]
+
+    df = pd.DataFrame(
+        {
+            "open_time": pd.to_datetime(
+                timestamps,
+                unit="s",
+                utc=True,
+                errors="coerce",
+            ),
+            "open": quote.get(
+                "open",
+                [],
+            ),
+            "high": quote.get(
+                "high",
+                [],
+            ),
+            "low": quote.get(
+                "low",
+                [],
+            ),
+            "close": quote.get(
+                "close",
+                [],
+            ),
+            "volume": quote.get(
+                "volume",
+                [],
+            ),
+        }
+    )
+
+    return ensure_ohlcv(
+        df
+    )
+
+
+def klines_yahoo(
+    symbol,
+    interval="15m",
+    limit=1000,
+    asset_type="stock",
+):
+    """
+    Récupère des bougies Yahoo.
+
+    4H :
+        Yahoo 1H -> agrégation V4.2 4H.
+    """
+
+    interval = normalize_interval(
+        interval
+    )
+
+    key = _cache_key(
+        "yahoo",
+        symbol,
+        interval,
+        limit,
+        asset_type,
+    )
+
+    cached = _cache_get(
+        key
+    )
+
+    if cached is not None:
+        _stats_increment(
+            "cache_hits"
+        )
+
+        return attach_metadata(
+            cached,
+            "yahoo",
+            symbol,
+            asset_type,
+        )
+
+    raw_limit = _completed_limit(
+        limit,
+        interval,
+    )
+
+    df = _yahoo_raw(
+        symbol,
+        interval,
+        raw_limit,
+    )
+
+    if interval == "4h":
+        df = aggregate_ohlcv(
+            df,
+            "4h",
+        )
+
+    else:
+        df = keep_completed_candles(
+            df,
+            interval,
+        )
+
+    df = (
+        ensure_ohlcv(df)
+        .tail(int(limit))
+        .reset_index(drop=True)
+    )
+
+    _cache_set(
+        key,
+        df,
+    )
+
+    return attach_metadata(
+        df,
+        "yahoo",
+        symbol,
+        asset_type,
+    )
+
+
+# ======================================================================
+# FINNHUB
+# ======================================================================
+
+_FINNHUB_RESOLUTION = {
+    "1m": "1",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "1d": "D",
+    "1w": "W",
 }
 
 
-# Twelve Data.
+def _finnhub_period(
+    interval,
+    limit,
+):
+    """
+    Calcule une fenêtre Unix suffisamment large.
+    """
+
+    seconds = interval_to_seconds(
+        interval
+    )
+
+    now = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    # Marge importante pour les marchés fermés
+    # et pour les périodes sans cotation.
+    total = (
+        max(100, int(limit))
+        * seconds
+        * 2
+    )
+
+    return (
+        now - total,
+        now,
+    )
+
+
+def _finnhub_raw(
+    symbol,
+    interval,
+    limit,
+):
+    """
+    Récupère les candles Finnhub.
+
+    Le volume 'v' est conservé lorsqu'il est fourni.
+    """
+
+    if not FINNHUB_API_KEY:
+        raise RuntimeError(
+            "FINNHUB_API_KEY absente."
+        )
+
+    requested_interval = normalize_interval(
+        interval
+    )
+
+    if requested_interval == "4h":
+        resolution = "60"
+        raw_interval = "1h"
+    else:
+        resolution = _FINNHUB_RESOLUTION.get(
+            requested_interval
+        )
+
+        if resolution is None:
+            raise RuntimeError(
+                f"Intervalle Finnhub non supporté : "
+                f"{interval}"
+            )
+
+        raw_interval = requested_interval
+
+    start, end = _finnhub_period(
+        raw_interval,
+        _completed_limit(
+            limit,
+            requested_interval,
+        ),
+    )
+
+    params = {
+        "symbol": symbol,
+        "resolution": resolution,
+        "from": start,
+        "to": end,
+        "token": FINNHUB_API_KEY,
+    }
+
+    response = _SESSION.get(
+        FINNHUB_CANDLE_BASE,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            f"Finnhub HTTP 429 pour {symbol}"
+        )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    status = str(
+        payload.get(
+            "s",
+            ""
+        )
+    ).lower()
+
+    if status not in {
+        "ok",
+    }:
+        raise RuntimeError(
+            f"Finnhub : aucune donnée pour "
+            f"{symbol} : {payload}"
+        )
+
+    timestamps = payload.get(
+        "t",
+        [],
+    )
+
+    opens = payload.get(
+        "o",
+        [],
+    )
+
+    highs = payload.get(
+        "h",
+        [],
+    )
+
+    lows = payload.get(
+        "l",
+        [],
+    )
+
+    closes = payload.get(
+        "c",
+        [],
+    )
+
+    volumes = payload.get(
+        "v",
+        [],
+    )
+
+    if not timestamps:
+        return empty_ohlcv()
+
+    df = pd.DataFrame(
+        {
+            "open_time": pd.to_datetime(
+                timestamps,
+                unit="s",
+                utc=True,
+                errors="coerce",
+            ),
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+        }
+    )
+
+    # Finnhub peut ne pas retourner le volume
+    # pour certains instruments.
+    if len(volumes) != len(timestamps):
+        df["volume"] = float("nan")
+
+    return ensure_ohlcv(
+        df
+    )
+
+
+def klines_finnhub(
+    symbol,
+    interval="15m",
+    limit=1000,
+    asset_type="stock",
+):
+    """
+    Finnhub V4.2.
+
+    Pour les actions :
+        volume réel conservé.
+
+    Pour les instruments sans volume :
+        NaN.
+
+    Pour 4H :
+        1H -> 4H.
+    """
+
+    interval = normalize_interval(
+        interval
+    )
+
+    key = _cache_key(
+        "finnhub",
+        symbol,
+        interval,
+        limit,
+        asset_type,
+    )
+
+    cached = _cache_get(
+        key
+    )
+
+    if cached is not None:
+        _stats_increment(
+            "cache_hits"
+        )
+
+        return attach_metadata(
+            cached,
+            "finnhub",
+            symbol,
+            asset_type,
+        )
+
+    raw_limit = _completed_limit(
+        limit,
+        interval,
+    )
+
+    df = _finnhub_raw(
+        symbol,
+        interval,
+        raw_limit,
+    )
+
+    if interval == "4h":
+        df = aggregate_ohlcv(
+            df,
+            "4h",
+        )
+
+    else:
+        df = keep_completed_candles(
+            df,
+            interval,
+        )
+
+    df = (
+        ensure_ohlcv(df)
+        .tail(int(limit))
+        .reset_index(drop=True)
+    )
+
+    _cache_set(
+        key,
+        df,
+    )
+
+    return attach_metadata(
+        df,
+        "finnhub",
+        symbol,
+        asset_type,
+    )
+
+
+# ======================================================================
+# TWELVE DATA
+# ======================================================================
+
 _TD_INTERVALS = {
     "1m": "1min",
     "5m": "5min",
@@ -133,1457 +1166,800 @@ _TD_INTERVALS = {
 }
 
 
-# Finnhub.
-#
-# Finnhub ne fournit pas nécessairement une bougie 4h directement
-# dans l'API candle. On récupère donc du 60 minutes puis on agrège.
-_FH_RESOLUTION = {
-    "1m": "1",
-    "5m": "5",
-    "15m": "15",
-    "30m": "30",
-    "1h": "60",
-    "4h": "60",
-    "1d": "D",
-}
-
-
-# ============================================================
-# CACHE MÉMOIRE
-# ============================================================
-
-_CACHE = {}
-_CACHE_LOCK = Lock()
-
-
-def _cache_get(key):
-    """Retourne une copie du cache si elle est encore valide."""
-
-    with _CACHE_LOCK:
-        item = _CACHE.get(key)
-
-        if item is None:
-            return None
-
-        timestamp, dataframe = item
-
-        if time.time() - timestamp <= CACHE_TTL:
-            return dataframe.copy()
-
-        _CACHE.pop(key, None)
-
-    return None
-
-
-def _cache_put(key, dataframe):
-    """Stocke une copie du DataFrame dans le cache."""
-
-    with _CACHE_LOCK:
-        _CACHE[key] = (
-            time.time(),
-            dataframe.copy(),
-        )
-
-
-# ============================================================
-# UTILITAIRES INTERVALLES
-# ============================================================
-
-def interval_to_seconds(interval):
-    """
-    Convertit un intervalle en secondes.
-
-    Exemple :
-        15m -> 900
-        1h  -> 3600
-        4h  -> 14400
-        1d  -> 86400
-    """
-
-    interval = str(interval).lower().strip()
-
-    if interval in _INTERVAL_SECONDS:
-        return _INTERVAL_SECONDS[interval]
-
-    unit = interval[-1:] if interval else ""
-    value_text = interval[:-1]
-
-    try:
-        value = int(value_text)
-    except (TypeError, ValueError):
-        return 60
-
-    multiplier = {
-        "m": 60,
-        "h": 3600,
-        "d": 86400,
-        "w": 604800,
-    }.get(unit)
-
-    if multiplier is None:
-        return 60
-
-    return value * multiplier
-
-
-def _required_raw_limit(interval, limit):
-    """
-    Détermine combien de bougies brutes il faut demander.
-
-    Pour une agrégation 4h depuis du 1h, il faut environ 4 fois
-    plus de bougies.
-    """
-
-    limit = max(1, int(limit))
-
-    if interval == "4h":
-        return min(limit * 4 + 20, 5000)
-
-    return limit
-
-
-# ============================================================
-# BOUGIES COMPLÉTÉES
-# ============================================================
-
-def keep_completed_candles(df, interval):
-    """
-    Supprime les bougies encore en formation.
-
-    Une bougie est considérée comme terminée lorsque :
-
-        maintenant >= open_time + durée_intervalle
-    """
-
-    if df is None or df.empty:
-        return pd.DataFrame(columns=STANDARD_COLUMNS)
-
-    out = df.copy()
-
-    if "open_time" not in out.columns:
-        return pd.DataFrame(columns=STANDARD_COLUMNS)
-
-    out["open_time"] = pd.to_datetime(
-        out["open_time"],
-        utc=True,
-        errors="coerce",
-    )
-
-    out = out.dropna(subset=["open_time"])
-
-    now = pd.Timestamp.now(tz="UTC")
-
-    duration = interval_to_seconds(interval)
-
-    completed = (
-        now - out["open_time"]
-    ).dt.total_seconds() >= duration
-
-    out = out.loc[completed].copy()
-
-    out = (
-        out
-        .sort_values("open_time")
-        .drop_duplicates("open_time", keep="last")
-        .reset_index(drop=True)
-    )
-
-    return out
-
-
-# ============================================================
-# NORMALISATION OHLCV
-# ============================================================
-
-def normalize_ohlcv(df, interval="15m", limit=1000):
-    """
-    Normalise toutes les sources dans le même format.
-
-    Important :
-    - OHLC est obligatoire.
-    - volume peut rester NaN.
-    - volume manquant n'est jamais remplacé par 0.
-    """
-
-    if df is None or df.empty:
-        return pd.DataFrame(columns=STANDARD_COLUMNS)
-
-    out = df.copy()
-
-    # Création des colonnes manquantes.
-    for column in STANDARD_COLUMNS:
-
-        if column not in out.columns:
-
-            if column == "volume":
-                out[column] = pd.NA
-            else:
-                out[column] = float("nan")
-
-    # Conversion timestamp.
-    out["open_time"] = pd.to_datetime(
-        out["open_time"],
-        utc=True,
-        errors="coerce",
-    )
-
-    # Conversion numérique.
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]:
-        out[column] = pd.to_numeric(
-            out[column],
-            errors="coerce",
-        )
-
-    # OHLC obligatoire.
-    out = out.dropna(
-        subset=[
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
-    )
-
-    # Vérification cohérence OHLC.
-    valid_high = (
-        out["high"]
-        >= out[["open", "close"]].max(axis=1)
-    )
-
-    valid_low = (
-        out["low"]
-        <= out[["open", "close"]].min(axis=1)
-    )
-
-    out = out.loc[
-        valid_high & valid_low
-    ].copy()
-
-    # Tri + suppression des doublons.
-    out = (
-        out
-        .sort_values("open_time")
-        .drop_duplicates(
-            "open_time",
-            keep="last",
-        )
-    )
-
-    # Exclusion des bougies en formation.
-    out = keep_completed_candles(
-        out,
-        interval,
-    )
-
-    return (
-        out[STANDARD_COLUMNS]
-        .tail(int(limit))
-        .reset_index(drop=True)
-    )
-
-
-# ============================================================
-# AGRÉGATION
-# ============================================================
-
-def aggregate_ohlcv(df, target_interval):
-    """
-    Agrège des bougies 1h en 4h.
-
-    OHLC :
-        open  = première valeur
-        high  = maximum
-        low   = minimum
-        close = dernière valeur
-
-    Volume :
-        somme uniquement si le volume existe.
-
-    Si aucun volume n'existe, le résultat conserve NaN.
-    """
-
-    if df is None or df.empty:
-        return pd.DataFrame(columns=STANDARD_COLUMNS)
-
-    if target_interval != "4h":
-        return normalize_ohlcv(
-            df,
-            target_interval,
-            len(df),
-        )
-
-    out = normalize_ohlcv(
-        df,
-        "1h",
-        len(df),
-    )
-
-    if out.empty:
-        return pd.DataFrame(columns=STANDARD_COLUMNS)
-
-    out = out.set_index("open_time")
-
-    aggregation = {
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-    }
-
-    # Ne somme le volume que s'il existe réellement.
-    volume_numeric = pd.to_numeric(
-        out["volume"],
-        errors="coerce",
-    )
-
-    if volume_numeric.notna().any():
-        aggregation["volume"] = "sum"
-
-    grouped = (
-        out
-        .resample("4h", origin="epoch")
-        .agg(aggregation)
-    )
-
-    if "volume" not in grouped.columns:
-        grouped["volume"] = pd.NA
-
-    grouped = grouped.reset_index()
-
-    grouped = normalize_ohlcv(
-        grouped,
-        "4h",
-        len(grouped),
-    )
-
-    return grouped
-
-
-# ============================================================
-# VOLUME
-# ============================================================
-
-def volume_status(df):
-    """
-    Détermine l'état du volume.
-
-    Important :
-    - NaN = volume indisponible.
-    - 0 n'est pas automatiquement converti en NaN.
-    - un volume négatif est invalide.
-    """
-
-    if (
-        df is None
-        or df.empty
-        or "volume" not in df.columns
-    ):
-        return VOLUME_UNAVAILABLE
-
-    volume = pd.to_numeric(
-        df["volume"],
-        errors="coerce",
-    )
-
-    valid_values = volume.dropna()
-
-    if valid_values.empty:
-        return VOLUME_UNAVAILABLE
-
-    if (valid_values < 0).any():
-        return VOLUME_INVALID
-
-    return VOLUME_CONFIRMED
-
-
-def volume_coverage(df):
-    """
-    Pourcentage de bougies disposant d'un volume exploitable.
-    """
-
-    if (
-        df is None
-        or df.empty
-        or "volume" not in df.columns
-    ):
-        return 0.0
-
-    volume = pd.to_numeric(
-        df["volume"],
-        errors="coerce",
-    )
-
-    if len(volume) == 0:
-        return 0.0
-
-    return float(
-        volume.notna().mean()
-    )
-
-
-# ============================================================
-# QUALITÉ DES DONNÉES
-# ============================================================
-
-def data_quality(
-    df,
-    interval="15m",
-    min_candles=120,
+def _twelvedata_error_message(
+    payload,
 ):
-    """
-    Évalue la qualité d'un dataset.
-
-    Retourne notamment :
-        valid
-        candles
-        fresh
-        age_seconds
-        volume_status
-        volume_coverage
-    """
-
-    if df is None or df.empty:
-        return {
-            "valid": False,
-            "candles": 0,
-            "volume_status": VOLUME_UNAVAILABLE,
-            "volume_coverage": 0.0,
-            "fresh": False,
-            "age_seconds": None,
-        }
-
-    out = normalize_ohlcv(
-        df,
-        interval,
-        max(
-            len(df),
-            int(min_candles),
-        ),
+    message = payload.get(
+        "message"
     )
 
-    if out.empty:
-        return {
-            "valid": False,
-            "candles": 0,
-            "volume_status": VOLUME_UNAVAILABLE,
-            "volume_coverage": 0.0,
-            "fresh": False,
-            "age_seconds": None,
-        }
-
-    now = pd.Timestamp.now(tz="UTC")
-
-    latest = out["open_time"].iloc[-1]
-
-    age = (
-        now - latest
-    ).total_seconds()
-
-    # Tolérance de fraîcheur.
-    #
-    # Pour un scan périodique, on accepte plusieurs périodes,
-    # mais pas une donnée manifestement ancienne.
-    fresh_limit = max(
-        interval_to_seconds(interval) * 4,
-        15 * 60,
-    )
-
-    return {
-        "valid": len(out) >= int(min_candles),
-        "candles": len(out),
-        "volume_status": volume_status(out),
-        "volume_coverage": volume_coverage(out),
-        "fresh": age <= fresh_limit,
-        "age_seconds": max(0.0, age),
-    }
-
-
-# ============================================================
-# HTTP
-# ============================================================
-
-def _request_json(
-    url,
-    params=None,
-    headers=None,
-):
-    """
-    Requête HTTP standardisée.
-    """
-
-    response = requests.get(
-        url,
-        params=params,
-        headers=headers or {},
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    response.raise_for_status()
-
-    return response.json(), response.headers
-
-
-# ============================================================
-# YAHOO FINANCE
-# ============================================================
-
-def klines_yahoo(
-    symbol,
-    interval="15m",
-    limit=1000,
-):
-    """
-    Récupère les données Yahoo Finance.
-
-    Pour 4h :
-        Yahoo -> 1h -> agrégation locale 4h.
-    """
-
-    cache_key = (
-        "yahoo",
-        symbol,
-        interval,
-        int(limit),
-    )
-
-    cached = _cache_get(cache_key)
-
-    if cached is not None:
-        return cached
-
-    if interval not in _YF_CONFIG:
-        raise ValueError(
-            f"Intervalle Yahoo non supporté: {interval}"
+    if message:
+        return str(
+            message
         )
 
-    range_value, yf_interval = _YF_CONFIG[interval]
-
-    raw_limit = _required_raw_limit(
-        interval,
-        limit,
+    code = payload.get(
+        "code"
     )
 
-    params = {
-        "range": range_value,
-        "interval": yf_interval,
-        "includePrePost": "false",
-        "events": "div,splits",
-    }
+    if code:
+        return f"code={code}"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 scanner-v4.2"
-    }
+    return "Erreur Twelve Data"
 
-    data, _ = _request_json(
-        YAHOO_BASE + str(symbol),
-        params=params,
-        headers=headers,
-    )
-
-    result = (
-        data
-        .get("chart", {})
-        .get("result")
-        or []
-    )
-
-    if not result:
-        raise RuntimeError(
-            f"Yahoo: aucune donnée pour {symbol}"
-        )
-
-    result = result[0]
-
-    timestamps = (
-        result.get("timestamp")
-        or []
-    )
-
-    indicators = result.get(
-        "indicators",
-        {},
-    )
-
-    quote_list = (
-        indicators.get("quote")
-        or [{}]
-    )
-
-    quote = quote_list[0]
-
-    opens = quote.get("open") or []
-    highs = quote.get("high") or []
-    lows = quote.get("low") or []
-    closes = quote.get("close") or []
-    volumes = quote.get("volume")
-
-    n = min(
-        len(timestamps),
-        len(opens),
-        len(highs),
-        len(lows),
-        len(closes),
-    )
-
-    rows = []
-
-    for i in range(n):
-
-        volume_value = None
-
-        if volumes is not None and i < len(volumes):
-            volume_value = volumes[i]
-
-        rows.append(
-            {
-                "open_time": pd.to_datetime(
-                    timestamps[i],
-                    unit="s",
-                    utc=True,
-                ),
-                "open": opens[i],
-                "high": highs[i],
-                "low": lows[i],
-                "close": closes[i],
-                "volume": volume_value,
-            }
-        )
-
-    out = pd.DataFrame(rows)
-
-    if interval == "4h":
-        # Normalisation en 1h avant agrégation.
-        out = normalize_ohlcv(
-            out,
-            "1h",
-            raw_limit,
-        )
-
-        out = aggregate_ohlcv(
-            out,
-            "4h",
-        )
-
-        out = out.tail(
-            int(limit)
-        ).reset_index(drop=True)
-
-    else:
-        out = normalize_ohlcv(
-            out,
-            interval,
-            limit,
-        )
-
-    _cache_put(
-        cache_key,
-        out,
-    )
-
-    return out
-
-
-# ============================================================
-# TWELVE DATA
-# ============================================================
 
 def klines_twelvedata(
     symbol,
     interval="15m",
     limit=1000,
+    asset_type="stock",
 ):
     """
-    Récupère les données Twelve Data.
+    Twelve Data.
 
-    Twelve Data est volontairement appelé uniquement lorsque
-    le routeur le décide.
-
-    Cela permet de préserver le quota quotidien.
+    IMPORTANT :
+        - une seule requête par appel logique ;
+        - aucun retry automatique ;
+        - budget quotidien partagé ;
+        - volume absent = NaN ;
+        - volume réel conservé.
     """
 
     if not TWELVE_DATA_API_KEY:
         raise RuntimeError(
-            "TWELVE_DATA_API_KEY non configurée"
+            "TWELVE_DATA_API_KEY absente."
         )
 
-    cache_key = (
+    interval = normalize_interval(
+        interval
+    )
+
+    key = _cache_key(
         "twelvedata",
         symbol,
         interval,
-        int(limit),
+        limit,
+        asset_type,
     )
 
-    cached = _cache_get(cache_key)
+    cached = _cache_get(
+        key
+    )
 
     if cached is not None:
-        return cached
-
-    td_interval = _TD_INTERVALS.get(interval)
-
-    if not td_interval:
-        raise ValueError(
-            f"Intervalle Twelve Data non supporté: {interval}"
+        _stats_increment(
+            "cache_hits"
         )
+
+        return attach_metadata(
+            cached,
+            "twelvedata",
+            symbol,
+            asset_type,
+        )
+
+    # Une réservation = une requête API.
+    if not _TwelveDataBudget.reserve():
+        raise RuntimeError(
+            "Budget Twelve Data quotidien atteint "
+            f"({TWELVE_DATA_DAILY_BUDGET} appels)."
+        )
+
+    td_interval = _TD_INTERVALS.get(
+        interval
+    )
+
+    if td_interval is None:
+        raise RuntimeError(
+            f"Intervalle Twelve Data non supporté : "
+            f"{interval}"
+        )
+
+    outputsize = min(
+        max(1, int(limit)),
+        5000,
+    )
 
     params = {
         "symbol": symbol,
         "interval": td_interval,
-        "outputsize": min(
-            int(limit),
-            5000,
-        ),
+        "outputsize": outputsize,
         "apikey": TWELVE_DATA_API_KEY,
         "format": "JSON",
         "timezone": "UTC",
     }
 
-    last_error = None
-
-    # Maximum 2 tentatives.
-    # Cela évite de multiplier inutilement les appels.
-    for attempt in range(2):
-
-        try:
-
-            data, _ = _request_json(
-                TWELVE_DATA_BASE,
-                params=params,
-            )
-
-            if (
-                data.get("status") == "error"
-                or data.get("code")
-            ):
-                raise RuntimeError(
-                    data.get("message")
-                    or str(data)
-                )
-
-            values = (
-                data.get("values")
-                or []
-            )
-
-            if not values:
-                raise RuntimeError(
-                    f"Twelve Data: aucune donnée pour {symbol}"
-                )
-
-            out = (
-                pd.DataFrame(values)
-                .rename(
-                    columns={
-                        "datetime": "open_time"
-                    }
-                )
-            )
-
-            out = normalize_ohlcv(
-                out,
-                interval,
-                limit,
-            )
-
-            _cache_put(
-                cache_key,
-                out,
-            )
-
-            return out
-
-        except Exception as exc:
-
-            last_error = exc
-
-            if attempt == 0:
-                time.sleep(1)
-
-    raise RuntimeError(
-        f"Twelve Data {symbol}: {last_error}"
-    )
-
-
-# ============================================================
-# FINNHUB
-# ============================================================
-
-def klines_finnhub(
-    symbol,
-    interval="15m",
-    limit=1000,
-):
-    """
-    Récupère les bougies Finnhub.
-
-    Le volume n'est volontairement PAS inventé.
-
-    Pour 4h :
-        Finnhub 60m -> agrégation locale 4h.
-    """
-
-    if not FINNHUB_API_KEY:
-        raise RuntimeError(
-            "FINNHUB_API_KEY non configurée"
-        )
-
-    cache_key = (
-        "finnhub",
-        symbol,
-        interval,
-        int(limit),
-    )
-
-    cached = _cache_get(cache_key)
-
-    if cached is not None:
-        return cached
-
-    resolution = _FH_RESOLUTION.get(interval)
-
-    if not resolution:
-        raise ValueError(
-            f"Intervalle Finnhub non supporté: {interval}"
-        )
-
-    now = int(
-        datetime.now(
-            timezone.utc
-        ).timestamp()
-    )
-
-    raw_limit = _required_raw_limit(
-        interval,
-        limit,
-    )
-
-    # Pour le 4h, raw_limit est exprimé en bougies 1h.
-    required_seconds = (
-        interval_to_seconds("1h")
-        if interval == "4h"
-        else interval_to_seconds(interval)
-    )
-
-    lookback = max(
-        required_seconds * (raw_limit + 30),
-        7 * 86400,
-    )
-
-    start = now - lookback
-
-    params = {
-        "symbol": symbol,
-        "resolution": resolution,
-        "from": start,
-        "to": now,
-        "token": FINNHUB_API_KEY,
-    }
-
-    data, _ = _request_json(
-        FINNHUB_BASE,
+    response = _SESSION.get(
+        TWELVE_DATA_BASE,
         params=params,
+        timeout=REQUEST_TIMEOUT,
     )
 
-    status = data.get("s")
-
-    if status != "ok":
-
+    if response.status_code == 429:
         raise RuntimeError(
-            f"Finnhub: "
-            f"{status or 'unknown'} "
-            f"pour {symbol}"
+            f"Twelve Data HTTP 429 pour {symbol}"
         )
 
-    timestamps = data.get("t") or []
-    opens = data.get("o") or []
-    highs = data.get("h") or []
-    lows = data.get("l") or []
-    closes = data.get("c") or []
+    response.raise_for_status()
 
-    n = min(
-        len(timestamps),
-        len(opens),
-        len(highs),
-        len(lows),
-        len(closes),
+    payload = response.json()
+
+    if payload.get(
+        "status"
+    ) == "error":
+        raise RuntimeError(
+            "Twelve Data : "
+            + _twelvedata_error_message(
+                payload
+            )
+        )
+
+    values = payload.get(
+        "values"
     )
 
-    rows = []
-
-    for i in range(n):
-
-        rows.append(
-            {
-                "open_time": pd.to_datetime(
-                    timestamps[i],
-                    unit="s",
-                    utc=True,
-                ),
-                "open": opens[i],
-                "high": highs[i],
-                "low": lows[i],
-                "close": closes[i],
-
-                # IMPORTANT :
-                # Finnhub ne nous fournit pas ici un volume
-                # exploitable de manière générique.
-                "volume": None,
-            }
+    if not values:
+        raise RuntimeError(
+            f"Twelve Data : aucune donnée pour "
+            f"{symbol}"
         )
 
-    out = pd.DataFrame(rows)
+    df = pd.DataFrame(
+        values
+    )
 
-    if interval == "4h":
-
-        out = normalize_ohlcv(
-            out,
-            "1h",
-            raw_limit,
+    if "datetime" not in df.columns:
+        raise RuntimeError(
+            "Twelve Data : colonne datetime absente."
         )
 
-        out = aggregate_ohlcv(
-            out,
-            "4h",
+    df["open_time"] = pd.to_datetime(
+        df["datetime"],
+        utc=True,
+        errors="coerce",
+    )
+
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]:
+        if column not in df.columns:
+            raise RuntimeError(
+                f"Twelve Data : colonne {column} absente."
+            )
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
         )
 
-        out = out.tail(
-            int(limit)
-        ).reset_index(drop=True)
-
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(
+            df["volume"],
+            errors="coerce",
+        )
     else:
+        # JAMAIS 0 pour un volume absent.
+        df["volume"] = float("nan")
 
-        out = normalize_ohlcv(
-            out,
-            interval,
-            limit,
-        )
-
-    _cache_put(
-        cache_key,
-        out,
+    df = ensure_ohlcv(
+        df
     )
 
-    return out
+    df = keep_completed_candles(
+        df,
+        interval,
+    )
+
+    df = (
+        df.tail(int(limit))
+        .reset_index(drop=True)
+    )
+
+    _cache_set(
+        key,
+        df,
+    )
+
+    return attach_metadata(
+        df,
+        "twelvedata",
+        symbol,
+        asset_type,
+    )
 
 
-# ============================================================
-# BINANCE
-# ============================================================
+# ======================================================================
+# BINANCE WRAPPER
+# ======================================================================
 
-def klines_binance(
+def klines_binance_v42(
     symbol,
     interval="5m",
     limit=1000,
+    asset_type="crypto",
 ):
     """
-    Récupère les klines Binance.
+    Wrapper Binance pour le routeur.
 
-    Binance reste la source prioritaire et quasi exclusive
-    pour les cryptos.
+    Binance reste la source unique de la crypto.
     """
 
-    cache_key = (
+    key = _cache_key(
         "binance",
         symbol,
         interval,
-        int(limit),
+        limit,
+        asset_type,
     )
 
-    cached = _cache_get(cache_key)
+    cached = _cache_get(
+        key
+    )
 
     if cached is not None:
-        return cached
+        _stats_increment(
+            "cache_hits"
+        )
 
-    url = (
-        f"{BINANCE_BASE}/api/v3/klines"
-    )
+        return attach_metadata(
+            cached,
+            "binance",
+            symbol,
+            asset_type,
+        )
 
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": min(
+    df = klines_binance(
+        symbol,
+        interval=interval,
+        limit=min(
             int(limit),
             1000,
         ),
-    }
-
-    data, _ = _request_json(
-        url,
-        params=params,
     )
 
-    if not isinstance(data, list):
-        raise RuntimeError(
-            f"Binance: réponse invalide pour {symbol}"
-        )
+    df = ensure_ohlcv(
+        df
+    )
 
-    rows = []
-
-    for row in data:
-
-        if len(row) < 6:
-            continue
-
-        rows.append(
-            {
-                "open_time": pd.to_datetime(
-                    row[0],
-                    unit="ms",
-                    utc=True,
-                ),
-                "open": row[1],
-                "high": row[2],
-                "low": row[3],
-                "close": row[4],
-                "volume": row[5],
-            }
-        )
-
-    out = normalize_ohlcv(
-        pd.DataFrame(rows),
+    df = keep_completed_candles(
+        df,
         interval,
-        limit,
     )
 
-    _cache_put(
-        cache_key,
-        out,
+    df = (
+        df.tail(int(limit))
+        .reset_index(drop=True)
     )
 
-    return out
+    _cache_set(
+        key,
+        df,
+    )
+
+    return attach_metadata(
+        df,
+        "binance",
+        symbol,
+        asset_type,
+    )
 
 
-# ============================================================
-# ROUTEUR
-# ============================================================
+# ======================================================================
+# RÉSOLUTION DES SYMBOLES
+# ======================================================================
+
+def _resolve_provider_symbol(
+    symbol,
+    provider,
+    symbol_map=None,
+):
+    """
+    Résolution flexible compatible avec plusieurs formats
+    de symbol_map.
+
+    Formats acceptés :
+
+    1.
+        {"yahoo": "AAPL", "finnhub": "AAPL"}
+
+    2.
+        {"AAPL": {"yahoo": "AAPL", ...}}
+
+    3.
+        {"AAPL": "AAPL"}
+
+    4.
+        [{"yahoo": "AAPL", ...}, ...]
+    """
+
+    provider = str(
+        provider
+    ).lower()
+
+    if symbol_map is None:
+        return symbol
+
+    # --------------------------------------------------------------
+    # Mapping direct provider -> symbole
+    # --------------------------------------------------------------
+
+    if isinstance(
+        symbol_map,
+        dict,
+    ):
+        direct = symbol_map.get(
+            provider
+        )
+
+        if direct:
+            return str(
+                direct
+            )
+
+        # ----------------------------------------------------------
+        # Mapping symbole -> mapping fournisseurs
+        # ----------------------------------------------------------
+
+        nested = symbol_map.get(
+            symbol
+        )
+
+        if isinstance(
+            nested,
+            dict,
+        ):
+            value = nested.get(
+                provider
+            )
+
+            if value:
+                return str(
+                    value
+                )
+
+        elif isinstance(
+            nested,
+            str,
+        ):
+            return nested
+
+    # --------------------------------------------------------------
+    # Liste / tuple de dictionnaires
+    # --------------------------------------------------------------
+
+    if isinstance(
+        symbol_map,
+        (list, tuple),
+    ):
+        for entry in symbol_map:
+            if not isinstance(
+                entry,
+                dict,
+            ):
+                continue
+
+            display = entry.get(
+                "display"
+            )
+
+            yahoo = entry.get(
+                "yahoo"
+            )
+
+            td = entry.get(
+                "twelvedata"
+            )
+
+            finnhub = entry.get(
+                "finnhub"
+            )
+
+            binance = entry.get(
+                "binance"
+            )
+
+            if symbol in {
+                display,
+                yahoo,
+                td,
+                finnhub,
+                binance,
+            }:
+                value = entry.get(
+                    provider
+                )
+
+                if value:
+                    return str(
+                        value
+                    )
+
+    return symbol
+
+
+# ======================================================================
+# CAPACITÉS FOURNISSEURS
+# ======================================================================
+
+def _provider_order(
+    asset_type,
+    require_volume=False,
+):
+    """
+    Ordre initial intelligent.
+
+    Le routeur peut ensuite modifier cet ordre en fonction
+    des résultats et des capacités.
+    """
+
+    asset = str(
+        asset_type
+    ).lower()
+
+    if asset == "crypto":
+        return [
+            "binance",
+        ]
+
+    if asset == "stock":
+        # Finnhub et Yahoo avant Twelve Data.
+        if require_volume:
+            return [
+                "finnhub",
+                "yahoo",
+                "twelvedata",
+            ]
+
+        return [
+            "finnhub",
+            "yahoo",
+            "twelvedata",
+        ]
+
+    if asset == "forex":
+        return [
+            "finnhub",
+            "yahoo",
+            "twelvedata",
+        ]
+
+    if asset == "index":
+        return [
+            "yahoo",
+            "finnhub",
+            "twelvedata",
+        ]
+
+    if asset == "commodity":
+        return [
+            "yahoo",
+            "finnhub",
+            "twelvedata",
+        ]
+
+    return [
+        "finnhub",
+        "yahoo",
+        "twelvedata",
+    ]
+
+
+def _provider_supports_interval(
+    provider,
+    interval,
+):
+    provider = str(
+        provider
+    ).lower()
+
+    interval = normalize_interval(
+        interval
+    )
+
+    if provider == "binance":
+        return True
+
+    if provider == "yahoo":
+        return interval in {
+            "1m",
+            "5m",
+            "15m",
+            "30m",
+            "1h",
+            "4h",
+            "1d",
+        }
+
+    if provider == "finnhub":
+        return interval in {
+            "1m",
+            "5m",
+            "15m",
+            "30m",
+            "1h",
+            "4h",
+            "1d",
+        }
+
+    if provider == "twelvedata":
+        return interval in {
+            "1m",
+            "5m",
+            "15m",
+            "30m",
+            "1h",
+            "4h",
+            "1d",
+        }
+
+    return False
+
+
+def _provider_function(
+    provider,
+):
+    provider = str(
+        provider
+    ).lower()
+
+    if provider == "binance":
+        return klines_binance_v42
+
+    if provider == "finnhub":
+        return klines_finnhub
+
+    if provider == "yahoo":
+        return klines_yahoo
+
+    if provider == "twelvedata":
+        return klines_twelvedata
+
+    raise ValueError(
+        f"Fournisseur inconnu : {provider}"
+    )
+
+
+# ======================================================================
+# ÉVALUATION D'UNE SOURCE
+# ======================================================================
+
+def _freshness_score(
+    df,
+    interval,
+):
+    """
+    Score de fraîcheur entre 0 et 1.
+
+    Une donnée récente obtient 1.
+    Une donnée plusieurs intervalles en retard voit son score diminuer.
+
+    On ne rejette pas automatiquement les marchés fermés.
+    """
+
+    if df is None or df.empty:
+        return 0.0
+
+    last = pd.to_datetime(
+        df["open_time"].iloc[-1],
+        utc=True,
+        errors="coerce",
+    )
+
+    if pd.isna(last):
+        return 0.0
+
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
+
+    age_seconds = max(
+        0.0,
+        (
+            now - last
+        ).total_seconds(),
+    )
+
+    interval_seconds = max(
+        60,
+        interval_to_seconds(
+            interval
+        ),
+    )
+
+    ratio = (
+        age_seconds
+        / interval_seconds
+    )
+
+    if ratio <= 1.5:
+        return 1.0
+
+    if ratio <= 3:
+        return 0.8
+
+    if ratio <= 6:
+        return 0.5
+
+    if ratio <= 12:
+        return 0.2
+
+    return 0.0
+
+
+def _source_score(
+    provider,
+    df,
+    asset_type,
+    interval,
+    require_volume,
+):
+    """
+    Score interne permettant de comparer les résultats
+    réellement obtenus.
+    """
+
+    if df is None or df.empty:
+        return -999.0
+
+    coverage = volume_coverage(
+        df
+    )
+
+    freshness = _freshness_score(
+        df,
+        interval,
+    )
+
+    score = 0.0
+
+    # --------------------------------------------------------------
+    # Fraîcheur
+    # --------------------------------------------------------------
+
+    score += (
+        freshness * 50.0
+    )
+
+    # --------------------------------------------------------------
+    # Volume
+    # --------------------------------------------------------------
+
+    if coverage >= VOLUME_MIN_COVERAGE:
+        score += 30.0
+    elif coverage > 0:
+        score += (
+            10.0 * coverage
+        )
+
+    # Si le volume est obligatoire, un fournisseur sans volume
+    # est fortement pénalisé.
+    if require_volume:
+        if coverage < VOLUME_MIN_COVERAGE:
+            score -= 40.0
+
+    # --------------------------------------------------------------
+    # Qualité de données
+    # --------------------------------------------------------------
+
+    count = len(
+        df
+    )
+
+    if count >= 120:
+        score += 15.0
+    elif count >= 60:
+        score += 8.0
+    elif count >= 30:
+        score += 3.0
+
+    # --------------------------------------------------------------
+    # Bonus provider par catégorie
+    # --------------------------------------------------------------
+
+    provider = str(
+        provider
+    ).lower()
+
+    asset = str(
+        asset_type
+    ).lower()
+
+    if asset == "crypto" and provider == "binance":
+        score += 100.0
+
+    elif asset == "stock" and provider == "finnhub":
+        score += 12.0
+
+    elif asset == "index" and provider == "yahoo":
+        score += 15.0
+
+    elif asset == "commodity" and provider == "yahoo":
+        score += 15.0
+
+    # Twelve Data doit être conservé comme secours
+    # afin d'économiser le quota.
+    if provider == "twelvedata":
+        score -= 8.0
+
+    return score
+
+
+# ======================================================================
+# DATA ROUTER
+# ======================================================================
 
 class DataRouter:
     """
-    Routeur intelligent V4.2.
+    Routeur V4.2.
 
-    Le routeur tient compte de :
+    Exemple :
 
-    - classe d'actif ;
-    - disponibilité du fournisseur ;
-    - fraîcheur ;
-    - nombre de bougies ;
-    - disponibilité du volume ;
-    - préférence éventuelle ;
-    - budget Twelve Data.
+        router = DataRouter()
 
-    Il peut essayer plusieurs fournisseurs puis choisir
-    le meilleur dataset obtenu.
+        df = router.fetch(
+            "AAPL",
+            interval="15m",
+            limit=1000,
+            asset_type="stock",
+            symbol_map={
+                "yahoo": "AAPL",
+                "finnhub": "AAPL",
+                "twelvedata": "AAPL",
+            },
+        )
     """
 
-    PROVIDERS = (
-        "binance",
-        "yahoo",
-        "finnhub",
-        "twelvedata",
-    )
-
-    FUNCTIONS = {
-        "binance": klines_binance,
-        "yahoo": klines_yahoo,
-        "finnhub": klines_finnhub,
-        "twelvedata": klines_twelvedata,
-    }
-
-    def __init__(
-        self,
-        twelvedata_daily_budget=None,
-    ):
-
-        self.td_budget = int(
-            twelvedata_daily_budget
-            or TWELVEDATA_DAILY_BUDGET
-        )
-
-        self.td_used = 0
-
-        self.td_day = (
-            datetime.now(
-                timezone.utc
-            ).date()
-        )
-
-        self.stats = {
-            provider: {
-                "attempts": 0,
-                "success": 0,
-                "fail": 0,
-            }
-            for provider in self.PROVIDERS
-        }
-
-        self.last_provider = None
-        self.last_metadata = {}
-
-    # ========================================================
-    # TWELVE DATA BUDGET
-    # ========================================================
-
-    def _reset_td_day(self):
-
-        today = (
-            datetime.now(
-                timezone.utc
-            ).date()
-        )
-
-        if today != self.td_day:
-
-            self.td_day = today
-            self.td_used = 0
-
-    def _td_allowed(self):
-
-        self._reset_td_day()
-
-        return (
-            bool(TWELVE_DATA_API_KEY)
-            and self.td_used
-            < self.td_budget
-        )
-
-    # ========================================================
-    # APPEL FOURNISSEUR
-    # ========================================================
-
-    def _call(
-        self,
-        provider,
-        symbol,
-        interval,
-        limit,
-    ):
-
-        if provider not in self.FUNCTIONS:
-            raise ValueError(
-                f"Fournisseur inconnu: {provider}"
-            )
-
-        if (
-            provider == "twelvedata"
-            and not self._td_allowed()
-        ):
-            raise RuntimeError(
-                "Twelve Data: budget journalier "
-                "atteint ou clé absente"
-            )
-
-        self.stats[
-            provider
-        ]["attempts"] += 1
-
-        try:
-
-            dataframe = self.FUNCTIONS[
-                provider
-            ](
-                symbol,
-                interval=interval,
-                limit=limit,
-            )
-
-            if provider == "twelvedata":
-                self.td_used += 1
-
-            self.stats[
-                provider
-            ]["success"] += 1
-
-            return dataframe
-
-        except Exception:
-
-            if provider == "twelvedata":
-
-                # Par prudence, on réserve un crédit en cas
-                # d'échec. Cela évite de dépasser le quota si
-                # l'API a malgré tout consommé la requête.
-                self.td_used += 1
-
-            self.stats[
-                provider
-            ]["fail"] += 1
-
-            raise
-
-    # ========================================================
-    # ORDRE DES FOURNISSEURS
-    # ========================================================
-
-    def _provider_order(
-        self,
-        asset_type,
-        preferred=None,
-        require_volume=True,
-    ):
-        """
-        Détermine l'ordre initial des fournisseurs.
-
-        Ce n'est qu'un ordre de recherche.
-        Le classement final est effectué après examen réel
-        des données.
-        """
-
-        asset_type = (
-            str(asset_type)
-            .lower()
-            .strip()
-        )
-
-        if asset_type == "crypto":
-
-            base = [
-                "binance",
-            ]
-
-        elif asset_type == "forex":
-
-            # Finnhub prioritaire pour éviter de gaspiller
-            # Twelve Data.
-            base = [
-                "finnhub",
-                "yahoo",
-                "twelvedata",
-            ]
-
-        elif asset_type == "index":
-
-            # Yahoo est particulièrement adapté aux indices.
-            base = [
-                "yahoo",
-                "twelvedata",
-                "finnhub",
-            ]
-
-        elif asset_type == "commodity":
-
-            base = [
-                "yahoo",
-                "twelvedata",
-                "finnhub",
-            ]
-
-        else:
-
-            # Actions.
-            base = [
-                "finnhub",
-                "yahoo",
-                "twelvedata",
-            ]
-
-        # Si une préférence est explicitement demandée,
-        # elle passe devant les autres fournisseurs disponibles.
-        if preferred in base:
-
-            base.remove(preferred)
-            base.insert(
-                0,
-                preferred,
-            )
-
-        return base
-
-    # ========================================================
-    # MERGE DU VOLUME
-    # ========================================================
+    # --------------------------------------------------------------
+    # Budget partagé
+    # --------------------------------------------------------------
 
     @staticmethod
-    def _merge_volume(
-        price_df,
-        volume_df,
-    ):
-        """
-        Ajoute un volume externe uniquement lorsque les timestamps
-        correspondent exactement.
-
-        On ne crée jamais de volume artificiel.
-        """
-
-        if (
-            price_df is None
-            or volume_df is None
-            or price_df.empty
-            or volume_df.empty
-        ):
-            return price_df
-
-        if (
-            "open_time" not in price_df.columns
-            or "open_time" not in volume_df.columns
-        ):
-            return price_df
-
-        if "volume" not in volume_df.columns:
-            return price_df
-
-        price = price_df.copy()
-
-        volume = volume_df[
-            [
-                "open_time",
-                "volume",
-            ]
-        ].copy()
-
-        volume["open_time"] = pd.to_datetime(
-            volume["open_time"],
-            utc=True,
-            errors="coerce",
-        )
-
-        volume["volume"] = pd.to_numeric(
-            volume["volume"],
-            errors="coerce",
-        )
-
-        volume = (
-            volume
-            .dropna(
-                subset=[
-                    "open_time",
-                    "volume",
-                ]
-            )
-            .drop_duplicates(
-                "open_time",
-                keep="last",
-            )
-        )
-
-        if volume.empty:
-            return price
-
-        price = price.copy()
-
-        price["open_time"] = pd.to_datetime(
-            price["open_time"],
-            utc=True,
-            errors="coerce",
-        )
-
-        merged = price.drop(
-            columns=["volume"],
-            errors="ignore",
-        ).merge(
-            volume,
-            on="open_time",
-            how="left",
-        )
-
-        for column in STANDARD_COLUMNS:
-
-            if column not in merged.columns:
-
-                if column == "volume":
-                    merged[column] = pd.NA
-                else:
-                    merged[column] = float("nan")
-
-        return merged[
-            STANDARD_COLUMNS
-        ]
-
-    # ========================================================
-    # SCORE
-    # ========================================================
+    def twelvedata_used():
+        return _TwelveDataBudget.used_today()
 
     @staticmethod
-    def _score_candidate(
-        provider,
-        quality,
-        preferred=None,
-        require_volume=True,
-    ):
-        """
-        Score qualitatif d'un candidat.
+    def twelvedata_remaining():
+        return _TwelveDataBudget.remaining()
 
-        Priorités :
-        1. validité
-        2. fraîcheur
-        3. volume si nécessaire
-        4. couverture volume
-        5. quantité de données
-        6. préférence explicite
-        """
+    @staticmethod
+    def twelvedata_budget():
+        return TWELVE_DATA_DAILY_BUDGET
 
-        score = 0.0
+    # Alias utiles pour compatibilité.
+    @staticmethod
+    def td_used():
+        return _TwelveDataBudget.used_today()
 
-        if quality["valid"]:
-            score += 1000
+    @staticmethod
+    def td_remaining():
+        return _TwelveDataBudget.remaining()
 
-        if quality["fresh"]:
-            score += 500
+    # --------------------------------------------------------------
+    # Statistiques
+    # --------------------------------------------------------------
 
-        if require_volume:
+    @staticmethod
+    def stats():
+        return router_stats()
 
-            if (
-                quality["volume_status"]
-                == VOLUME_CONFIRMED
-            ):
-                score += 300
+    @staticmethod
+    def get_stats():
+        return router_stats()
 
-            elif (
-                quality["volume_status"]
-                == VOLUME_UNAVAILABLE
-            ):
-                score -= 50
+    # --------------------------------------------------------------
+    # Réinitialisation du cache
+    # --------------------------------------------------------------
 
-            elif (
-                quality["volume_status"]
-                == VOLUME_INVALID
-            ):
-                score -= 500
+    @staticmethod
+    def clear_cache():
+        clear_cache()
 
-            score += (
-                quality["volume_coverage"]
-                * 100
-            )
-
-        score += min(
-            quality["candles"],
-            1000,
-        )
-
-        if provider == preferred:
-            score += 50
-
-        # L'ordre de coût/priorité est volontairement :
-        #
-        # Binance : gratuit / excellent pour crypto
-        # Yahoo   : gratuit
-        # Finnhub : quota gratuit
-        # TD      : quota plus précieux
-        #
-        # Mais le coût n'écrase jamais une vraie différence
-        # de qualité.
-        provider_bonus = {
-            "binance": 40,
-            "yahoo": 30,
-            "finnhub": 20,
-            "twelvedata": 0,
-        }
-
-        score += provider_bonus.get(
-            provider,
-            0,
-        )
-
-        return score
-
-    # ========================================================
-    # FETCH
-    # ========================================================
+    # --------------------------------------------------------------
+    # Fetch
+    # --------------------------------------------------------------
 
     def fetch(
         self,
@@ -1592,86 +1968,171 @@ class DataRouter:
         limit=1000,
         asset_type="stock",
         preferred=None,
-        require_volume=True,
+        require_volume=False,
         symbol_map=None,
     ):
         """
-        Récupère un actif via le meilleur fournisseur disponible.
-
-        Parameters
-        ----------
-        symbol :
-            symbole par défaut.
-
-        interval :
-            1m, 5m, 15m, 30m, 1h, 4h, 1d...
-
-        limit :
-            nombre de bougies souhaité.
-
-        asset_type :
-            crypto / forex / stock / index / commodity.
+        Sélectionne automatiquement la meilleure source.
 
         preferred :
-            fournisseur préféré éventuel.
+            fournisseur préféré optionnel.
 
         require_volume :
-            si False, un OHLC frais sans volume peut être accepté.
+            True pour actions/crypto/matières nécessitant
+            un volume exploitable.
 
-        symbol_map :
-            dictionnaire du type :
-
-                {
-                    "yahoo": "AAPL",
-                    "finnhub": "AAPL",
-                    "twelvedata": "AAPL"
-                }
-
-        Returns
-        -------
-        DataFrame normalisé avec df.attrs :
-            provider
-            provider_symbol
-            volume_status
-            volume_coverage
-            data_fresh
-            data_age_seconds
-            router_candidates
-            router_errors
+        Le routeur n'utilise pas Twelve Data avant les
+        autres sources lorsque celles-ci sont disponibles.
         """
 
-        symbol_map = symbol_map or {}
+        asset = str(
+            asset_type
+        ).lower()
 
-        order = self._provider_order(
-            asset_type,
-            preferred,
-            require_volume,
+        interval = normalize_interval(
+            interval
         )
 
-        candidates = []
-        errors = []
-
-        min_candles = min(
-            120,
-            int(limit),
+        symbol = str(
+            symbol
         )
 
-        # ====================================================
-        # PHASE 1 — RECHERCHE
-        # ====================================================
+        _stats_increment(
+            "requests"
+        )
 
-        for provider in order:
+        # ----------------------------------------------------------
+        # Crypto : Binance uniquement
+        # ----------------------------------------------------------
+
+        if asset == "crypto":
+            provider = "binance"
 
             provider_symbol = (
-                symbol_map.get(provider)
-                or (
-                    symbol
-                    if provider == "binance"
-                    else None
+                _resolve_provider_symbol(
+                    symbol,
+                    provider,
+                    symbol_map,
                 )
             )
 
-            # Ne jamais inventer un symbole pour un fournisseur.
+            try:
+                df = _provider_function(
+                    provider
+                )(
+                    provider_symbol,
+                    interval=interval,
+                    limit=limit,
+                    asset_type=asset,
+                )
+
+                if df is None or df.empty:
+                    raise RuntimeError(
+                        "Binance : données vides."
+                    )
+
+                _stats_increment(
+                    "success"
+                )
+
+                _stats_increment(
+                    "binance"
+                )
+
+                return df
+
+            except Exception:
+                _stats_increment(
+                    "errors"
+                )
+
+                raise
+
+        # ----------------------------------------------------------
+        # Construction des candidats
+        # ----------------------------------------------------------
+
+        candidates = _provider_order(
+            asset,
+            require_volume=require_volume,
+        )
+
+        if preferred:
+            preferred = str(
+                preferred
+            ).lower()
+
+            if preferred in candidates:
+                candidates.remove(
+                    preferred
+                )
+
+                candidates.insert(
+                    0,
+                    preferred,
+                )
+
+        # ----------------------------------------------------------
+        # Suppression des fournisseurs non disponibles
+        # ----------------------------------------------------------
+
+        filtered = []
+
+        for provider in candidates:
+            if not _provider_supports_interval(
+                provider,
+                interval,
+            ):
+                continue
+
+            if (
+                provider == "twelvedata"
+                and not TWELVE_DATA_API_KEY
+            ):
+                continue
+
+            if (
+                provider == "finnhub"
+                and not FINNHUB_API_KEY
+            ):
+                continue
+
+            filtered.append(
+                provider
+            )
+
+        candidates = filtered
+
+        if not candidates:
+            _stats_increment(
+                "errors"
+            )
+
+            raise RuntimeError(
+                f"Aucun fournisseur disponible pour "
+                f"{symbol} ({asset}, {interval})."
+            )
+
+        # ----------------------------------------------------------
+        # Essai des sources
+        # ----------------------------------------------------------
+
+        successful = []
+
+        errors = []
+
+        for index, provider in enumerate(
+            candidates
+        ):
+            provider_symbol = (
+                _resolve_provider_symbol(
+                    symbol,
+                    provider,
+                    symbol_map,
+                )
+            )
+
+            # Une absence explicite de symbole peut être ignorée.
             if not provider_symbol:
                 errors.append(
                     f"{provider}: symbole absent"
@@ -1679,286 +2140,274 @@ class DataRouter:
                 continue
 
             try:
+                fetcher = _provider_function(
+                    provider
+                )
 
-                dataframe = self._call(
-                    provider,
+                df = fetcher(
                     provider_symbol,
-                    interval,
-                    limit,
+                    interval=interval,
+                    limit=limit,
+                    asset_type=asset,
                 )
 
-                quality = data_quality(
-                    dataframe,
-                    interval,
-                    min_candles=min_candles,
+                if df is None or df.empty:
+                    raise RuntimeError(
+                        "données vides"
+                    )
+
+                df = ensure_ohlcv(
+                    df
                 )
 
-                if not quality["valid"]:
+                if df.empty:
+                    raise RuntimeError(
+                        "données OHLCV vides"
+                    )
 
-                    errors.append(
-                        f"{provider}: "
-                        f"données insuffisantes "
-                        f"({quality['candles']} bougies)"
+                score = _source_score(
+                    provider,
+                    df,
+                    asset,
+                    interval,
+                    require_volume,
+                )
+
+                successful.append(
+                    {
+                        "provider": provider,
+                        "symbol": provider_symbol,
+                        "df": df,
+                        "score": score,
+                    }
+                )
+
+                # --------------------------------------------------
+                # Cas normal :
+                # une source très bonne suffit.
+                # --------------------------------------------------
+
+                coverage = volume_coverage(
+                    df
+                )
+
+                freshness = _freshness_score(
+                    df,
+                    interval,
+                )
+
+                volume_good = (
+                    coverage
+                    >= VOLUME_MIN_COVERAGE
+                )
+
+                # Crypto déjà traitée.
+                if (
+                    asset == "crypto"
+                    or (
+                        require_volume
+                        and volume_good
+                        and freshness >= 0.5
+                    )
+                    or (
+                        not require_volume
+                        and freshness >= 0.5
+                    )
+                ):
+                    break
+
+                # --------------------------------------------------
+                # Si la source est exploitable mais volume absent,
+                # on continue pour tenter une source avec volume.
+                # --------------------------------------------------
+
+                if (
+                    require_volume
+                    and not volume_good
+                    and index < len(candidates) - 1
+                ):
+                    _stats_increment(
+                        "fallbacks"
                     )
 
                     continue
 
-                candidates.append(
-                    (
-                        provider,
-                        provider_symbol,
-                        dataframe,
-                        quality,
-                    )
-                )
-
-                # =================================================
-                # ARRÊT RAPIDE
-                # =================================================
-
-                # Cas idéal :
-                # données fraîches + volume confirmé.
-                if (
-                    quality["fresh"]
-                    and quality["volume_status"]
-                    == VOLUME_CONFIRMED
-                ):
-                    break
-
-                # Si le volume n'est pas requis, on peut arrêter
-                # dès qu'un dataset OHLC frais est obtenu.
-                if (
-                    quality["fresh"]
-                    and not require_volume
-                ):
-                    break
+                break
 
             except Exception as exc:
-
                 errors.append(
                     f"{provider}: {exc}"
                 )
 
-        # ====================================================
-        # AUCUNE SOURCE
-        # ====================================================
+                _stats_increment(
+                    "errors"
+                )
 
-        if not candidates:
+                if index < len(candidates) - 1:
+                    _stats_increment(
+                        "fallbacks"
+                    )
 
-            message = (
-                "Aucune source exploitable"
+                continue
+
+        # ----------------------------------------------------------
+        # Aucun succès
+        # ----------------------------------------------------------
+
+        if not successful:
+            raise RuntimeError(
+                f"Aucune source exploitable pour "
+                f"{symbol}. "
+                + " | ".join(errors)
             )
 
-            if errors:
-                message += ": " + " | ".join(
-                    errors
-                )
+        # ----------------------------------------------------------
+        # Choix final :
+        # meilleure qualité réelle, pas simplement premier venu.
+        # ----------------------------------------------------------
 
-            raise RuntimeError(message)
-
-        # ====================================================
-        # PHASE 2 — CLASSEMENT
-        # ====================================================
-
-        candidates.sort(
-            key=lambda item: self._score_candidate(
-                item[0],
-                item[3],
-                preferred=preferred,
-                require_volume=require_volume,
-            ),
-            reverse=True,
+        selected = max(
+            successful,
+            key=lambda item: item["score"],
         )
 
-        (
-            provider,
-            provider_symbol,
-            dataframe,
-            quality,
-        ) = candidates[0]
-
-        # ====================================================
-        # PHASE 3 — ENRICHISSEMENT VOLUME
-        # ====================================================
-
-        if (
-            require_volume
-            and quality["volume_status"]
-            != VOLUME_CONFIRMED
-        ):
-
-            for (
-                volume_provider,
-                volume_symbol,
-                volume_df,
-                volume_quality,
-            ) in candidates:
-
-                if (
-                    volume_provider == provider
-                ):
-                    continue
-
-                if (
-                    volume_quality[
-                        "volume_status"
-                    ]
-                    != VOLUME_CONFIRMED
-                ):
-                    continue
-
-                enriched = self._merge_volume(
-                    dataframe,
-                    volume_df,
-                )
-
-                enriched_quality = data_quality(
-                    enriched,
-                    interval,
-                    min_candles=min_candles,
-                )
-
-                if (
-                    enriched_quality[
-                        "volume_status"
-                    ]
-                    == VOLUME_CONFIRMED
-                ):
-
-                    dataframe = enriched
-                    quality = enriched_quality
-
-                    break
-
-        # ====================================================
-        # NORMALISATION FINALE
-        # ====================================================
-
-        dataframe = normalize_ohlcv(
-            dataframe,
-            interval,
-            limit,
-        )
-
-        final_volume_status = volume_status(
-            dataframe
-        )
-
-        final_volume_coverage = volume_coverage(
-            dataframe
-        )
-
-        final_quality = data_quality(
-            dataframe,
-            interval,
-            min_candles=min_candles,
-        )
-
-        # ====================================================
-        # MÉTADONNÉES
-        # ====================================================
-
-        dataframe.attrs[
+        provider = selected[
             "provider"
-        ] = provider
-
-        dataframe.attrs[
-            "provider_symbol"
-        ] = provider_symbol
-
-        dataframe.attrs[
-            "asset_type"
-        ] = asset_type
-
-        dataframe.attrs[
-            "interval"
-        ] = interval
-
-        dataframe.attrs[
-            "volume_status"
-        ] = final_volume_status
-
-        dataframe.attrs[
-            "volume_coverage"
-        ] = final_volume_coverage
-
-        dataframe.attrs[
-            "data_fresh"
-        ] = final_quality["fresh"]
-
-        dataframe.attrs[
-            "data_age_seconds"
-        ] = final_quality["age_seconds"]
-
-        dataframe.attrs[
-            "candles"
-        ] = final_quality["candles"]
-
-        dataframe.attrs[
-            "router_candidates"
-        ] = [
-            item[0]
-            for item in candidates
         ]
 
-        dataframe.attrs[
+        provider_symbol = selected[
+            "symbol"
+        ]
+
+        df = selected[
+            "df"
+        ]
+
+        # ----------------------------------------------------------
+        # Métadonnées
+        # ----------------------------------------------------------
+
+        df = attach_metadata(
+            df,
+            provider,
+            provider_symbol,
+            asset,
+        )
+
+        df.attrs[
+            "router_candidates"
+        ] = [
+            item["provider"]
+            for item in successful
+        ]
+
+        df.attrs[
+            "router_scores"
+        ] = {
+            item["provider"]:
+                round(
+                    float(item["score"]),
+                    2,
+                )
+            for item in successful
+        }
+
+        df.attrs[
             "router_errors"
         ] = errors
 
-        dataframe.attrs[
-            "twelvedata_used"
-        ] = self.td_used
+        df.attrs[
+            "router_selected_score"
+        ] = round(
+            float(selected["score"]),
+            2,
+        )
 
-        self.last_provider = provider
+        df.attrs[
+            "router_fallback_count"
+        ] = max(
+            0,
+            len(successful) - 1,
+        )
 
-        self.last_metadata = {
-            "provider": provider,
-            "provider_symbol": provider_symbol,
-            "asset_type": asset_type,
-            "interval": interval,
-            "volume_status": final_volume_status,
-            "volume_coverage": final_volume_coverage,
-            "fresh": final_quality["fresh"],
-            "age_seconds": final_quality["age_seconds"],
-            "candles": final_quality["candles"],
-            "candidates": [
-                item[0]
-                for item in candidates
-            ],
-            "errors": errors,
-            "twelvedata_used": self.td_used,
-            "twelvedata_budget": self.td_budget,
-        }
+        _stats_increment(
+            "success"
+        )
 
-        return dataframe
+        _stats_increment(
+            provider
+        )
 
-    # ========================================================
-    # STATISTIQUES
-    # ========================================================
+        return df
 
-    def get_stats(self):
-        """
-        Retourne les statistiques du routeur.
-        """
 
-        self._reset_td_day()
+# ======================================================================
+# FONCTIONS DE COMPATIBILITÉ
+# ======================================================================
 
-        return {
-            "providers": {
-                provider: values.copy()
-                for provider, values
-                in self.stats.items()
-            },
-            "twelvedata": {
-                "used": self.td_used,
-                "budget": self.td_budget,
-                "remaining": max(
-                    0,
-                    self.td_budget
-                    - self.td_used,
-                ),
-            },
-            "last_provider": self.last_provider,
-            "last_metadata": self.last_metadata.copy(),
-        }
-```
+def fetch_data(
+    symbol,
+    interval="15m",
+    limit=1000,
+    asset_type="stock",
+    preferred=None,
+    require_volume=False,
+    symbol_map=None,
+):
+    """
+    Interface fonctionnelle simple vers DataRouter.
+    """
+
+    router = DataRouter()
+
+    return router.fetch(
+        symbol=symbol,
+        interval=interval,
+        limit=limit,
+        asset_type=asset_type,
+        preferred=preferred,
+        require_volume=require_volume,
+        symbol_map=symbol_map,
+    )
+
+
+def get_router_stats():
+    return router_stats()
+
+
+def get_twelvedata_budget():
+    return {
+        "used": DataRouter.twelvedata_used(),
+        "remaining": DataRouter.twelvedata_remaining(),
+        "budget": TWELVE_DATA_DAILY_BUDGET,
+    }
+
+
+# ======================================================================
+# TEST LOCAL
+# ======================================================================
+
+if __name__ == "__main__":
+    print(
+        "Module data_sources.py V4.2 chargé correctement."
+    )
+
+    print(
+        "Twelve Data : "
+        f"{DataRouter.twelvedata_used()}/"
+        f"{TWELVE_DATA_DAILY_BUDGET} "
+        "appels utilisés."
+    )
+
+    print(
+        "Twelve Data restant : "
+        f"{DataRouter.twelvedata_remaining()}"
+    )
+
+    print(
+        "Statistiques routeur :"
+    )
+
+    print(
+        router_stats()
+    )
