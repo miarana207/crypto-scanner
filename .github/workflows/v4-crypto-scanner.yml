@@ -55,7 +55,6 @@ jobs:
           PYTHONIOENCODING: "utf-8"
 
           BINANCE_DATA_URL: https://data-api.binance.vision
-          BINANCE_AUDIT_PATH: binance_universe_audit.csv
 
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
@@ -70,12 +69,3 @@ jobs:
 
         run: |
           python -u app/run_and_notify.py --threshold 75 --limit 1000 --top 5
-
-      - name: Upload Binance universe audit
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: binance-universe-audit
-          path: binance_universe_audit.csv
-          if-no-files-found: warn
-          retention-days: 14
